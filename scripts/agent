@@ -174,8 +174,10 @@ cmd_pr() {
 		die "refusing to open a pull request from $base"
 	fi
 
-	if existing=$(gh pr view --json url -q .url 2>/dev/null); then
-		ok "a pull request already exists: $existing"
+	# Only an OPEN pull request means there is nothing to do. `gh pr view`
+	# matches by branch name and will happily return a closed or merged one.
+	if [ "$(gh pr view --json state -q .state 2>/dev/null || echo NONE)" = 'OPEN' ]; then
+		ok "a pull request is already open: $(gh pr view --json url -q .url)"
 		return 0
 	fi
 
