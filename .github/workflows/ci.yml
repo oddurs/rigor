@@ -33,7 +33,16 @@ jobs:
 
       - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2.87.10
         with:
-          tool: cargo-nextest,shellcheck,typos,actionlint
+          tool: cargo-nextest,shellcheck,typos
+
+      # install-action has no actionlint. go install pins the version and
+      # verifies the module against Go's checksum database; Go is on every
+      # runner image.
+      - name: Install actionlint
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          gopath=$(go env GOPATH)
+          echo "$gopath/bin" >> "$GITHUB_PATH"
 
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
