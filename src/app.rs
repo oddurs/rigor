@@ -469,23 +469,8 @@ impl App {
                 idx.into_iter().map(Row::Wt).collect()
             }
             v => {
-                let viewer = self.viewer.clone();
                 let mut idx: Vec<usize> = (0..self.prs.len())
-                    .filter(|&i| {
-                        let p = &self.prs[i];
-                        if !self.settings.show_drafts && p.is_draft {
-                            return false;
-                        }
-                        let in_view = match v {
-                            View::Ready => p.is_ready(),
-                            View::Mine => p.is_mine(&viewer),
-                            View::Review => p.wants_my_review(&viewer),
-                            View::Assigned => p.assigned_to_me(&viewer),
-                            View::Blocked => p.is_blocked(),
-                            _ => true,
-                        };
-                        in_view && self.pr_matches(i, &q)
-                    })
+                    .filter(|&i| self.in_view(&self.prs[i], v) && self.pr_matches(i, &q))
                     .collect();
                 if self.sort == Sort::Attention {
                     idx.sort_by_key(|&i| (attention_rank(&self.prs[i]), -self.prs[i].updated_at));
@@ -525,23 +510,30 @@ impl App {
             || w.path.to_string_lossy().to_lowercase().contains(q)
     }
 
+    /// Whether `p` belongs on the view `v`, before any filter. Hidden drafts
+    /// are out of every view.
+    fn in_view(&self, p: &Pr, v: View) -> bool {
+        if p.is_draft && !self.settings.show_drafts {
+            return false;
+        }
+        match v {
+            View::Ready => p.is_ready(),
+            View::Mine => p.is_mine(&self.viewer),
+            View::Review => p.wants_my_review(&self.viewer),
+            View::Assigned => p.assigned_to_me(&self.viewer),
+            View::Blocked => p.is_blocked(),
+            View::All => true,
+            View::Worktrees => false,
+        }
+    }
+
+    /// The size of a view before filtering: what its tab counts, and the
+    /// "of N" while a filter is typed. It must agree with the list, so it
+    /// shares `in_view` with `rebuild`.
     pub fn count_for(&self, v: View) -> usize {
         match v {
             View::Worktrees => self.worktrees.len(),
-            View::All => self.prs.len(),
-            View::Ready => self.prs.iter().filter(|p| p.is_ready()).count(),
-            View::Blocked => self.prs.iter().filter(|p| p.is_blocked()).count(),
-            View::Mine => self.prs.iter().filter(|p| p.is_mine(&self.viewer)).count(),
-            View::Review => self
-                .prs
-                .iter()
-                .filter(|p| p.wants_my_review(&self.viewer))
-                .count(),
-            View::Assigned => self
-                .prs
-                .iter()
-                .filter(|p| p.assigned_to_me(&self.viewer))
-                .count(),
+            _ => self.prs.iter().filter(|p| self.in_view(p, v)).count(),
         }
     }
 
@@ -640,19 +632,12 @@ impl App {
     }
 
     pub fn open_url(&mut self, url: &str) {
-        let cmd = self.settings.open_command.clone();
-        let mut parts = cmd.split_whitespace();
-        let Some(bin) = parts.next() else { return };
-        let args: Vec<&str> = parts.collect();
-        match Command::new(bin)
-            .args(&args)
-            .arg(url)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+        match launch(&self.settings.open_command, url) {
             Ok(_) => self.note(format!("opened {url}")),
-            Err(e) => self.note(format!("could not run `{bin}`: {e}")),
+            Err(e) => self.note(format!(
+                "could not run `{}`: {e}",
+                self.settings.open_command
+            )),
         }
     }
 
@@ -713,12 +698,37 @@ impl App {
                 if let Some(mut si) = c.stdin.take() {
                     let _ = si.write_all(url.as_bytes());
                 }
-                let _ = c.wait();
-                self.note(format!("copied {url}"));
+                match c.wait() {
+                    Ok(status) if status.success() => self.note(format!("copied {url}")),
+                    Ok(status) => self.note(format!("`{bin}` failed ({status}); nothing copied")),
+                    Err(e) => self.note(format!("could not run `{bin}`: {e}")),
+                }
             }
             Err(e) => self.note(format!("could not run `{bin}`: {e}")),
         }
     }
+}
+
+/// Run a configured command with `url` as its last argument and return its
+/// pid. The command gets no stdin, since the terminal belongs to rigor, and
+/// is reaped off-thread, so opening PRs all session leaves no zombies behind.
+fn launch(command: &str, url: &str) -> std::io::Result<u32> {
+    let mut parts = command.split_whitespace();
+    let bin = parts
+        .next()
+        .ok_or_else(|| std::io::Error::other("the command is empty"))?;
+    let mut child = Command::new(bin)
+        .args(parts)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(pid)
 }
 
 /// Ordering for the "attention" sort. Mergeable PRs come first because merging
@@ -813,6 +823,20 @@ mod tests {
         assert_eq!(a.schedule.failures, 0);
         assert!(a.schedule.paused_until.is_none());
         assert!(a.in_flight.prs);
+    }
+
+    /// Opening a PR must not leave a zombie process for the rest of the session.
+    #[cfg(unix)]
+    #[test]
+    fn a_launched_opener_is_reaped() {
+        let pid = libc::pid_t::try_from(launch("true", "https://example.com").unwrap()).unwrap();
+        let gone = (0..200).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            // SAFETY: kill(2) with signal 0 sends nothing; it only reports
+            // whether the process still exists, and a zombie does.
+            unsafe { libc::kill(pid, 0) != 0 }
+        });
+        assert!(gone, "the opener was never reaped");
     }
 
     /// A panicking worker still answers, so its loading flag always clears.

@@ -19,14 +19,14 @@ pub fn key(app: &mut App, k: KeyEvent) {
         return;
     }
     match app.mode {
-        Mode::Filter => filter_key(app, k.code),
+        Mode::Filter => filter_key(app, k),
         Mode::Help => help_key(app, k.code),
         Mode::Browse => browse_key(app, k),
     }
 }
 
-fn filter_key(app: &mut App, code: KeyCode) {
-    match code {
+fn filter_key(app: &mut App, k: KeyEvent) {
+    match k.code {
         KeyCode::Esc => {
             app.filter.clear();
             app.mode = Mode::Browse;
@@ -37,7 +37,13 @@ fn filter_key(app: &mut App, code: KeyCode) {
             app.filter.pop();
             app.rebuild();
         }
-        KeyCode::Char(c) => {
+        // Only plain typing is text: a Ctrl or Alt chord reports its letter
+        // too, and Ctrl-A must not type an `a` into the filter.
+        KeyCode::Char(c)
+            if !k
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             app.filter.push(c);
             app.rebuild();
         }
@@ -130,6 +136,14 @@ pub struct Input {
 impl Input {
     pub fn mouse(&mut self, app: &mut App, m: MouseEvent) {
         let (x, y) = (m.column, m.row);
+        // Help is modal, as it is for keys: a click closes it, and nothing
+        // reaches the dashboard underneath.
+        if app.mode == Mode::Help {
+            if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                app.mode = Mode::Browse;
+            }
+            return;
+        }
         match m.kind {
             MouseEventKind::ScrollDown => {
                 if in_rect(app.hits.detail, x, y) {
@@ -146,11 +160,6 @@ impl Input {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if app.mode == Mode::Help {
-                    app.mode = Mode::Browse;
-                    return;
-                }
-
                 if let Some((_, v)) = app
                     .hits
                     .tabs
@@ -174,12 +183,15 @@ impl Input {
                     return;
                 }
 
+                // Rows are recorded by screen line, so the column has to be
+                // checked too: side by side, the detail pane shares those lines.
                 if let Some(idx) = app
                     .hits
                     .rows
                     .iter()
                     .find(|(ry, _)| *ry == y)
                     .map(|(_, i)| *i)
+                    && in_rect(app.hits.list, x, y)
                 {
                     let now = Instant::now();
                     let double = self

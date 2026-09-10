@@ -7,15 +7,15 @@ expression: "render(&mut a, 120, 30)"
 ───────────━━━━━━───────────────────────────────────────────────────────────────────────────────────────────────────────
 ▎#4846  ✗ 1/3     ⌂ Give the┌ keys ────────────────────────────────────────────────────────┐                         3m
  #4840  ✓ 3     ✔ ⌂ Move the│  j / k, ↓ / ↑        move selection                          │                         2h
-                            │  g / G               first / last                            │
+                            │  g / G, home / end   first / last                            │
                             │  PgUp / PgDn         page                                    │
-                            │  1–9, tab            switch view (by position)               │
+                            │  1–9, tab / ⇧tab     switch view                             │
                             │  enter, o            open PR in browser                      │
                             │  c                   open the PR's checks page               │
                             │  y                   copy PR URL to clipboard                │
                             │  s                   toggle sort: recent ⇄ attention         │
                             │  d                   show / hide drafts                      │
-                            │  /                   filter list (title, branch, author)     │
+                            │  /                   filter: title, branch, author, label    │
                             │  esc                 clear filter                            │
                             │  r                   refresh now                             │
                             │  J / K               scroll the detail pane                  │

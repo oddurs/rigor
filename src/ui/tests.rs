@@ -1084,3 +1084,91 @@ fn cleanup_commands_quote_paths_that_need_it() {
     assert_eq!(shell("/home/dev/my desk"), "'/home/dev/my desk'");
     assert_eq!(shell("/home/dev/it's"), r"'/home/dev/it'\''s'");
 }
+
+// ------------------------------------------------------------ counts, input
+
+/// A tab's count is the size of its list. Hidden drafts leave both.
+#[test]
+fn tab_counts_match_the_list_when_drafts_are_hidden() {
+    let mut a = sample_app();
+    press(&mut a, "d");
+    for view in [View::All, View::Review, View::Mine] {
+        a.set_view(view);
+        assert_eq!(a.count_for(view), a.rows.len(), "{view:?}");
+    }
+    assert_eq!(
+        a.count_for(View::Review),
+        0,
+        "the only review request is a draft"
+    );
+}
+
+#[test]
+fn a_ctrl_chord_types_nothing_into_the_filter() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut a = sample_app();
+    press(&mut a, "/");
+    crate::event::key(
+        &mut a,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+    );
+    assert!(a.filter.is_empty(), "{:?}", a.filter);
+}
+
+fn mouse(a: &mut App, kind: ratatui::crossterm::event::MouseEventKind, x: u16, y: u16) {
+    let event = ratatui::crossterm::event::MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+    };
+    crate::event::Input::default().mouse(a, event);
+}
+
+/// Side by side, the list and the detail pane share screen lines. A click in
+/// the detail pane belongs to the detail pane.
+#[test]
+fn a_click_in_the_detail_pane_does_not_select_a_list_row() {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    let mut a = sample_app();
+    a.set_view(View::All);
+    a.settings.layout = LayoutMode::Split;
+    render(&mut a, 160, 24);
+    let (y, row) = a.hits.rows[1];
+    let detail_x = a.hits.detail.x + a.hits.detail.width - 2;
+    mouse(&mut a, MouseEventKind::Down(MouseButton::Left), detail_x, y);
+    assert_eq!(a.selected, 0, "a detail-pane click selected row {row}");
+    let list_x = a.hits.list.x + 4;
+    mouse(&mut a, MouseEventKind::Down(MouseButton::Left), list_x, y);
+    assert_eq!(a.selected, row);
+}
+
+/// Help is modal for the mouse as it is for keys.
+#[test]
+fn help_swallows_the_scroll_wheel_and_a_click_closes_it() {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    let mut a = sample_app();
+    a.set_view(View::All);
+    render(&mut a, 120, 24);
+    a.mode = Mode::Help;
+    mouse(&mut a, MouseEventKind::ScrollDown, 10, 5);
+    assert_eq!(a.selected, 0, "scrolling moved the list behind help");
+    assert_eq!(a.mode, Mode::Help);
+    mouse(&mut a, MouseEventKind::Down(MouseButton::Left), 10, 5);
+    assert_eq!(a.mode, Mode::Browse);
+}
+
+#[test]
+fn a_failed_copy_does_not_claim_success() {
+    let mut a = sample_app();
+    a.set_view(View::All);
+    a.settings.copy_command = "false".into();
+    a.copy_url();
+    let note = a.notice.clone().unwrap().0;
+    assert!(note.contains("nothing copied"), "{note}");
+
+    a.settings.copy_command = "true".into();
+    a.copy_url();
+    let note = a.notice.clone().unwrap().0;
+    assert!(note.starts_with("copied "), "{note}");
+}

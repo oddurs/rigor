@@ -10,15 +10,15 @@ use crate::app::App;
 
 const KEYS: &[(&str, &str)] = &[
     ("j / k, ↓ / ↑", "move selection"),
-    ("g / G", "first / last"),
+    ("g / G, home / end", "first / last"),
     ("PgUp / PgDn", "page"),
-    ("1–9, tab", "switch view (by position)"),
+    ("1–9, tab / ⇧tab", "switch view"),
     ("enter, o", "open PR in browser"),
     ("c", "open the PR's checks page"),
     ("y", "copy PR URL to clipboard"),
     ("s", "toggle sort: recent ⇄ attention"),
     ("d", "show / hide drafts"),
-    ("/", "filter list (title, branch, author)"),
+    ("/", "filter: title, branch, author, label"),
     ("esc", "clear filter"),
     ("r", "refresh now"),
     ("J / K", "scroll the detail pane"),
