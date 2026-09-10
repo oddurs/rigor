@@ -21,7 +21,7 @@ query($owner:String!, $name:String!, $cursor:String) {
   repository(owner:$owner, name:$name) {
     defaultBranchRef { name }
     mergedPullRequests: pullRequests(states:MERGED, first:50, orderBy:{field:UPDATED_AT, direction:DESC}) {
-      nodes { number title url headRefName mergedAt }
+      nodes { number title url headRefName headRefOid mergedAt }
     }
     pullRequests(states:OPEN, first:50, orderBy:{field:UPDATED_AT, direction:DESC}, after:$cursor) {
       pageInfo { hasNextPage endCursor }
@@ -68,7 +68,6 @@ pub struct Fetched {
     pub merged: Vec<MergedPr>,
 }
 
-/// Fetch every open PR (up to `max`), paginating the GraphQL connection.
 /// How long a single `gh api graphql` call may take. Generous, because a large
 /// repository paginates; the point is that a stalled connection cannot hold the
 /// refresh forever. `RIGOR_GH_TIMEOUT_SECS` overrides it — for very slow links,
@@ -177,6 +176,7 @@ fn parse_page(v: &Value) -> Result<Page> {
             title: string(n, "title"),
             url: string(n, "url"),
             head_ref: string(n, "headRefName"),
+            head_oid: string(n, "headRefOid"),
             merged_at: opt_ts(n, "mergedAt").unwrap_or(0),
         })
         .collect();
@@ -396,6 +396,10 @@ mod tests {
         assert_eq!(b.reset_at, parse_iso8601("2027-01-15T10:00:00Z").unwrap());
         assert_eq!(p.merged.len(), 1);
         assert_eq!(p.merged[0].head_ref, "landed-branch");
+        assert_eq!(
+            p.merged[0].head_oid,
+            "5d6c7b8a9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b"
+        );
         assert_eq!(p.next_cursor, None, "hasNextPage is false");
         assert_eq!(p.prs.len(), 3);
     }
@@ -501,6 +505,12 @@ mod tests {
         assert!(!f.default_branch.is_empty(), "defaultBranchRef");
         assert!(!f.prs.is_empty(), "cli/cli always has open pull requests");
         assert!(f.budget.is_some(), "rateLimit is still in the schema");
+        // Removal is decided by this commit id; an empty one would quietly
+        // mean no worktree is ever removable.
+        assert!(
+            !f.merged.is_empty() && f.merged.iter().all(|m| m.head_oid.len() >= 40),
+            "headRefOid on merged pull requests"
+        );
         assert!(
             f.prs
                 .iter()

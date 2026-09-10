@@ -162,13 +162,19 @@ pub fn list_worktrees(root: &Path) -> Result<Vec<Worktree>> {
 
 /// Working-tree state for one worktree: uncommitted files, drift from upstream,
 /// and the tip commit. Each call shells out a few times, so callers run it off-thread.
-pub fn worktree_status(wt: &Worktree, default_branch: &str) -> WorktreeStatus {
+///
+/// `None` when `git status` fails — a timeout, a worktree whose directory is
+/// gone. Reporting that as zero changed files would call the desk clean on no
+/// evidence, and a clean desk is one rigor may offer to remove.
+pub fn worktree_status(wt: &Worktree, default_branch: &str) -> Option<WorktreeStatus> {
     let p = &wt.path;
-    let mut st = WorktreeStatus::default();
-
-    if let Some(s) = git_ok(p, &["status", "--porcelain"]) {
-        st.dirty = s.lines().filter(|l| !l.is_empty()).count();
-    }
+    let mut st = WorktreeStatus {
+        dirty: git_ok(p, &["status", "--porcelain"])?
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count(),
+        ..WorktreeStatus::default()
+    };
 
     // Unpushed work is the signal that matters on an agent's desk. Against an
     // upstream that is exactly what `@{upstream}..HEAD` counts; with no upstream
@@ -198,7 +204,7 @@ pub fn worktree_status(wt: &Worktree, default_branch: &str) -> WorktreeStatus {
         st.last_author = it.next().unwrap_or("").to_string();
     }
 
-    st
+    Some(st)
 }
 
 /// A cheap fingerprint of a worktree's git state: when its HEAD file and index
@@ -236,17 +242,16 @@ fn gitdir(worktree: &Path) -> Option<PathBuf> {
     })
 }
 
+/// One worktree's scan: its path, its fingerprint, and its status if git
+/// could read it.
+pub type Scanned = (PathBuf, Signature, Option<WorktreeStatus>);
+
 /// Status for the worktrees at `which`, a few at a time and at background
-/// priority. Returns each scanned worktree's path, fingerprint and status; the
-/// fingerprint is taken before the scan, so a change made mid-scan is seen as a
-/// change next time rather than missed.
-pub fn scan(
-    wts: &[Worktree],
-    which: &[usize],
-    default_branch: &str,
-) -> Vec<(PathBuf, Signature, WorktreeStatus)> {
+/// priority. The fingerprint is taken before the scan, so a change made
+/// mid-scan is seen as a change next time rather than missed.
+pub fn scan(wts: &[Worktree], which: &[usize], default_branch: &str) -> Vec<Scanned> {
     let next = AtomicUsize::new(0);
-    let results: Mutex<Vec<(PathBuf, Signature, WorktreeStatus)>> = Mutex::new(Vec::new());
+    let results: Mutex<Vec<Scanned>> = Mutex::new(Vec::new());
     // Four at a time: enough to finish promptly, few enough that a scan of a
     // large repository never saturates the disk while agents are building.
     let workers = std::thread::available_parallelism()
@@ -274,4 +279,25 @@ pub fn scan(
     results
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A worktree whose directory is gone cannot be read, and must not come
+    /// back looking clean: a clean desk is one rigor may offer to remove.
+    #[test]
+    fn a_status_git_cannot_read_is_unknown_not_clean() {
+        let d = tempfile::tempdir().unwrap();
+        let wt = Worktree {
+            path: d.path().join("gone"),
+            branch: Some("feat/x".into()),
+            head: String::new(),
+            is_main: false,
+            detached: false,
+            status: None,
+        };
+        assert!(worktree_status(&wt, "main").is_none());
+    }
 }

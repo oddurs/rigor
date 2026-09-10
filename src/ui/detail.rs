@@ -7,8 +7,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, WtState};
-use crate::model::{CheckState, Mergeable, MergedPr, Pr, Worktree};
+use crate::app::{App, Desk, WtState};
+use crate::model::{CheckState, Mergeable, Pr, Worktree};
 use crate::theme::Theme;
 use crate::util::{cell, cols, dur_short, now_secs, pad, rel_time, right, truncate};
 
@@ -33,11 +33,14 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
             &t,
             area.width as usize,
         ),
-        (None, Some(wt)) => {
-            let merged = wt.branch.as_deref().and_then(|b| app.merged_for_branch(b));
-            let state = app.wt_state(wt);
-            wt_detail(&mut lines, wt, merged, state, app.home.as_deref(), now, &t);
-        }
+        (None, Some(wt)) => wt_detail(
+            &mut lines,
+            &app.desk(wt),
+            app.settings.worktree_status,
+            app.home.as_deref(),
+            now,
+            &t,
+        ),
         // The list pane already explains an empty view; saying it twice is noise.
         (None, None) => {}
     }
@@ -306,15 +309,17 @@ fn checks(
     }
 }
 
+/// `scanning` is whether worktree status is on at all, which decides how an
+/// unknown status is explained.
 fn wt_detail(
     lines: &mut Vec<Line<'static>>,
-    w: &Worktree,
-    merged: Option<&MergedPr>,
-    disposition: WtState,
+    desk: &Desk<'_>,
+    scanning: bool,
     home: Option<&str>,
     now: i64,
     t: &Theme,
 ) {
+    let w = desk.wt;
     lines.push(Line::from(Span::styled(
         format!(
             " {}{}",
@@ -339,7 +344,19 @@ fn wt_detail(
         Span::styled(branch, Style::new().fg(t.fg)),
     ]));
 
-    let st = w.status.clone().unwrap_or_default();
+    let Some(st) = desk.status() else {
+        let why = if scanning {
+            "not scanned yet"
+        } else {
+            "not checked: worktree_status is off"
+        };
+        lines.push(Line::from(vec![
+            field("state", t),
+            Span::styled(why, Style::new().fg(t.muted)),
+        ]));
+        merged_pr(lines, desk, now, t);
+        return;
+    };
     let mut state = vec![field("state", t)];
     if st.dirty > 0 {
         state.push(Span::styled(
@@ -379,7 +396,13 @@ fn wt_detail(
         ]));
     }
 
-    match merged {
+    merged_pr(lines, desk, now, t);
+    cleanup(lines, desk, home, t);
+}
+
+/// The PR line: the merged PR this branch landed as, if any.
+fn merged_pr(lines: &mut Vec<Line<'static>>, desk: &Desk<'_>, now: i64, t: &Theme) {
+    match desk.merged {
         Some(m) => {
             lines.push(Line::from(vec![
                 field("pr", t),
@@ -398,22 +421,14 @@ fn wt_detail(
             Span::styled("no open PR for this branch", Style::new().fg(t.muted)),
         ])),
     }
-
-    cleanup(lines, w, merged, disposition, home, t);
 }
 
 /// The one line of advice the worktree view exists for: whether this desk can
 /// be collected, and the command to do it.
-fn cleanup(
-    lines: &mut Vec<Line<'static>>,
-    w: &Worktree,
-    merged: Option<&MergedPr>,
-    disposition: WtState,
-    home: Option<&str>,
-    t: &Theme,
-) {
+fn cleanup(lines: &mut Vec<Line<'static>>, desk: &Desk<'_>, home: Option<&str>, t: &Theme) {
+    let (w, merged) = (desk.wt, desk.merged);
     // Only ever say a desk is collectable when nothing local would be lost.
-    match disposition {
+    match desk.state {
         WtState::Removable => {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
@@ -426,7 +441,7 @@ fn cleanup(
             lines.push(Line::from(vec![
                 field("", t),
                 Span::styled(
-                    format!("git worktree remove {}", w.short_path(home)),
+                    format!("git worktree remove {}", shell_path(w, home)),
                     Style::new().fg(t.fg),
                 ),
             ]));
@@ -441,6 +456,33 @@ fn cleanup(
                 ),
             ]));
         }
+        // Pushed and clean, but not at the commit that merged: the branch has
+        // moved on, or someone added to the PR from elsewhere. Say why this
+        // is not offered for removal rather than leave it looking forgotten.
+        WtState::Idle if merged.is_some() && !desk.landed && w.status.is_some() && !w.is_main => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                field("cleanup", t),
+                Span::styled(
+                    "a PR from this branch merged, but not at this commit",
+                    Style::new().fg(t.muted),
+                ),
+            ]));
+        }
         _ => {}
     }
+}
+
+/// The worktree's path as one shell word. `~`-shortened when it needs no
+/// quoting, since the shell expands `~` only outside quotes; otherwise the
+/// full path, single-quoted.
+pub fn shell_path(w: &Worktree, home: Option<&str>) -> String {
+    let short = w.short_path(home);
+    if short
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-~+@%:,=".contains(c))
+    {
+        return short;
+    }
+    format!("'{}'", w.path.to_string_lossy().replace('\'', r"'\''"))
 }

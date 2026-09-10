@@ -1,7 +1,7 @@
 //! Layered configuration: built-in defaults, user config, repo-local config,
 //! then environment and CLI overrides.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -54,6 +54,16 @@ impl View {
         }
     }
 
+    /// The name config files and `--view` use.
+    pub fn name(self) -> String {
+        self.title().to_ascii_lowercase()
+    }
+
+    /// Every view's name, for error messages.
+    pub fn names() -> String {
+        Self::ALL.map(Self::name).join(", ")
+    }
+
     pub const fn title(self) -> &'static str {
         match self {
             Self::Ready => "Ready",
@@ -87,6 +97,14 @@ pub enum LayoutMode {
 }
 
 impl LayoutMode {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Split => "split",
+            Self::Stack => "stack",
+        }
+    }
+
     fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
@@ -199,10 +217,17 @@ const fn default_copy() -> &'static str {
     }
 }
 
+/// `$RIGOR_CONFIG`, when set and not empty.
+fn named_config() -> Option<PathBuf> {
+    std::env::var_os("RIGOR_CONFIG")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+}
+
 /// `$RIGOR_CONFIG`, else `$XDG_CONFIG_HOME/rigor/config.toml`, else `~/.config/rigor/config.toml`.
 pub fn user_config_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("RIGOR_CONFIG") {
-        return Some(PathBuf::from(p));
+    if let Some(p) = named_config() {
+        return Some(p);
     }
     let base = std::env::var("XDG_CONFIG_HOME")
         .ok()
@@ -231,11 +256,15 @@ pub fn load(repo_root: &Path, explicit: Option<&Path>) -> Result<Settings> {
     let mut merged = ConfigFile::default();
     let mut sources = Vec::new();
 
-    let user_path = match explicit {
-        Some(p) => Some(p.to_path_buf()),
-        None => user_config_path(),
-    };
-    if let Some(p) = user_path
+    // A file someone named, with `--config` or `RIGOR_CONFIG`, has to exist:
+    // a typo in its path would otherwise run quietly on the defaults.
+    let named = explicit.map(Path::to_path_buf).or_else(named_config);
+    if let Some(p) = &named
+        && !p.exists()
+    {
+        bail!("config file {} does not exist", p.display());
+    }
+    if let Some(p) = named.or_else(user_config_path)
         && let Some(c) = read(&p)?
     {
         merged.merge(c);
@@ -252,13 +281,8 @@ pub fn load(repo_root: &Path, explicit: Option<&Path>) -> Result<Settings> {
     if let Some(names) = &merged.views {
         let mut views: Vec<View> = Vec::new();
         for n in names {
-            let v = View::parse(n).with_context(|| {
-                let names: Vec<&str> = View::ALL.iter().map(|v| v.title()).collect();
-                format!(
-                    "views: `{n}` is not a view name (try {})",
-                    names.join(", ").to_lowercase()
-                )
-            })?;
+            let v = View::parse(n)
+                .with_context(|| format!("views: `{n}` is not a view (try {})", View::names()))?;
             if !views.contains(&v) {
                 views.push(v);
             }
@@ -267,8 +291,13 @@ pub fn load(repo_root: &Path, explicit: Option<&Path>) -> Result<Settings> {
             s.views = views;
         }
     }
-    if let Some(v) = merged.default_view.as_deref().and_then(View::parse) {
-        s.default_view = v;
+    if let Some(name) = merged.default_view.as_deref() {
+        s.default_view = View::parse(name).with_context(|| {
+            format!(
+                "default_view: `{name}` is not a view (try {})",
+                View::names()
+            )
+        })?;
     }
     // Landing on a tab that is not on the tab bar would leave the bar with
     // nothing highlighted, so fall back to the first configured view.
@@ -278,8 +307,10 @@ pub fn load(repo_root: &Path, explicit: Option<&Path>) -> Result<Settings> {
     if let Some(v) = merged.refresh_secs {
         s.refresh_secs = v;
     }
-    if let Some(v) = merged.layout.as_deref().and_then(LayoutMode::parse) {
-        s.layout = v;
+    if let Some(name) = merged.layout.as_deref() {
+        s.layout = LayoutMode::parse(name).with_context(|| {
+            format!("layout: `{name}` is not a layout (try auto, split or stack)")
+        })?;
     }
     if let Some(v) = merged.max_prs {
         s.max_prs = v.clamp(1, 1000);
@@ -319,7 +350,7 @@ default_view    = "ready"  # any name from `views` below
 views = ["ready", "mine", "review", "blocked", "all", "worktrees"]
 refresh_secs    = 90       # 0 disables background refresh
 layout          = "auto"   # auto | split (side-by-side) | stack (list over detail)
-max_prs         = 200
+max_prs         = 200      # 1 to 1000
 show_drafts     = true
 mouse           = true
 worktree_status = true     # off skips per-worktree git status entirely
@@ -327,6 +358,8 @@ worktree_status = true     # off skips per-worktree git status entirely
 # a checkout). This is how often all of them are rescanned, to catch unstaged
 # edits too. 0 rescans everything only when you press r.
 worktree_scan_secs = 300
+# Run with the URL as the last argument; the copy command gets it on stdin.
+# Defaults: open and pbcopy on macOS, xdg-open and xclip elsewhere.
 # open_command  = "open"
 # copy_command  = "pbcopy"
 
@@ -339,6 +372,7 @@ worktree_scan_secs = 300
 # success = "green"
 # failure = "red"
 # pending = "yellow"
+# warn    = "magenta"  # local work: uncommitted or unpushed
 # muted   = "darkgray"
 # fg      = "inherit"
 # bg      = "inherit"
@@ -348,6 +382,7 @@ worktree_scan_secs = 300
 # do not report them get no band: an accent bar and a bolder line instead.
 # Set either to pin it:
 # sel_bg  = "#2b2d31"
+# sel_fg  = "inherit"
 # border  = "8"        # ANSI bright-black, i.e. whatever your theme calls it
 "##;
 
@@ -418,5 +453,36 @@ mod tests {
             load(d.path(), Some(&typo)).is_err(),
             "a typo must not be silently ignored"
         );
+    }
+
+    /// A bad value is as much a typo as a bad key, for every field that names
+    /// something.
+    #[test]
+    fn unknown_view_and_layout_names_are_errors() {
+        let d = tempfile::tempdir().unwrap();
+        for (body, needle) in [
+            ("default_view = \"someday\"\n", "someday"),
+            ("layout = \"sideways\"\n", "sideways"),
+        ] {
+            let p = write(d.path(), "d.toml", body);
+            let err = format!("{:#}", load(d.path(), Some(&p)).unwrap_err());
+            assert!(err.contains(needle), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_named_config_file_must_exist() {
+        let d = tempfile::tempdir().unwrap();
+        let missing = d.path().join("nope.toml");
+        let err = load(d.path(), Some(&missing)).unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    /// The starter config is a working config: every key in it parses.
+    #[test]
+    fn the_sample_config_loads() {
+        let d = tempfile::tempdir().unwrap();
+        let p = write(d.path(), "sample.toml", SAMPLE);
+        load(d.path(), Some(&p)).unwrap();
     }
 }

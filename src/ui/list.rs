@@ -7,9 +7,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, Row, WtState};
+use crate::app::{App, Desk, Row, WtState};
 use crate::config::View;
-use crate::model::{CheckState, Mergeable, MergedPr, Pr, Worktree, WorktreeStatus};
+use crate::model::{CheckState, Mergeable, Pr, Worktree};
 use crate::theme::Theme;
 use crate::util::{cell, cols, now_secs, pad, rel_time, right, truncate};
 
@@ -73,13 +73,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
                 let pr = &app.prs[pi];
                 pr_line(pr, app.worktree_for(pr), selected, &ctx)
             }
-            Row::Wt(wi) => {
-                let w = &app.worktrees[wi];
-                let pr = w.branch.as_deref().and_then(|b| app.pr_for_branch(b));
-                let merged = w.branch.as_deref().and_then(|b| app.merged_for_branch(b));
-                let state = app.wt_state(w);
-                wt_line(w, pr, merged, state, selected, &ctx)
-            }
+            Row::Wt(wi) => wt_line(&app.desk(&app.worktrees[wi]), selected, &ctx),
         };
         lines.push(line);
     }
@@ -233,23 +227,16 @@ fn review_cell(pr: &Pr, t: &Theme) -> (&'static str, Color) {
 }
 
 /// Worktree view: the workspace, what it is on, and whether it has a PR yet.
-fn wt_line(
-    w: &Worktree,
-    pr: Option<&Pr>,
-    merged: Option<&MergedPr>,
-    state: WtState,
-    selected: bool,
-    ctx: &RowCtx<'_>,
-) -> Line<'static> {
+fn wt_line(desk: &Desk<'_>, selected: bool, ctx: &RowCtx<'_>) -> Line<'static> {
     let (t, width, now, home) = (ctx.theme, ctx.width, ctx.now, ctx.home);
+    let (w, pr, merged, state) = (desk.wt, desk.pr, desk.merged, desk.state);
     let base = row_style(selected, t);
     let mut spans = vec![Span::styled(
         if selected { "▎" } else { " " },
         base.fg(t.accent),
     )];
 
-    let unknown = WorktreeStatus::default();
-    let st = w.status.as_ref().unwrap_or(&unknown);
+    let st = desk.status();
     let (glyph, glyph_color) = match state {
         WtState::Working => ("●", t.warn),
         WtState::Removable => ("⌫", t.success),
@@ -286,12 +273,14 @@ fn wt_line(
     };
     spans.push(Span::styled(pad(&pr_text, 14), base.fg(pr_color)));
 
-    let (drift, drift_color) = match state {
-        // A detached checkout has no branch to be local to or unpushed from.
+    let (drift, drift_color) = match (&st, state) {
+        // A detached checkout has no branch to be local to or unpushed from,
+        // and a desk not yet scanned has said nothing either way.
         _ if w.detached => (String::new(), t.muted),
-        WtState::Removable => ("removable".to_string(), t.success),
-        _ if st.unpushed > 0 => (st.drift(), t.warn),
-        _ => (st.drift(), t.muted),
+        (None, _) => (String::new(), t.muted),
+        (_, WtState::Removable) => ("removable".to_string(), t.success),
+        (Some(st), _) if st.unpushed > 0 => (st.drift(), t.warn),
+        (Some(st), _) => (st.drift(), t.muted),
     };
     spans.push(Span::styled(
         pad(&truncate(&drift, 9), 10),
@@ -315,7 +304,7 @@ fn wt_line(
 
     if show_age {
         let age = st
-            .last_commit_at
+            .and_then(|s| s.last_commit_at)
             .map(|ts| rel_time(ts, now))
             .unwrap_or_default();
         spans.push(Span::styled(

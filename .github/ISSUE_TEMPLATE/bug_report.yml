@@ -54,6 +54,6 @@ body:
     attributes:
       label: Configuration
       description: Output of `rigor --print-config`, plus any `[theme]` overrides.
-      render: toml
+      render: text
     validations:
       required: false

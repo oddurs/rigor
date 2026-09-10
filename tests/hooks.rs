@@ -140,6 +140,8 @@ fn commit_msg_accepts_conventional_commits() {
         "chore(deps): bump ratatui",
         "docs: explain the seam\n\nLonger body explaining why.",
         "feat: a subject\n# a comment git strips\n",
+        "# a template comment before the subject\nfeat: a subject\n",
+        "feat: trailing blank lines are not part of it\n\n\n\n",
         "Merge branch 'feature'",
         "Revert \"feat: something\"",
     ] {

@@ -44,18 +44,24 @@ Six views, selected with the number keys, Tab, or a click:
 | `All` | Every open pull request |
 | `Worktrees` | Every git worktree, its branch, its pull request, and its local state |
 
+An `Assigned` view, for pull requests assigned to you, is off the tab bar by
+default; add it with `views` in the config, or open on it with `rigor -v assigned`.
+
 Keys: `o`/`Enter` opens the selected pull request in the browser, `c` its checks
 page, `y` copies the URL, `/` filters, `s` toggles between recency and
-merge-readiness ordering, `r` refreshes, `?` lists everything.
+merge-readiness ordering, `d` shows or hides drafts, `r` refreshes, `?` lists
+everything.
 
 CI shows as a rolled-up glyph with counts in each row (`✓ 19`, `✗ 1/19`,
 `◐ 15/19`); selecting a pull request expands every check run with its state and
 duration, and clicking one opens that job.
 
-In the `Worktrees` view, a worktree whose branch has landed and whose desk is
-clean is marked `removable`, with the exact `git worktree remove` line in the
-detail pane. `rigor` never modifies your repository — it only tells you what is
-safe to collect.
+In the `Worktrees` view, a worktree still at the exact commit its pull request
+merged at, with nothing uncommitted, is marked `removable`, with the
+`git worktree remove` line in the detail pane. Matching the commit, not just the
+branch name, means a reused branch name with new work is never offered, and a
+squash-merged branch whose remote was deleted still is. `rigor` never modifies
+your repository — it only tells you what is safe to collect.
 
 ## Configuration
 
@@ -66,9 +72,14 @@ your terminal is themed with. Everything is optional:
 rigor --init-config   # writes a commented ~/.config/rigor/config.toml
 ```
 
-A repo-local `.rigor.toml` overrides the user config. `RIGOR_THEME` (or
-`HERDR_THEME_FILE`) points at a theme file, which lets a parent shell hand its
-palette down at launch. `NO_COLOR` is honored.
+A repo-local `.rigor.toml` overrides the user config. `RIGOR_CONFIG` (or
+`--config`) names a different user config, and `rigor --print-config` shows the
+settings in effect and which files they came from. An unknown key or value is an
+error, not silently ignored.
+
+`RIGOR_THEME` (or `HERDR_THEME_FILE`) points at a theme file, which lets a parent
+shell hand its palette down at launch. `NO_COLOR` is honored.
+`RIGOR_GH_TIMEOUT_SECS` changes how long one GitHub call may take (default 45).
 
 The selection band and the hairlines are the exception to palette slots: rigor
 asks the terminal for its actual foreground and background (OSC 10/11) and mixes

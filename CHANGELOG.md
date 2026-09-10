@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `--print-config` lists the tab bar, and spells every value the way a config
+  file does, so a line can be copied into one.
+
 - A full testing workflow. nextest runs the suite, with per-test timeouts so a
   hung end-to-end test is killed rather than stalling the run. Snapshot tests
   pin every major screen state. Property tests cover column widths, date
@@ -23,6 +26,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports coverage (`scripts/task coverage`).
 
 ### Fixed
+
+- A worktree is offered for removal only when it is still at the exact commit
+  its pull request merged at. Matching by branch name alone offered a reused
+  branch name holding new, unmerged commits. And after a squash merge whose
+  remote branch was deleted and pruned, the branch's commits counted as
+  unpushed, so the desk was never offered at all.
+- A worktree whose status was not yet known — before its first scan, with
+  `worktree_status = false`, or when `git status` failed — was shown as `local`
+  and `clean`, and could be marked removable. It now makes no claim either way,
+  and the detail pane says why.
+- With drafts hidden, tab counts still included them, so a tab could promise
+  more rows than its list held.
+- Side by side, a click in the detail pane selected whichever list row shared
+  its screen line.
+- With help open, the scroll wheel moved the list behind it.
+- A Ctrl or Alt chord typed its letter into the filter.
+- A copy command that failed still reported the URL as copied.
+- Each opened pull request left a finished opener process unreaped for the rest
+  of the session, and the opener inherited the terminal's input.
+- A `--config` or `RIGOR_CONFIG` path that did not exist was ignored, and so was
+  an unknown `default_view` or `layout` value. Each is now an error.
+- `--view`'s help and error message left out `ready` and `blocked`, and it could
+  open on a view missing from the tab bar, with no tab highlighted. The help
+  lists every view, and a view missing from the bar is added to it.
 
 - A `gh` call that stalled — a connection left half-open across sleep and wake
   is the usual cause — stopped all further refreshes for good. Every `gh` and

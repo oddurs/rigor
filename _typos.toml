@@ -5,7 +5,11 @@
 locale = "en-us"
 
 [files]
+# Dotfiles too: .github, .githooks and .config are prose and scripts like any
+# other, and typos skips hidden paths unless told otherwise.
+ignore-hidden = false
 extend-exclude = [
+  ".git/",
   "Cargo.lock",
   "site/pnpm-lock.yaml",
   # Generated from source: regenerated, never edited by hand.

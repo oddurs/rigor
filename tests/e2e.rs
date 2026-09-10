@@ -23,6 +23,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const FIXTURE: &str = include_str!("fixtures/graphql_page.json");
+/// The final commit the fixture gives the merged PR for `landed-branch`. Each
+/// run's repository has its own commit ids, so the fake `gh` answers with the
+/// landed desk's real HEAD in its place.
+const FIXTURE_LANDED_OID: &str = "5d6c7b8a9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b";
 const ROWS: u16 = 30;
 const COLS: u16 = 160;
 
@@ -121,7 +125,17 @@ fn init_repo(root: &Path) {
 fn install_fakes(root: &Path) {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(root.join("fixture.json"), FIXTURE).unwrap();
+    let landed = isolated("git", &root.join("wt/landed"))
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let landed = String::from_utf8(landed.stdout).unwrap();
+    assert!(FIXTURE.contains(FIXTURE_LANDED_OID));
+    std::fs::write(
+        root.join("fixture.json"),
+        FIXTURE.replace(FIXTURE_LANDED_OID, landed.trim()),
+    )
+    .unwrap();
     std::fs::write(root.join("gh.mode"), "ok").unwrap();
     write_exe(
         &bin.join("gh"),
