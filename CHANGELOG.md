@@ -40,9 +40,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal or supervisor allows before SIGKILL.
 - A panic in a background worker could leave a loading flag set forever. Workers
   now always report back, and such a panic no longer tears down the screen.
+- A theme color with a sign after the `#`, such as `#+fffff`, was read as a
+  different color. Hex colors must now be all hex digits; anything else is
+  reported as not a color.
+- The pre-push hook refused the first publish of a repository using SHA-256
+  object ids, whose missing-ref id is 64 zeros rather than 40.
+- CI's `required` gate was skipped, not failed, when a job it depends on
+  failed, and branch protection counts a skipped check as passing. It now
+  always runs and passes only when every job succeeded.
 
 ### Changed
 
+- The code is held to a strict standard, enforced by `scripts/task lint`:
+  clippy's pedantic group plus selected nursery and restriction lints, with
+  warnings as errors; shellcheck with its optional checks; actionlint for the
+  workflows; typos for spelling, in American English. `scripts/task audit`
+  checks dependencies against an advisory, license and source policy with
+  cargo-deny, and CI runs it on every change. Workflow actions are pinned to a
+  commit SHA. The published crate ships only the program and what its unit
+  tests read.
 - Worktrees are rescanned only when their git state moved — two `stat` calls per
   worktree decide it — plus any removable candidate and the selected one, with a
   full sweep every `worktree_scan_secs` (default 300) to catch unstaged edits.

@@ -43,6 +43,7 @@ scripts/task lint       # lint, warnings are errors
 scripts/task test       # full test suite
 scripts/task build      # compile
 scripts/task check      # all of the above
+scripts/task audit      # dependency policy (needs the network)
 ```
 
 Do not invoke `cargo` directly in a script, a hook, or a workflow. CI runs
@@ -98,6 +99,11 @@ from inside the worktree it would delete is refused.
 ## Code shape
 
 - Match the surrounding style, naming, and comment density.
+- The standards in CONTRIBUTING.md are enforced, not advisory. In short:
+  `#[expect(lint, reason = "...")]`, never `#[allow]`; no `unwrap` or `expect`
+  outside tests; a `// SAFETY:` comment on every `unsafe` block; no lossy `as`
+  casts; in shell, no `|| true` and no `"$(...)"` used directly as an argument;
+  American English.
 - Comments explain why, not what. Do not narrate the diff.
 - Do not add a dependency, an abstraction, or a config knob that the change does
   not require.
