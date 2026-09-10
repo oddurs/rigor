@@ -17,6 +17,8 @@ targets:
   test       full test suite
   build      compile all targets
   check      fmt:check && lint && test && build
+
+Covers both the Rust CLI and the site in site/.
 USAGE
 	exit 2
 }
@@ -24,21 +26,39 @@ USAGE
 # The pinned toolchain in rust-toolchain.toml is installed on demand by rustup.
 CARGO="${CARGO:-cargo}"
 
+# The site is a second stack behind the same seam. Its dependencies are not
+# optional: skipping them silently would let the site rot while `check` stayed
+# green, so a missing install is a loud failure with the command to fix it.
+site() {
+	if [ ! -d site/node_modules ]; then
+		printf 'site/node_modules is missing. run: scripts/setup\n' >&2
+		printf '  (or, just for the site: cd site && pnpm install)\n' >&2
+		exit 1
+	fi
+	(cd site && pnpm run --silent "$@")
+}
+
 case "${1:-}" in
 fmt)
 	"$CARGO" fmt --all
+	site fmt
 	;;
 fmt:check)
 	"$CARGO" fmt --all -- --check
+	site fmt:check
 	;;
 lint)
 	"$CARGO" clippy --all-targets --all-features --locked -- -D warnings
+	site typecheck
 	;;
 test)
 	"$CARGO" test --all-features --locked
+	# The site is one static page with no behaviour of its own; `next build`
+	# in the build target is what would catch a break. No test target for it.
 	;;
 build)
 	"$CARGO" build --all-targets --locked
+	site build
 	;;
 check)
 	# Ordered cheapest-first so the fastest signal fails first.

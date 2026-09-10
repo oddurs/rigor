@@ -23,3 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `config.toml`, `.rigor.toml`, `RIGOR_THEME`, or `HERDR_THEME_FILE`. `NO_COLOR`
   is honoured.
 - Mouse support: click a tab, a row, or a check run; scroll either pane.
+- `site/`: a single-page landing and docs site, built with Next.js and StyleX
+  and exported to static HTML. Its hero shows a frame captured from the
+  renderer's own test fixtures.

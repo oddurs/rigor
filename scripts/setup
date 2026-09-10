@@ -16,6 +16,14 @@ else
 	exit 1
 fi
 
+printf 'installing site dependencies\n'
+if command -v pnpm >/dev/null 2>&1; then
+	(cd site && pnpm install --frozen-lockfile)
+else
+	printf 'pnpm not found: install Node 22+ and `corepack enable pnpm`, then re-run\n' >&2
+	exit 1
+fi
+
 printf 'verifying the project builds green\n'
 scripts/task check
 

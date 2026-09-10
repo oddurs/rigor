@@ -9,8 +9,9 @@ protection, so following it is the path of least resistance.
 scripts/setup
 ```
 
-This wires `core.hooksPath` to `.githooks/`, installs the pinned toolchain, and
-verifies the project is green.
+This wires `core.hooksPath` to `.githooks/`, installs the pinned Rust toolchain
+and the site's dependencies, and verifies the project is green. You need Node
+22+ with pnpm as well as Rust, because `site/` is part of `scripts/task check`.
 
 ## One unit of work, one worktree, one branch, one pull request
 
