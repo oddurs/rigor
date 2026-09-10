@@ -13,9 +13,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::app::{App, Hits};
+use crate::app::{App, Hits, Mode};
 use crate::config::{LayoutMode, View};
-use crate::util::{now_secs, rel_time};
+use crate::util::{cols, now_secs, rel_time, secs};
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
@@ -43,7 +43,7 @@ pub fn clip(line: Line<'static>, width: usize) -> Line<'static> {
     Line::from(out).style(style)
 }
 
-pub fn draw(f: &mut Frame, app: &mut App) {
+pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     let area = f.area();
     app.hits = Hits::default();
 
@@ -71,12 +71,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_body(f, split, app);
     draw_footer(f, footer, app);
 
-    if app.show_help {
+    if app.mode == Mode::Help {
         help::draw(f, area, app);
     }
 }
 
-fn width_of(spans: &[Span]) -> usize {
+fn width_of(spans: &[Span<'_>]) -> usize {
     spans.iter().map(|s| crate::util::width(&s.content)).sum()
 }
 
@@ -86,7 +86,7 @@ fn width_of(spans: &[Span]) -> usize {
 /// the accent, a hairline sets it apart, and the repository is the one bold
 /// thing on the line. When the line is too narrow, context goes in order of
 /// how little it helps — the branch, then the user, then the status.
-fn draw_nav(f: &mut Frame, area: Rect, app: &App) {
+fn draw_nav(f: &mut Frame<'_>, area: Rect, app: &App) {
     let t = app.theme;
     let muted = Style::new().fg(t.muted);
 
@@ -111,7 +111,7 @@ fn draw_nav(f: &mut Frame, area: Rect, app: &App) {
     let viewer = (!app.viewer.is_empty()).then(|| Span::styled(format!("@{}", app.viewer), muted));
 
     let assemble = |sb: bool, sv: bool, ss: bool| -> (Vec<Span<'static>>, Vec<Span<'static>>) {
-        let mut left: Vec<Span> = head.to_vec();
+        let mut left: Vec<Span<'_>> = head.to_vec();
         if sb && let Some(b) = &branch {
             left.extend(b.iter().cloned());
         }
@@ -166,7 +166,7 @@ fn sync_status(app: &App) -> Vec<Span<'static>> {
         }
     };
 
-    if app.loading_prs || app.loading_wts {
+    if app.in_flight.syncing() {
         return vec![
             Span::styled(
                 SPINNER[app.spinner % SPINNER.len()],
@@ -175,28 +175,28 @@ fn sync_status(app: &App) -> Vec<Span<'static>> {
             Span::styled(" syncing", muted),
         ];
     }
-    if let Some(at) = app.paused_until.filter(|at| *at > now) {
+    if let Some(at) = app.schedule.paused_until.filter(|at| *at > now) {
         return vec![
             dot(t.pending),
             Span::styled(format!(" rate limited · resumes{}", until(at)), muted),
         ];
     }
     if app.error.is_some() {
-        let retry = if app.next_refresh == i64::MAX {
+        let retry = if app.schedule.next_refresh == i64::MAX {
             String::new()
         } else {
-            format!(" · retry{}", until(app.next_refresh))
+            format!(" · retry{}", until(app.schedule.next_refresh))
         };
         return vec![
             dot(t.failure),
             Span::styled(format!(" sync failed{retry}"), muted),
         ];
     }
-    if app.last_refresh == 0 {
+    if app.schedule.last_refresh == 0 {
         return Vec::new();
     }
-    let age = now - app.last_refresh;
-    let every = app.settings.refresh_secs as i64;
+    let age = now - app.schedule.last_refresh;
+    let every = secs(app.settings.refresh_secs);
     let stale = if every > 0 {
         age > every * 2
     } else {
@@ -204,7 +204,10 @@ fn sync_status(app: &App) -> Vec<Span<'static>> {
     };
     vec![
         dot(if stale { t.pending } else { t.success }),
-        Span::styled(format!(" {} ago", rel_time(app.last_refresh, now)), muted),
+        Span::styled(
+            format!(" {} ago", rel_time(app.schedule.last_refresh, now)),
+            muted,
+        ),
     ]
 }
 
@@ -215,7 +218,7 @@ fn sync_status(app: &App) -> Vec<Span<'static>> {
 /// front of each title, which put two bare digits side by side (`Ready 2  2
 /// Mine`); the number keys are positional and listed in the footer instead.
 fn draw_subnav(
-    f: &mut Frame,
+    f: &mut Frame<'_>,
     area: Rect,
     rail: Rect,
     app: &mut App,
@@ -223,7 +226,7 @@ fn draw_subnav(
     list: Rect,
 ) {
     let t = app.theme;
-    let mut spans: Vec<Span> = Vec::new();
+    let mut spans: Vec<Span<'_>> = Vec::new();
     let mut x = area.x;
     let mut underline: Option<(u16, u16)> = None;
 
@@ -247,7 +250,7 @@ fn draw_subnav(
 
         let title = v.title();
         let num = count.to_string();
-        let w = (title.chars().count() + num.chars().count() + 3) as u16;
+        let w = cols(title.chars().count() + num.chars().count() + 3);
 
         spans.push(Span::styled(" ", base));
         spans.push(Span::styled(title, title_style));
@@ -270,8 +273,8 @@ fn draw_subnav(
         x = x.saturating_add(w + 1);
     }
 
-    let mut right: Vec<Span> = Vec::new();
-    if !app.filter.is_empty() && !app.filter_mode {
+    let mut right: Vec<Span<'_>> = Vec::new();
+    if !app.filter.is_empty() && app.mode != Mode::Filter {
         right.push(Span::styled(
             format!("/{}   ", app.filter),
             Style::new().fg(t.accent),
@@ -303,7 +306,7 @@ fn draw_subnav(
     // right end of the list's stretch of rail.
     let marker = (app.rows.len() > list.height as usize).then(|| {
         (
-            divider_x.unwrap_or(rail.right()),
+            divider_x.unwrap_or_else(|| rail.right()),
             format!(" {}/{} ", app.selected + 1, app.rows.len()),
         )
     });
@@ -336,10 +339,10 @@ fn rail_line(
     // The marker ends one column short of the junction (or the edge) and never
     // overwrites the active tab's underline.
     if let Some((end_x, text)) = marker {
-        let w = text.chars().count() as u16;
+        let w = cols(text.chars().count());
         let start = end_x.saturating_sub(1 + w).max(rail.x);
         for (i, ch) in text.chars().enumerate() {
-            let cx = start + i as u16;
+            let cx = start + cols(i);
             if cx < rail.right() && !under(cx) {
                 cells[(cx - rail.x) as usize] = (ch, Style::new().fg(t.muted));
             }
@@ -352,7 +355,7 @@ fn rail_line(
     }
 
     // Merge runs of one style into a single span.
-    let mut spans: Vec<Span> = Vec::new();
+    let mut spans: Vec<Span<'_>> = Vec::new();
     let mut run = String::new();
     let mut run_style = light;
     for (ch, st) in cells {
@@ -368,6 +371,7 @@ fn rail_line(
     Line::from(spans)
 }
 
+#[derive(Clone, Copy)]
 struct BodySplit {
     list: Rect,
     detail_outer: Rect,
@@ -398,7 +402,7 @@ fn body_layout(app: &App, area: Rect) -> BodySplit {
     }
 }
 
-fn draw_body(f: &mut Frame, split: BodySplit, app: &mut App) {
+fn draw_body(f: &mut Frame<'_>, split: BodySplit, app: &mut App) {
     let t = app.theme;
     let block = Block::new()
         .borders(if split.side_by_side {
@@ -419,11 +423,11 @@ fn draw_body(f: &mut Frame, split: BodySplit, app: &mut App) {
 
 /// The footer is the command line. It uses no filled badges — the same rule as
 /// the nav — and it only offers actions that would do something right now.
-fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
     let t = app.theme;
     let muted = Style::new().fg(t.muted);
 
-    if app.filter_mode {
+    if app.mode == Mode::Filter {
         // A live count is the point of typing a filter: see the list narrow.
         let line = Line::from(vec![
             Span::styled(" /", Style::new().fg(t.accent)),
@@ -475,7 +479,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         "1".into()
     };
 
-    let mut left: Vec<Vec<Span>> = vec![key(&view_keys, "view")];
+    let mut left: Vec<Vec<Span<'_>>> = vec![key(&view_keys, "view")];
     if has_pr || landed {
         left.push(key("o", "open"));
     }
@@ -489,7 +493,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 
     // Help and quit are pinned right, so they survive any width: they are how
     // you find everything else.
-    let mut right: Vec<Span> = key("?", "help");
+    let mut right: Vec<Span<'_>> = key("?", "help");
     right.extend([
         Span::styled("q".to_string(), Style::new().fg(t.fg)),
         Span::styled(" quit ".to_string(), muted),

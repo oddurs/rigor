@@ -6,6 +6,14 @@
 //! so they keep holding. The screen is rebuilt with a real terminal emulator
 //! (vt100), so what is asserted is what a user would see.
 #![cfg(unix)]
+#![expect(
+    clippy::unwrap_used,
+    reason = "in a test an unwrap is an assertion: a failed setup step is a failed test"
+)]
+
+mod common;
+
+use common::{QUIET_GIT, inherited_git_vars, isolated, write_exe};
 
 use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -30,124 +38,9 @@ struct World {
 impl World {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let git = |args: &[&str], cwd: &Path| {
-            let mut c = Command::new("git");
-            // GIT_* from a calling hook would aim these at the real repository.
-            for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("GIT_")) {
-                c.env_remove(k);
-            }
-            // Modern git starts background maintenance after writes (commit, fetch,
-            // worktree add) and it can outlive the command that started it — a
-            // process still running after the test ends. Tests turn it off.
-            c.envs(QUIET_GIT);
-            let out = c.args(args).current_dir(cwd).output().unwrap();
-            assert!(
-                out.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-
-        let repo = root.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&["init", "-q", "-b", "main"], &repo);
-        git(&["config", "user.email", "test@example.com"], &repo);
-        git(&["config", "user.name", "Test"], &repo);
-        git(&["config", "commit.gpgsign", "false"], &repo);
-        std::fs::write(repo.join("README.md"), "widget\n").unwrap();
-        git(&["add", "."], &repo);
-        git(&["commit", "-q", "-m", "init"], &repo);
-        git(
-            &[
-                "init",
-                "-q",
-                "--bare",
-                root.join("origin.git").to_str().unwrap(),
-            ],
-            root,
-        );
-        git(
-            &[
-                "remote",
-                "add",
-                "origin",
-                root.join("origin.git").to_str().unwrap(),
-            ],
-            &repo,
-        );
-        git(&["push", "-q", "-u", "origin", "main"], &repo);
-        git(&["remote", "set-head", "origin", "main"], &repo);
-
-        // A desk with uncommitted work, and one whose branch has landed.
-        git(
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "retry-budget",
-                "../wt/retry-budget",
-            ],
-            &repo,
-        );
-        std::fs::write(root.join("wt/retry-budget/scratch.txt"), "wip\n").unwrap();
-        git(
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "landed-branch",
-                "../wt/landed",
-            ],
-            &repo,
-        );
-
-        let bin = root.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(root.join("fixture.json"), FIXTURE).unwrap();
-        std::fs::write(root.join("gh.mode"), "ok").unwrap();
-        write_exe(
-            &bin.join("gh"),
-            r#"#!/bin/sh
-dir="$(cd "$(dirname "$0")/.." && pwd)"
-# One line per call. Not "$*": the query argument spans many lines, and
-# counting lines would count the query, not the calls.
-echo "$1 $2" >> "$dir/gh.log"
-case "$(cat "$dir/gh.mode")" in
-  hang) echo $$ > "$dir/gh.pid"; exec sleep 600 ;;
-  fail) echo "HTTP 502: Bad Gateway" >&2; exit 1 ;;
-  ratelimit) printf '%s' '{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded for user ID 1."}]}' ;;
-  *) cat "$dir/fixture.json" ;;
-esac
-"#,
-        );
-        let real_git = String::from_utf8(
-            Command::new("sh")
-                .args(["-c", "command -v git"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap();
-        write_exe(
-            &bin.join("git"),
-            &format!(
-                "#!/bin/sh\necho \"$*\" >> \"$(cd \"$(dirname \"$0\")/..\" && pwd)/git.log\"\nexec {} \"$@\"\n",
-                real_git.trim()
-            ),
-        );
-        write_exe(
-            &bin.join("open-log"),
-            "#!/bin/sh\necho \"$1\" >> \"$(cd \"$(dirname \"$0\")/..\" && pwd)/opened.log\"\n",
-        );
-        std::fs::write(
-            root.join("config.toml"),
-            format!("open_command = \"{}\"\n", bin.join("open-log").display()),
-        )
-        .unwrap();
-        World { dir }
+        init_repo(dir.path());
+        install_fakes(dir.path());
+        Self { dir }
     }
 
     fn root(&self) -> &Path {
@@ -167,10 +60,108 @@ esac
     }
 }
 
-fn write_exe(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, body).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+fn git(args: &[&str], cwd: &Path) {
+    let out = isolated("git", cwd).args(args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A repository pushed to a bare origin, with two worktrees: a desk holding
+/// uncommitted work, and one whose branch has landed.
+fn init_repo(root: &Path) {
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&["init", "-q", "-b", "main"], &repo);
+    git(&["config", "user.email", "test@example.com"], &repo);
+    git(&["config", "user.name", "Test"], &repo);
+    git(&["config", "commit.gpgsign", "false"], &repo);
+    std::fs::write(repo.join("README.md"), "widget\n").unwrap();
+    git(&["add", "."], &repo);
+    git(&["commit", "-q", "-m", "init"], &repo);
+    let origin = root.join("origin.git");
+    git(&["init", "-q", "--bare", origin.to_str().unwrap()], root);
+    git(
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+        &repo,
+    );
+    git(&["push", "-q", "-u", "origin", "main"], &repo);
+    git(&["remote", "set-head", "origin", "main"], &repo);
+
+    git(
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "retry-budget",
+            "../wt/retry-budget",
+        ],
+        &repo,
+    );
+    std::fs::write(root.join("wt/retry-budget/scratch.txt"), "wip\n").unwrap();
+    git(
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "landed-branch",
+            "../wt/landed",
+        ],
+        &repo,
+    );
+}
+
+/// A fake `gh` answering from the fixture (or hanging, failing, or reporting a
+/// rate limit), a `git` shim logging every call, and an opener that records the
+/// URL it was handed.
+fn install_fakes(root: &Path) {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(root.join("fixture.json"), FIXTURE).unwrap();
+    std::fs::write(root.join("gh.mode"), "ok").unwrap();
+    write_exe(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+dir="$(cd "$(dirname "$0")/.." && pwd)"
+# One line per call. Not "$*": the query argument spans many lines, and
+# counting lines would count the query, not the calls.
+echo "$1 $2" >> "$dir/gh.log"
+case "$(cat "$dir/gh.mode")" in
+  hang) echo $$ > "$dir/gh.pid"; exec sleep 600 ;;
+  fail) echo "HTTP 502: Bad Gateway" >&2; exit 1 ;;
+  ratelimit) printf '%s' '{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded for user ID 1."}]}' ;;
+  *) cat "$dir/fixture.json" ;;
+esac
+"#,
+    );
+    let real_git = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    write_exe(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> \"$(cd \"$(dirname \"$0\")/..\" && pwd)/git.log\"\nexec {} \"$@\"\n",
+            real_git.trim()
+        ),
+    );
+    write_exe(
+        &bin.join("open-log"),
+        "#!/bin/sh\necho \"$1\" >> \"$(cd \"$(dirname \"$0\")/..\" && pwd)/opened.log\"\n",
+    );
+    std::fs::write(
+        root.join("config.toml"),
+        format!("open_command = \"{}\"\n", bin.join("open-log").display()),
+    )
+    .unwrap();
 }
 
 // --------------------------------------------------------------- the terminal
@@ -183,7 +174,7 @@ struct Term {
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct Opts<'a> {
     args: &'a [&'a str],
     env: &'a [(&'a str, &'a str)],
@@ -192,7 +183,7 @@ struct Opts<'a> {
 }
 
 impl Term {
-    fn start(world: &World, opts: Opts) -> Term {
+    fn start(world: &World, opts: Opts<'_>) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: ROWS,
@@ -229,7 +220,7 @@ impl Term {
         ] {
             cmd.env_remove(k);
         }
-        for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("GIT_")) {
+        for k in inherited_git_vars() {
             cmd.env_remove(k);
         }
         for (k, v) in QUIET_GIT {
@@ -273,7 +264,7 @@ impl Term {
                 }
             }
         });
-        Term {
+        Self {
             screen,
             raw,
             input,
@@ -324,7 +315,7 @@ impl Term {
     }
 
     fn pid(&self) -> i32 {
-        self.child.process_id().unwrap() as i32
+        i32::try_from(self.child.process_id().unwrap()).unwrap()
     }
 
     fn wait_exit(&mut self, timeout: Duration) -> portable_pty::ExitStatus {
@@ -363,20 +354,12 @@ impl Drop for Term {
 }
 
 fn alive(pid: i32) -> bool {
+    // SAFETY: kill(2) with signal 0 delivers nothing; it only asks whether the
+    // process exists. It takes plain integers and touches no memory.
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
 const LOAD: Duration = Duration::from_secs(15);
-
-/// git configuration through the environment, reaching every git a test runs
-/// — its own setup and rigor's calls alike.
-const QUIET_GIT: [(&str, &str); 5] = [
-    ("GIT_CONFIG_COUNT", "2"),
-    ("GIT_CONFIG_KEY_0", "maintenance.auto"),
-    ("GIT_CONFIG_VALUE_0", "false"),
-    ("GIT_CONFIG_KEY_1", "gc.auto"),
-    ("GIT_CONFIG_VALUE_1", "0"),
-];
 
 // --------------------------------------------------------------------- tests
 
@@ -445,7 +428,7 @@ fn a_click_on_a_tab_switches_the_view() {
     let t = Term::start(&w, Opts::default());
     t.wait_for("#101", LOAD);
     let tabs = t.row(1);
-    let col = tabs.find("Worktrees").expect("tab bar") as u16 + 2;
+    let col = u16::try_from(tabs.find("Worktrees").expect("tab bar")).unwrap() + 2;
     // SGR mouse: press and release, 1-based coordinates.
     t.send(format!("\x1b[<0;{col};2M\x1b[<0;{col};2m").as_bytes());
     t.wait_for("removable", LOAD);
@@ -495,6 +478,8 @@ fn sigterm_exits_cleanly_and_restores_the_terminal() {
     let w = World::new();
     let mut t = Term::start(&w, Opts::default());
     t.wait_for("#101", LOAD);
+    // SAFETY: kill(2) takes plain integers and touches no memory; the target is
+    // the rigor this test started and still owns.
     unsafe { libc::kill(t.pid(), libc::SIGTERM) };
     let status = t.wait_exit(Duration::from_secs(5));
     assert!(status.success(), "{status:?}");
@@ -519,8 +504,8 @@ fn the_selection_band_comes_from_the_terminals_own_colours() {
             },
         );
         t.wait_for("#101", LOAD);
-        let screen = t.screen.lock().unwrap();
-        let s = screen.screen();
+        // A copy of the screen, so the lock is released at once.
+        let s = t.screen.lock().unwrap().screen().clone();
         let row = (0..ROWS)
             .find(|r| s.contents_between(*r, 0, *r, COLS).contains("#101"))
             .unwrap();

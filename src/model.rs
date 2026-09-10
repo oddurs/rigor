@@ -14,7 +14,7 @@ pub enum CheckState {
 }
 
 impl CheckState {
-    /// A CheckRun carries `status` (QUEUED/IN_PROGRESS/COMPLETED) plus a `conclusion` once done.
+    /// A `CheckRun` carries `status` (`QUEUED/IN_PROGRESS/COMPLETED`) plus a `conclusion` once done.
     pub fn from_check_run(status: &str, conclusion: Option<&str>) -> Self {
         match status {
             "COMPLETED" => match conclusion.unwrap_or("") {
@@ -22,7 +22,8 @@ impl CheckState {
                 "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED" => Self::Failure,
                 "CANCELLED" => Self::Cancelled,
                 "SKIPPED" => Self::Skipped,
-                "NEUTRAL" | "STALE" => Self::Neutral,
+                // NEUTRAL, STALE, and anything GitHub adds later: neither a
+                // pass nor a failure.
                 _ => Self::Neutral,
             },
             "QUEUED" | "IN_PROGRESS" | "WAITING" | "PENDING" | "REQUESTED" => Self::Pending,
@@ -40,7 +41,7 @@ impl CheckState {
         }
     }
 
-    pub fn glyph(self) -> &'static str {
+    pub const fn glyph(self) -> &'static str {
         match self {
             Self::Success => "✓",
             Self::Failure => "✗",
@@ -52,7 +53,7 @@ impl CheckState {
         }
     }
 
-    pub fn is_bad(self) -> bool {
+    pub const fn is_bad(self) -> bool {
         matches!(self, Self::Failure | Self::Cancelled)
     }
 }
@@ -91,7 +92,7 @@ impl ReviewDecision {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Approved => "approved",
             Self::ChangesRequested => "changes requested",
@@ -192,7 +193,7 @@ impl Pr {
             && matches!(self.rollup, CheckState::Success | CheckState::None)
             && !matches!(
                 self.review_decision,
-                Some(ReviewDecision::ChangesRequested) | Some(ReviewDecision::ReviewRequired)
+                Some(ReviewDecision::ChangesRequested | ReviewDecision::ReviewRequired)
             )
     }
 
@@ -229,10 +230,10 @@ pub struct Worktree {
 
 impl Worktree {
     pub fn name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| self.path.to_string_lossy().to_string())
+        self.path.file_name().map_or_else(
+            || self.path.to_string_lossy().to_string(),
+            |s| s.to_string_lossy().to_string(),
+        )
     }
 
     /// The last two path components — enough to tell two agent desks apart

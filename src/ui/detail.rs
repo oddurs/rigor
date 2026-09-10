@@ -10,9 +10,9 @@ use ratatui::widgets::Paragraph;
 use crate::app::{App, WtState};
 use crate::model::{CheckState, Mergeable, MergedPr, Pr, Worktree};
 use crate::theme::Theme;
-use crate::util::{cell, dur_short, now_secs, pad, rel_time, right, truncate};
+use crate::util::{cell, cols, dur_short, now_secs, pad, rel_time, right, truncate};
 
-pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
+pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.width < 4 || area.height < 2 {
         return;
     }
@@ -21,7 +21,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
 
     // (line index -> check index), resolved to screen rows once we know the scroll.
     let mut check_lines: Vec<(usize, usize)> = Vec::new();
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line<'_>> = Vec::new();
 
     match (app.selected_pr(), app.selected_worktree()) {
         (Some(pr), wt) => pr_detail(
@@ -36,26 +36,26 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         (None, Some(wt)) => {
             let merged = wt.branch.as_deref().and_then(|b| app.merged_for_branch(b));
             let state = app.wt_state(wt);
-            wt_detail(&mut lines, wt, merged, state, app.home.as_deref(), now, &t)
+            wt_detail(&mut lines, wt, merged, state, app.home.as_deref(), now, &t);
         }
         // The list pane already explains an empty view; saying it twice is noise.
         (None, None) => {}
     }
 
-    let max_scroll = lines.len().saturating_sub(area.height as usize) as u16;
+    let max_scroll = cols(lines.len().saturating_sub(usize::from(area.height)));
     app.detail_scroll = app.detail_scroll.min(max_scroll);
     let scroll = app.detail_scroll;
 
     for (li, ci) in check_lines {
         if li >= scroll as usize {
-            let y = area.y + (li - scroll as usize) as u16;
+            let y = area.y + cols(li - usize::from(scroll));
             if y < area.bottom() {
                 app.hits.checks.push((y, ci));
             }
         }
     }
 
-    let lines: Vec<Line> = lines
+    let lines: Vec<Line<'_>> = lines
         .into_iter()
         .map(|l| super::clip(l, area.width as usize))
         .collect();
@@ -78,6 +78,14 @@ fn pr_detail(
     t: &Theme,
     width: usize,
 ) {
+    pr_header(lines, pr, now, t, width);
+    pr_fields(lines, pr, t);
+    worktree_line(lines, wt, now, t);
+    checks(lines, check_lines, pr, now, t, width);
+}
+
+/// Number, title and draft marker; then author, age, diff size and comments.
+fn pr_header(lines: &mut Vec<Line<'static>>, pr: &Pr, now: i64, t: &Theme, width: usize) {
     let mut head = vec![
         Span::styled(
             format!(" #{} ", pr.number),
@@ -115,7 +123,10 @@ fn pr_detail(
             muted,
         ),
     ]));
+}
 
+/// Review state, mergeability (and the base it merges into), labels, branch.
+fn pr_fields(lines: &mut Vec<Line<'static>>, pr: &Pr, t: &Theme) {
     let (rv_text, rv_color) = match pr.review_decision {
         Some(d) => (
             d.label().to_string(),
@@ -167,7 +178,9 @@ fn pr_detail(
         field("branch", t),
         Span::styled(pr.head_ref.clone(), Style::new().fg(t.fg)),
     ]));
+}
 
+fn worktree_line(lines: &mut Vec<Line<'static>>, wt: Option<&Worktree>, now: i64, t: &Theme) {
     // The worktree line answers "which agent is holding this branch, and is its
     // desk clean?" — so it carries the local state and the tip commit age.
     match wt {
@@ -207,7 +220,16 @@ fn pr_detail(
             Span::styled("none checked out locally", Style::new().fg(t.muted)),
         ])),
     }
+}
 
+fn checks(
+    lines: &mut Vec<Line<'static>>,
+    check_lines: &mut Vec<(usize, usize)>,
+    pr: &Pr,
+    now: i64,
+    t: &Theme,
+    width: usize,
+) {
     let tally = pr.tally();
     if tally.total == 0 {
         lines.push(Line::from(vec![
@@ -377,6 +399,19 @@ fn wt_detail(
         ])),
     }
 
+    cleanup(lines, w, merged, disposition, home, t);
+}
+
+/// The one line of advice the worktree view exists for: whether this desk can
+/// be collected, and the command to do it.
+fn cleanup(
+    lines: &mut Vec<Line<'static>>,
+    w: &Worktree,
+    merged: Option<&MergedPr>,
+    disposition: WtState,
+    home: Option<&str>,
+    t: &Theme,
+) {
     // Only ever say a desk is collectable when nothing local would be lost.
     match disposition {
         WtState::Removable => {

@@ -16,38 +16,48 @@ pub fn freeze_time(at: i64) {
     FROZEN.with(|f| f.set(Some(at)));
 }
 
+/// A configured duration in seconds as a signed epoch offset, saturating: an
+/// absurd config value means "never", not an overflow.
+pub fn secs(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// A count or width as a terminal coordinate, saturating at the largest one.
+pub fn cols(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
 pub fn now_secs() -> i64 {
     #[cfg(test)]
-    if let Some(at) = FROZEN.with(|f| f.get()) {
+    if let Some(at) = FROZEN.with(std::cell::Cell::get) {
         return at;
     }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| secs(d.as_secs()))
 }
 
 /// Parse the exact shape GitHub returns: `2026-09-09T20:13:41Z`.
-pub fn parse_iso8601(s: &str) -> Option<i64> {
-    let b = s.as_bytes();
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
+pub fn parse_iso8601(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
         return None;
     }
-    let num = |a: usize, z: usize| -> Option<i64> { s.get(a..z)?.parse::<i64>().ok() };
+    let num = |from: usize, to: usize| -> Option<i64> { text.get(from..to)?.parse::<i64>().ok() };
     let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
     Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec)
 }
 
 /// Days since 1970-01-01 (Howard Hinnant's civil-date algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
     let mp = (m + 9) % 12;
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+    era * 146_097 + doe - 719_468
 }
 
 /// Compact age: `12s`, `4m`, `3h`, `2d`, `5w`.
@@ -171,7 +181,7 @@ mod tests {
 
         #[test]
         fn rel_time_never_panics_and_stays_short(a in any::<i32>(), b in any::<i32>()) {
-            prop_assert!(rel_time(a as i64, b as i64).len() <= 8);
+            prop_assert!(rel_time(i64::from(a), i64::from(b)).len() <= 8);
         }
     }
 
@@ -179,15 +189,15 @@ mod tests {
     fn format_iso8601(ts: i64) -> String {
         let (days, secs) = (ts.div_euclid(86400), ts.rem_euclid(86400));
         // Howard Hinnant's civil_from_days.
-        let z = days + 719468;
-        let era = z.div_euclid(146097);
-        let doe = z - era * 146097;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
         let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
         let mp = (5 * doy + 2) / 153;
         let d = doy - (153 * mp + 2) / 5 + 1;
         let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
         format!(
             "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
             secs / 3600,

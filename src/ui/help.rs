@@ -34,7 +34,7 @@ const MOUSE: &[(&str, &str)] = &[
     ("scroll wheel", "scroll the list or detail pane"),
 ];
 
-pub fn draw(f: &mut Frame, area: Rect, app: &App) {
+pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
     let t = app.theme;
     // Recede everything behind the modal so it reads as a layer on top, not
     // as more text on the same plane.
@@ -48,7 +48,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let w = 64u16.min(area.width.saturating_sub(4));
     // Rows: every key and mouse binding, a blank line, the "mouse" heading,
     // and the two borders.
-    let h = (KEYS.len() + MOUSE.len() + 4) as u16;
+    let h = crate::util::cols(KEYS.len() + MOUSE.len() + 4);
     let h = h.min(area.height.saturating_sub(2));
     let rect = Rect::new(
         area.x + (area.width.saturating_sub(w)) / 2,
@@ -69,7 +69,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line<'_>> = Vec::new();
     for (k, d) in KEYS {
         lines.push(row(k, d, app));
     }

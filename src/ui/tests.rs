@@ -5,7 +5,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 use super::draw;
-use crate::app::{App, Sort, WtState};
+use crate::app::{App, Mode, Sort, WtState};
 use crate::config::{LayoutMode, Settings, View};
 use crate::model::{
     Check, CheckState, Mergeable, MergedPr, Pr, RepoInfo, ReviewDecision, Worktree, WorktreeStatus,
@@ -34,6 +34,40 @@ fn sample_app() -> App {
     a.home = Some("/home/dev".into());
     let now = now_secs();
 
+    let prs = sample_prs(now);
+
+    // Route through the real message path so the merged-branch index is built
+    // the way a live fetch builds it.
+    a.on_msg(crate::app::Msg::Prs(Ok(crate::github::Fetched {
+        budget: None,
+        viewer: "octocat".into(),
+        default_branch: "main".into(),
+        prs,
+        merged: vec![
+            MergedPr {
+                number: 4700,
+                title: "Drop the monospace count chips".into(),
+                url: "https://github.com/acme/widget/pull/4700".into(),
+                head_ref: "drop-mono".into(),
+                merged_at: now - 86400 * 4,
+            },
+            MergedPr {
+                number: 4701,
+                title: "Fix the row hover state".into(),
+                url: "https://github.com/acme/widget/pull/4701".into(),
+                head_ref: "row-hover".into(),
+                merged_at: now - 86400 * 5,
+            },
+        ],
+    })));
+
+    a.on_msg(crate::app::Msg::Worktrees(Ok(sample_worktrees(now))));
+    a
+}
+
+/// Three PRs covering the states that matter: failing and dirty, approved and
+/// green, and a draft that conflicts and waits on review.
+fn sample_prs(now: i64) -> Vec<Pr> {
     let prs = vec![
         pr(
             4846,
@@ -68,33 +102,13 @@ fn sample_app() -> App {
     prs[2].review_requests = vec!["octocat".into()];
     prs[2].is_draft = true;
     prs[2].mergeable = Mergeable::Conflicting;
+    prs
+}
 
-    // Route through the real message path so the merged-branch index is built
-    // the way a live fetch builds it.
-    a.on_msg(crate::app::Msg::Prs(Ok(crate::github::Fetched {
-        budget: None,
-        viewer: "octocat".into(),
-        default_branch: "main".into(),
-        prs,
-        merged: vec![
-            MergedPr {
-                number: 4700,
-                title: "Drop the monospace count chips".into(),
-                url: "https://github.com/acme/widget/pull/4700".into(),
-                head_ref: "drop-mono".into(),
-                merged_at: now - 86400 * 4,
-            },
-            MergedPr {
-                number: 4701,
-                title: "Fix the row hover state".into(),
-                url: "https://github.com/acme/widget/pull/4701".into(),
-                head_ref: "row-hover".into(),
-                merged_at: now - 86400 * 5,
-            },
-        ],
-    })));
-
-    a.on_msg(crate::app::Msg::Worktrees(Ok(vec![
+/// The main worktree, a dirty desk, a clean one with an open PR, one whose
+/// branch landed (removable), and one that landed but still holds work.
+fn sample_worktrees(now: i64) -> Vec<Worktree> {
+    vec![
         wt(
             "/home/dev/src/widget",
             "chore/release-notes",
@@ -132,8 +146,7 @@ fn sample_app() -> App {
             4,
             now - 86400 * 5,
         ),
-    ])));
-    a
+    ]
 }
 
 fn pr(
@@ -232,7 +245,7 @@ fn renders_at_every_width() {
     for view in View::ALL {
         a.set_view(view);
         for help in [false, true] {
-            a.show_help = help;
+            a.mode = if help { Mode::Help } else { Mode::Browse };
             for (w, h) in [
                 (200u16, 40u16),
                 (140, 30),
@@ -249,7 +262,7 @@ fn renders_at_every_width() {
             }
         }
     }
-    a.show_help = false;
+    a.mode = Mode::Browse;
 }
 
 /// The attention sort is what makes the dashboard actionable: approved-and-green
@@ -265,7 +278,7 @@ fn attention_sort_puts_mergeable_first() {
         .iter()
         .map(|r| match r {
             crate::app::Row::Pr(i) => a.prs[*i].number,
-            _ => unreachable!(),
+            crate::app::Row::Wt(_) => unreachable!("only pull requests in this view"),
         })
         .collect();
     // approved + green, then the failing one, then the conflicting draft
@@ -390,7 +403,7 @@ fn removable_worktrees_need_a_clean_desk() {
 fn pr_num(a: &App, r: &crate::app::Row) -> u64 {
     match r {
         crate::app::Row::Pr(i) => a.prs[*i].number,
-        _ => unreachable!(),
+        crate::app::Row::Wt(_) => unreachable!("only pull requests in this view"),
     }
 }
 
@@ -421,7 +434,7 @@ fn tabs_lead_with_their_title_not_a_key_digit() {
 
 /// The active view is marked by a heavy underline on the rail that hugs its
 /// label — not the padding around it. It is what makes the row read as a
-/// subnav, and it survives NO_COLOR because it is a glyph, not a colour.
+/// subnav, and it survives `NO_COLOR` because it is a glyph, not a colour.
 #[test]
 fn the_rail_underlines_exactly_the_active_tab() {
     for view in [View::Ready, View::Blocked, View::Worktrees] {
@@ -476,7 +489,7 @@ fn ready_and_blocked_counts_carry_meaning_in_colour() {
     let subnav = row_text(&buf, 1);
     let digit_after = |title: &str| {
         let col = subnav.find(title).unwrap() + title.len() + 1;
-        buf[(col as u16, 1)].fg
+        buf[(u16::try_from(col).unwrap(), 1)].fg
     };
     assert_eq!(digit_after("Ready"), a.theme.success);
     assert_eq!(digit_after("Blocked"), a.theme.failure);
@@ -513,6 +526,7 @@ fn the_selected_row_is_a_full_width_band_when_the_terminal_reports_its_colours()
     let mut a = sample_app();
     a.theme = Theme::resolve(
         &crate::theme::ThemeConfig::default(),
+        None,
         crate::probe::Probed {
             fg: Some((0xd4, 0xd8, 0xde)),
             bg: Some((0x16, 0x18, 0x1c)),
@@ -569,15 +583,16 @@ fn the_sync_dot_reports_freshness() {
     let dot_colour = |a: &mut App| {
         let buf = frame(a, 160, 24);
         let row = row_text(&buf, 0);
-        let col = row.chars().position(|c| c == '●').expect("no status dot") as u16;
+        let col =
+            u16::try_from(row.chars().position(|c| c == '●').expect("no status dot")).unwrap();
         buf[(col, 0)].fg
     };
 
     let mut a = sample_app();
-    a.last_refresh = now_secs() - 5;
+    a.schedule.last_refresh = now_secs() - 5;
     assert_eq!(dot_colour(&mut a), a.theme.success);
 
-    a.last_refresh = now_secs() - (a.settings.refresh_secs as i64 * 3);
+    a.schedule.last_refresh = now_secs() - crate::util::secs(a.settings.refresh_secs) * 3;
     assert_eq!(dot_colour(&mut a), a.theme.pending);
 
     a.error = Some("gh api graphql failed".into());
@@ -695,7 +710,7 @@ fn the_footer_keeps_help_and_quit_at_any_width() {
 fn the_filter_prompt_counts_matches() {
     let mut a = sample_app();
     a.set_view(View::All);
-    a.filter_mode = true;
+    a.mode = Mode::Filter;
     a.filter = "retry".into();
     a.rebuild();
     let f = footer(&frame(&mut a, 160, 24));
@@ -706,7 +721,7 @@ fn the_filter_prompt_counts_matches() {
 #[test]
 fn the_help_modal_dims_what_is_behind_it() {
     let mut a = sample_app();
-    a.show_help = true;
+    a.mode = Mode::Help;
     let buf = frame(&mut a, 160, 40);
     assert!(buf[(0, 0)].modifier.contains(ratatui::style::Modifier::DIM));
 }
@@ -828,7 +843,7 @@ proptest::proptest! {
 
 // ------------------------------------------------------------------ keys
 
-fn press(a: &mut App, input: &mut crate::event::Input, keys: &str) {
+fn press(a: &mut App, keys: &str) {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     for ch in keys.chars() {
         let code = match ch {
@@ -838,7 +853,7 @@ fn press(a: &mut App, input: &mut crate::event::Input, keys: &str) {
             '\t' => KeyCode::Tab,
             c => KeyCode::Char(c),
         };
-        input.key(a, KeyEvent::new(code, KeyModifiers::NONE));
+        crate::event::key(a, KeyEvent::new(code, KeyModifiers::NONE));
     }
 }
 
@@ -846,45 +861,43 @@ fn press(a: &mut App, input: &mut crate::event::Input, keys: &str) {
 #[test]
 fn keys_move_the_selection_and_switch_views_by_position() {
     let mut a = sample_app();
-    let mut i = crate::event::Input::default();
     a.set_view(View::All);
-    press(&mut a, &mut i, "j");
+    press(&mut a, "j");
     assert_eq!(a.selected, 1);
-    press(&mut a, &mut i, "G");
+    press(&mut a, "G");
     assert_eq!(a.selected, a.rows.len() - 1);
-    press(&mut a, &mut i, "k");
+    press(&mut a, "k");
     assert_eq!(a.selected, a.rows.len() - 2);
-    press(&mut a, &mut i, "g");
+    press(&mut a, "g");
     assert_eq!(a.selected, 0);
 
     // Number keys index the tab bar, whatever it is configured to hold.
-    press(&mut a, &mut i, "6");
+    press(&mut a, "6");
     assert_eq!(a.view, View::Worktrees);
-    press(&mut a, &mut i, "1");
+    press(&mut a, "1");
     assert_eq!(a.view, View::Ready);
-    press(&mut a, &mut i, "\t");
+    press(&mut a, "\t");
     assert_eq!(a.view, View::Mine);
-    press(&mut a, &mut i, "9"); // past the last tab: ignored
+    press(&mut a, "9"); // past the last tab: ignored
     assert_eq!(a.view, View::Mine);
 }
 
 #[test]
 fn the_filter_narrows_as_you_type_and_esc_restores() {
     let mut a = sample_app();
-    let mut i = crate::event::Input::default();
     a.set_view(View::All);
-    press(&mut a, &mut i, "/tokens");
-    assert!(a.filter_mode);
+    press(&mut a, "/tokens");
+    assert_eq!(a.mode, Mode::Filter);
     assert_eq!(a.rows.len(), 1, "only the colour-tokens PR matches");
     // While typing, letters are text, not commands: `q` must not quit.
-    press(&mut a, &mut i, "q");
+    press(&mut a, "q");
     assert!(!a.quit && a.filter == "tokensq");
-    press(&mut a, &mut i, "\x08\n");
+    press(&mut a, "\x08\n");
     assert!(
-        !a.filter_mode && a.filter == "tokens",
+        a.mode != Mode::Filter && a.filter == "tokens",
         "enter keeps the filter"
     );
-    press(&mut a, &mut i, "\x1b");
+    press(&mut a, "\x1b");
     assert!(a.filter.is_empty());
     assert_eq!(a.rows.len(), 3);
 }
@@ -892,27 +905,26 @@ fn the_filter_narrows_as_you_type_and_esc_restores() {
 #[test]
 fn sort_drafts_and_help_toggle() {
     let mut a = sample_app();
-    let mut i = crate::event::Input::default();
     a.set_view(View::All);
-    press(&mut a, &mut i, "s");
+    press(&mut a, "s");
     assert_eq!(a.sort, Sort::Attention);
-    press(&mut a, &mut i, "s");
+    press(&mut a, "s");
     assert_eq!(a.sort, Sort::Recent);
 
     let with_drafts = a.rows.len();
-    press(&mut a, &mut i, "d");
+    press(&mut a, "d");
     assert_eq!(a.rows.len(), with_drafts - 1, "the draft is hidden");
-    press(&mut a, &mut i, "d");
+    press(&mut a, "d");
     assert_eq!(a.rows.len(), with_drafts);
 
     // `q` closes help first; only a second `q` quits.
-    press(&mut a, &mut i, "?");
-    assert!(a.show_help);
-    press(&mut a, &mut i, "j"); // other keys are swallowed while help is open
+    press(&mut a, "?");
+    assert_eq!(a.mode, Mode::Help);
+    press(&mut a, "j"); // other keys are swallowed while help is open
     assert_eq!(a.selected, 0);
-    press(&mut a, &mut i, "q");
-    assert!(!a.show_help && !a.quit);
-    press(&mut a, &mut i, "q");
+    press(&mut a, "q");
+    assert!(a.mode != Mode::Help && !a.quit);
+    press(&mut a, "q");
     assert!(a.quit);
 }
 
@@ -933,16 +945,16 @@ fn snapshots() {
     insta::assert_snapshot!("worktrees_120x18", render(&mut a, 120, 18));
 
     a.set_view(View::Mine);
-    a.show_help = true;
+    a.mode = Mode::Help;
     insta::assert_snapshot!("help_120x30", render(&mut a, 120, 30));
-    a.show_help = false;
+    a.mode = Mode::Browse;
 
     a.set_view(View::All);
-    a.filter_mode = true;
+    a.mode = Mode::Filter;
     a.filter = "retry".into();
     a.rebuild();
     insta::assert_snapshot!("filtering_120x12", render(&mut a, 120, 12));
-    a.filter_mode = false;
+    a.mode = Mode::Browse;
     a.filter = "zzz".into();
     a.rebuild();
     insta::assert_snapshot!("filter_matches_nothing_120x10", render(&mut a, 120, 10));
@@ -950,7 +962,7 @@ fn snapshots() {
     a.rebuild();
 
     a.error = Some("gh api graphql: timed out after 45s".into());
-    a.next_refresh = NOW + 180;
+    a.schedule.next_refresh = NOW + 180;
     insta::assert_snapshot!("sync_failed_120x10", render(&mut a, 120, 10));
     a.error = None;
 

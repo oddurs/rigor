@@ -14,6 +14,7 @@ use crate::github;
 use crate::model::{
     CheckState, Mergeable, MergedPr, Pr, RepoInfo, ReviewDecision, Worktree, WorktreeStatus,
 };
+use crate::schedule::{self, Schedule};
 use crate::theme::Theme;
 use crate::util::now_secs;
 
@@ -22,9 +23,6 @@ pub enum Msg {
     Worktrees(Result<Vec<Worktree>, String>),
     Statuses(Result<Vec<(PathBuf, git::Signature, WorktreeStatus)>, String>),
 }
-
-/// The longest rigor ever waits between refreshes, however it is backing off.
-const MAX_WAIT: i64 = 900;
 
 /// Run `work` off the UI thread and always answer. A panic inside becomes an
 /// error message rather than a reply that never comes — which would leave a
@@ -41,19 +39,31 @@ fn spawn_reply<T: Send + 'static>(
     });
 }
 
-/// Whether a worktree needs `git status` this round. Idle desks are the
-/// common case — fifty of them cost ten CPU-seconds to rescan — so a desk is
-/// only rescanned when its fingerprint moved, when it is new, when it is the
-/// one being looked at, or when it is a candidate for "removable". That last
-/// one is always rechecked: the safety claim must never rest on stale data.
-pub fn needs_scan(
-    full: bool,
-    previous: Option<&git::Signature>,
-    current: &git::Signature,
-    removable_candidate: bool,
-    selected: bool,
-) -> bool {
-    full || previous != Some(current) || removable_candidate || selected
+/// What the keyboard is doing: browsing, typing a filter, or reading help.
+/// One at a time — the type makes "typing a filter with help open" impossible,
+/// where two booleans made it merely unlikely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    Browse,
+    Filter,
+    Help,
+}
+
+/// Background work running right now.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InFlight {
+    pub prs: bool,
+    pub worktrees: bool,
+    pub scan: bool,
+}
+
+impl InFlight {
+    /// A fetch or listing the user is waiting on, which is what the spinner
+    /// shows. A scan is not: it runs at background priority and nobody waits.
+    pub const fn syncing(self) -> bool {
+        self.prs || self.worktrees
+    }
 }
 
 /// A visible line in the list: either a pull request or a worktree.
@@ -82,10 +92,10 @@ pub enum Sort {
 }
 
 impl Sort {
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
-            Sort::Recent => "recent",
-            Sort::Attention => "attention",
+            Self::Recent => "recent",
+            Self::Attention => "attention",
         }
     }
 }
@@ -120,29 +130,13 @@ pub struct App {
     pub offset: usize,
     pub detail_scroll: u16,
     pub filter: String,
-    pub filter_mode: bool,
-    pub loading_prs: bool,
-    pub loading_wts: bool,
-    pub scanning: bool,
+    pub mode: Mode,
+    pub in_flight: InFlight,
+    pub schedule: Schedule,
     pub error: Option<String>,
-    /// False once the terminal reports it lost focus. Terminals that never
-    /// report focus leave it true, which keeps their behaviour unchanged.
-    pub focused: bool,
-    /// Consecutive failed fetches; each one doubles the wait, up to MAX_WAIT.
-    pub failures: u32,
-    /// When the next PR refresh is due, in epoch seconds.
-    pub next_refresh: i64,
-    /// When the next full worktree scan is due.
-    pub next_full_scan: i64,
-    /// Set while the shared GitHub budget is low: no automatic fetch until then.
-    pub paused_until: Option<i64>,
     /// Each worktree's fingerprint at its last scan.
     scanned: HashMap<PathBuf, git::Signature>,
-    /// Makes the next worktree listing scan everything, not just what moved.
-    pending_full: bool,
     pub notice: Option<(String, i64)>,
-    pub last_refresh: i64,
-    pub show_help: bool,
     pub quit: bool,
     pub spinner: usize,
     pub home: Option<String>,
@@ -171,21 +165,12 @@ impl App {
             offset: 0,
             detail_scroll: 0,
             filter: String::new(),
-            filter_mode: false,
-            loading_prs: false,
-            loading_wts: false,
-            scanning: false,
+            mode: Mode::Browse,
+            in_flight: InFlight::default(),
+            schedule: Schedule::default(),
             error: None,
-            focused: true,
-            failures: 0,
-            next_refresh: 0,
-            next_full_scan: 0,
-            paused_until: None,
             scanned: HashMap::new(),
-            pending_full: true,
             notice: None,
-            last_refresh: 0,
-            show_help: false,
             quit: false,
             spinner: 0,
             home: std::env::var("HOME").ok(),
@@ -197,41 +182,35 @@ impl App {
 
     // ---------------------------------------------------------------- loading
 
-    /// `r`: everything, now. Clears any backoff and any rate-limit pause —
-    /// the user asked, and one fetch costs a few points of budget.
+    /// `r`: everything, now, whatever the backoff or pause says.
     pub fn refresh(&mut self) {
-        self.failures = 0;
-        self.paused_until = None;
-        self.pending_full = true;
+        self.schedule.reset();
         self.refresh_prs();
     }
 
     /// Called every turn of the event loop. Starts whatever is due; never waits.
     pub fn tick(&mut self) {
         let now = now_secs();
-        if !self.loading_prs && now >= self.next_refresh {
+        if !self.in_flight.prs && self.schedule.refresh_due(now) {
             self.refresh_prs();
         }
-        // Full sweeps pick up unstaged edits in desks whose fingerprint did not
-        // move. Nobody needs that while the terminal is in the background.
-        let every = self.settings.worktree_scan_secs as i64;
-        if self.focused
-            && every > 0
-            && !self.loading_wts
-            && !self.scanning
-            && now >= self.next_full_scan
+        if !self.in_flight.worktrees
+            && !self.in_flight.scan
+            && self
+                .schedule
+                .full_scan_due(now, self.settings.worktree_scan_secs)
         {
-            self.pending_full = true;
+            self.schedule.pending_full = true;
             self.refresh_worktrees();
         }
     }
 
     pub fn refresh_prs(&mut self) {
-        if self.loading_prs {
+        if self.in_flight.prs {
             return;
         }
-        self.loading_prs = true;
-        self.last_refresh = now_secs();
+        self.in_flight.prs = true;
+        self.schedule.last_refresh = now_secs();
         let (owner, name, max) = (
             self.repo.owner.clone(),
             self.repo.name.clone(),
@@ -245,70 +224,27 @@ impl App {
     }
 
     pub fn refresh_worktrees(&mut self) {
-        if self.loading_wts {
+        if self.in_flight.worktrees {
             return;
         }
-        self.loading_wts = true;
+        self.in_flight.worktrees = true;
         let root = self.repo.root.clone();
         spawn_reply(self.tx.clone(), Msg::Worktrees, move || {
             git::list_worktrees(&root).map_err(|e| format!("{e:#}"))
         });
     }
 
-    /// Set the next automatic refresh from the start of the last one: the
-    /// configured interval, stretched fourfold while unfocused, doubled per
-    /// consecutive failure, capped at MAX_WAIT, and never before a rate-limit
-    /// pause ends. `refresh_secs = 0` turns automatic refresh off.
-    fn schedule(&mut self) {
-        self.schedule_from(self.last_refresh);
-    }
-
-    /// As `schedule`, counting the wait from `base`. A success counts from when
-    /// the fetch started, which keeps a steady cadence; a failure counts from
-    /// when it failed, or a call that took 45s to time out would be retried at
-    /// once and a dead connection hammered back to back.
-    fn schedule_from(&mut self, base: i64) {
-        let every = self.settings.refresh_secs as i64;
-        if every == 0 {
-            self.next_refresh = i64::MAX;
-            return;
-        }
-        let mut wait = every;
-        if !self.focused {
-            wait = (wait * 4).min(MAX_WAIT);
-        }
-        if self.failures > 0 {
-            wait = (wait << self.failures.min(4)).min(MAX_WAIT);
-        }
-        let mut next = base + wait;
-        if let Some(until) = self.paused_until {
-            next = next.max(until);
-        }
-        self.next_refresh = next;
-    }
-
-    /// The terminal reported a focus change. Rescheduling from the last
-    /// refresh is the whole mechanism: losing focus stretches the wait, and on
-    /// regaining it a stale screen has a due time already in the past, so the
-    /// next tick catches up at once.
     pub fn set_focus(&mut self, focused: bool) {
-        if self.focused != focused {
-            self.focused = focused;
-            self.schedule();
-        }
+        self.schedule.set_focus(focused, self.settings.refresh_secs);
     }
 
     pub fn on_msg(&mut self, msg: Msg) {
         match msg {
             Msg::Prs(Ok(f)) => {
-                self.loading_prs = false;
+                self.in_flight.prs = false;
                 self.error = None;
-                self.failures = 0;
-                // Leave most of the shared budget for everything else using gh:
-                // pause automatic fetches below 5% until the window resets.
-                self.paused_until = f
-                    .budget
-                    .and_then(|b| (b.remaining < (b.limit / 20).max(50)).then_some(b.reset_at));
+                self.schedule
+                    .succeeded(f.budget, self.settings.refresh_secs);
                 self.viewer = f.viewer;
                 self.repo.default_branch = f.default_branch;
                 self.prs = f.prs;
@@ -319,21 +255,17 @@ impl App {
                     .map(|(i, m)| (m.head_ref.clone(), i))
                     .collect();
                 self.merged = f.merged;
-                self.schedule();
                 self.rebuild();
             }
             Msg::Prs(Err(e)) => {
-                self.loading_prs = false;
-                self.failures += 1;
-                if e.to_lowercase().contains("rate limit") {
-                    self.paused_until = Some(now_secs() + MAX_WAIT);
-                }
+                self.in_flight.prs = false;
+                self.schedule
+                    .failed(&e, self.settings.refresh_secs, now_secs());
                 self.error = Some(e);
-                self.schedule_from(now_secs());
             }
             Msg::Worktrees(Ok(mut wts)) => {
-                self.loading_wts = false;
-                wts.sort_by_key(|a| a.name());
+                self.in_flight.worktrees = false;
+                wts.sort_by_key(Worktree::name);
                 // Carry each desk's last known status forward: most are not
                 // rescanned this round, and blanking them would flicker.
                 let known: HashMap<PathBuf, WorktreeStatus> = self
@@ -350,19 +282,15 @@ impl App {
                 self.index_worktrees();
                 self.rebuild();
 
-                let full = std::mem::take(&mut self.pending_full);
+                let full = std::mem::take(&mut self.schedule.pending_full);
                 if full {
-                    let every = self.settings.worktree_scan_secs as i64;
-                    self.next_full_scan = if every > 0 {
-                        now_secs() + every
-                    } else {
-                        i64::MAX
-                    };
+                    self.schedule
+                        .full_scan_started(now_secs(), self.settings.worktree_scan_secs);
                 }
-                if self.settings.worktree_status && !self.scanning {
+                if self.settings.worktree_status && !self.in_flight.scan {
                     let which = self.scan_set(full);
                     if !which.is_empty() {
-                        self.scanning = true;
+                        self.in_flight.scan = true;
                         let (wts, branch) =
                             (self.worktrees.clone(), self.repo.default_branch.clone());
                         spawn_reply(self.tx.clone(), Msg::Statuses, move || {
@@ -372,11 +300,11 @@ impl App {
                 }
             }
             Msg::Worktrees(Err(e)) => {
-                self.loading_wts = false;
+                self.in_flight.worktrees = false;
                 self.error = Some(e);
             }
             Msg::Statuses(Ok(results)) => {
-                self.scanning = false;
+                self.in_flight.scan = false;
                 for (path, sig, st) in results {
                     // Adopt only for worktrees still present.
                     if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
@@ -387,7 +315,7 @@ impl App {
                 self.rebuild();
             }
             Msg::Statuses(Err(e)) => {
-                self.scanning = false;
+                self.in_flight.scan = false;
                 self.error = Some(e);
             }
         }
@@ -404,7 +332,7 @@ impl App {
                     && w.branch
                         .as_deref()
                         .is_some_and(|b| self.merged_for_branch(b).is_some());
-                needs_scan(
+                schedule::needs_scan(
                     full,
                     self.scanned.get(&w.path),
                     &git::signature(&w.path),
@@ -445,8 +373,13 @@ impl App {
     /// branch has actually landed. The main worktree is never collectable, and
     /// a detached one has no branch to match, so both stay Idle.
     pub fn wt_state(&self, w: &Worktree) -> WtState {
-        let st = w.status.clone().unwrap_or_default();
-        if st.dirty > 0 || st.unpushed > 0 {
+        // Unknown status counts as clean here, as it always has: `Working`
+        // needs evidence of local work, and "removable" also needs the branch
+        // to have landed, which is checked below.
+        if w.status
+            .as_ref()
+            .is_some_and(|st| st.dirty > 0 || st.unpushed > 0)
+        {
             return WtState::Working;
         }
         if w.is_main {
@@ -603,12 +536,12 @@ impl App {
             return;
         }
         self.user_selected = true;
-        let n = self.rows.len() as isize;
-        self.selected = (self.selected as isize + delta).clamp(0, n - 1) as usize;
+        let last = self.rows.len() - 1;
+        self.selected = self.selected.saturating_add_signed(delta).min(last);
         self.detail_scroll = 0;
     }
 
-    pub fn select(&mut self, i: usize) {
+    pub const fn select(&mut self, i: usize) {
         if i < self.rows.len() {
             self.user_selected = true;
             self.selected = i;
@@ -628,10 +561,20 @@ impl App {
     }
 
     pub fn cycle_view(&mut self, delta: isize) {
-        let views = self.settings.views.clone();
-        let cur = views.iter().position(|v| *v == self.view).unwrap_or(0) as isize;
-        let n = views.len() as isize;
-        self.set_view(views[(cur + delta).rem_euclid(n) as usize]);
+        let views = &self.settings.views;
+        let n = views.len();
+        if n == 0 {
+            return;
+        }
+        let cur = views.iter().position(|v| *v == self.view).unwrap_or(0);
+        let step = delta.unsigned_abs() % n;
+        let next = if delta >= 0 {
+            (cur + step) % n
+        } else {
+            (cur + n - step) % n
+        };
+        let view = views[next];
+        self.set_view(view);
     }
 
     /// Number keys index the configured tab bar, not a fixed list of views.
@@ -698,7 +641,7 @@ impl App {
     }
 
     pub fn open_checks(&mut self) {
-        if let Some(url) = self.selected_pr().map(|p| p.checks_url()) {
+        if let Some(url) = self.selected_pr().map(Pr::checks_url) {
             self.open_url(&url);
         }
     }
@@ -771,7 +714,7 @@ mod tests {
     use crate::config::Settings;
     use crate::github::{Budget, Fetched};
     use crate::model::RepoInfo;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::Duration;
 
     fn app() -> App {
         let repo = RepoInfo {
@@ -799,133 +742,40 @@ mod tests {
         }
     }
 
-    /// A failure must never stop refreshing — it waits longer each time,
-    /// doubling up to fifteen minutes, and a success resets it.
+    /// Fetch results reach the schedule: a failure is shown and backs off, a
+    /// success clears it and takes the budget into account.
     #[test]
-    fn failures_back_off_exponentially_and_recover() {
+    fn fetch_results_drive_the_schedule() {
         let mut a = app();
-        a.last_refresh = 1_000;
-        let mut waits = Vec::new();
-        for _ in 0..6 {
-            a.loading_prs = true;
-            a.on_msg(Msg::Prs(Err("gh api graphql: timed out after 45s".into())));
-            // Counted from the failure, not from when the attempt began.
-            waits.push(a.next_refresh - now_secs());
-        }
-        let want = [180, 360, 720, 900, 900, 900];
-        assert!(
-            waits.iter().zip(want).all(|(g, w)| (g - w).abs() <= 1),
-            "{waits:?}"
-        );
+        a.in_flight.prs = true;
+        a.on_msg(Msg::Prs(Err("gh api graphql: timed out after 45s".into())));
+        assert!(!a.in_flight.prs, "the flag always clears");
+        assert_eq!(a.schedule.failures, 1);
         assert!(a.error.is_some());
+        assert!(a.schedule.next_refresh > now_secs());
 
-        a.loading_prs = true;
-        a.on_msg(Msg::Prs(Ok(fetched(None))));
-        assert_eq!(a.failures, 0);
-        assert_eq!(a.next_refresh - a.last_refresh, 90);
-        assert!(a.error.is_none());
-    }
-
-    /// rigor shares the GraphQL budget with every other gh call, agents
-    /// included. Below 5% it stops fetching until the window resets.
-    #[test]
-    fn a_low_shared_budget_pauses_until_reset() {
-        let mut a = app();
-        a.last_refresh = 1_000;
+        a.schedule.last_refresh = 1_000;
+        a.in_flight.prs = true;
         let low = Budget {
-            remaining: 120,
+            remaining: 1,
             limit: 5000,
             reset_at: 5_000,
         };
-        a.loading_prs = true;
         a.on_msg(Msg::Prs(Ok(fetched(Some(low)))));
-        assert_eq!(a.paused_until, Some(5_000));
-        assert_eq!(a.next_refresh, 5_000);
-
-        let healthy = Budget {
-            remaining: 4_500,
-            limit: 5000,
-            reset_at: 5_000,
-        };
-        a.loading_prs = true;
-        a.on_msg(Msg::Prs(Ok(fetched(Some(healthy)))));
-        assert_eq!(a.paused_until, None);
-        assert_eq!(a.next_refresh, 1_090);
+        assert_eq!(a.schedule.failures, 0);
+        assert!(a.error.is_none());
+        assert_eq!(a.schedule.paused_until, Some(5_000));
     }
 
     #[test]
-    fn a_rate_limit_error_pauses_rather_than_retrying_at_once() {
+    fn manual_refresh_clears_backoff_and_pause_and_fetches() {
         let mut a = app();
-        a.loading_prs = true;
-        a.on_msg(Msg::Prs(Err(
-            "GitHub returned errors: API rate limit exceeded".into(),
-        )));
-        assert!(a.paused_until.is_some_and(|p| p > now_secs()));
-        assert!(a.next_refresh >= a.paused_until.unwrap());
-    }
-
-    /// In the background the interval stretches fourfold; back in focus, a
-    /// stale screen is due immediately.
-    #[test]
-    fn focus_stretches_the_interval_and_catches_up_on_return() {
-        let mut a = app();
-        a.last_refresh = now_secs() - 200;
-        a.schedule();
-        a.set_focus(false);
-        assert_eq!(a.next_refresh - a.last_refresh, 360);
-        a.set_focus(true);
-        assert!(
-            a.next_refresh <= now_secs(),
-            "a stale screen should refresh at once"
-        );
-    }
-
-    #[test]
-    fn manual_refresh_clears_backoff_and_pause() {
-        let mut a = app();
-        a.failures = 3;
-        a.paused_until = Some(now_secs() + 600);
+        a.schedule.failures = 3;
+        a.schedule.paused_until = Some(now_secs() + 600);
         a.refresh();
-        assert_eq!(a.failures, 0);
-        assert!(a.paused_until.is_none());
-        assert!(a.loading_prs);
-    }
-
-    /// The whole efficiency win rests on this: an idle desk is skipped, a
-    /// desk that moved is rescanned, and a removable candidate or the selected
-    /// desk is always rescanned.
-    #[test]
-    fn only_desks_that_moved_are_rescanned() {
-        let t = |s| Some(UNIX_EPOCH + Duration::from_secs(s));
-        let seen = (t(10), t(20));
-        assert!(
-            !needs_scan(false, Some(&seen), &seen, false, false),
-            "idle desk"
-        );
-        assert!(
-            needs_scan(false, Some(&seen), &(t(10), t(21)), false, false),
-            "index moved"
-        );
-        assert!(
-            needs_scan(false, Some(&seen), &(t(11), t(20)), false, false),
-            "HEAD moved"
-        );
-        assert!(
-            needs_scan(false, None, &seen, false, false),
-            "never scanned"
-        );
-        assert!(
-            needs_scan(false, Some(&seen), &seen, true, false),
-            "removable candidate"
-        );
-        assert!(
-            needs_scan(false, Some(&seen), &seen, false, true),
-            "selected"
-        );
-        assert!(
-            needs_scan(true, Some(&seen), &seen, false, false),
-            "full sweep"
-        );
+        assert_eq!(a.schedule.failures, 0);
+        assert!(a.schedule.paused_until.is_none());
+        assert!(a.in_flight.prs);
     }
 
     /// A panicking worker still answers, so its loading flag always clears.
@@ -934,7 +784,7 @@ mod tests {
         let (tx, rx) = channel();
         spawn_reply::<()>(
             tx,
-            |r| Msg::Worktrees(r.map(|_| Vec::new())),
+            |r| Msg::Worktrees(r.map(|()| Vec::new())),
             || panic!("boom"),
         );
         match rx.recv_timeout(Duration::from_secs(5)).expect("no reply") {
