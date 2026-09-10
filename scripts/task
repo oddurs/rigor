@@ -13,10 +13,13 @@ usage: scripts/task <target>
 targets:
   fmt        format in place
   fmt:check  verify formatting, non-zero on drift
-  lint       lint; warnings are errors
-  test       full test suite
-  build      compile all targets
+  lint       lint; warnings are errors (clippy, shellcheck, site types)
+  test       full test suite: unit, property, snapshot, end-to-end, hooks
+  build      compile all targets, and verify the site's CSS
   check      fmt:check && lint && test && build
+
+  coverage   line coverage report (not part of check)
+  test:live  contract tests against the real GitHub API (needs gh auth)
 
 Covers both the Rust CLI and the site in site/.
 USAGE
@@ -25,6 +28,17 @@ USAGE
 
 # The pinned toolchain in rust-toolchain.toml is installed on demand by rustup.
 CARGO="${CARGO:-cargo}"
+
+# Tools beyond cargo are required, not optional: a check that silently skips
+# when a tool is missing is a check that stops running without anyone noticing.
+need() {
+	if ! command -v "$1" >/dev/null 2>&1; then
+		printf '%s is not installed. %s\n' "$1" "$2" >&2
+		exit 1
+	fi
+}
+
+SHELL_SCRIPTS="scripts/task scripts/setup scripts/agent .githooks/commit-msg .githooks/pre-commit .githooks/pre-push"
 
 # The site is a second stack behind the same seam. Its dependencies are not
 # optional: skipping them silently would let the site rot while `check` stayed
@@ -49,16 +63,39 @@ fmt:check)
 	;;
 lint)
 	"$CARGO" clippy --all-targets --all-features --locked -- -D warnings
+	need shellcheck "Install: brew install shellcheck (or apt-get install shellcheck)"
+	# shellcheck disable=SC2086 # the list is split on purpose
+	shellcheck $SHELL_SCRIPTS
 	site typecheck
 	;;
 test)
-	"$CARGO" test --all-features --locked
-	# The site is one static page with no behaviour of its own; `next build`
-	# in the build target is what would catch a break. No test target for it.
+	# nextest: each test in its own process, and a hung end-to-end test is
+	# killed (see .config/nextest.toml) instead of stalling the run. CI sets
+	# NEXTEST_PROFILE=ci, which also writes JUnit.
+	need cargo-nextest "Install: brew install cargo-nextest (or cargo install cargo-nextest --locked)"
+	"$CARGO" nextest run --all-features --locked
+	# The site's behaviour is its build output; build verifies it.
 	;;
 build)
 	"$CARGO" build --all-targets --locked
 	site build
+	# A green `next build` has shipped an unstyled page before.
+	site check:css
+	;;
+coverage)
+	need cargo-llvm-cov "Install: brew install cargo-llvm-cov (or cargo install cargo-llvm-cov --locked)"
+	need cargo-nextest "Install: brew install cargo-nextest"
+	# Coverage needs LLVM's profiling tools for the pinned toolchain.
+	rustup component add llvm-tools-preview >/dev/null
+	"$CARGO" llvm-cov nextest --all-features --locked --html
+	"$CARGO" llvm-cov report --summary-only
+	printf '\nHTML report: target/llvm-cov/html/index.html\n'
+	;;
+test:live)
+	# The contract with GitHub's real API. Needs the network and gh auth, so
+	# it is not part of check; CI runs it weekly (.github/workflows/contract.yml).
+	need cargo-nextest "Install: brew install cargo-nextest"
+	"$CARGO" nextest run --all-features --locked --run-ignored only -E 'test(/^github::tests::live_/)'
 	;;
 check)
 	# Ordered cheapest-first so the fastest signal fails first.

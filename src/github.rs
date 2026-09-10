@@ -69,12 +69,23 @@ pub struct Fetched {
 }
 
 /// Fetch every open PR (up to `max`), paginating the GraphQL connection.
+/// How long a single `gh api graphql` call may take. Generous, because a large
+/// repository paginates; the point is that a stalled connection cannot hold the
+/// refresh forever. `RIGOR_GH_TIMEOUT_SECS` overrides it — for very slow links,
+/// and so the end-to-end tests can exercise the timeout in seconds, not minutes.
+fn gh_timeout() -> Duration {
+    let secs = std::env::var("RIGOR_GH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(45);
+    Duration::from_secs(secs)
+}
+
+/// Fetch every open PR (up to `max`), paginating the GraphQL connection.
 pub fn fetch_prs(owner: &str, name: &str, max: usize) -> Result<Fetched> {
     let mut prs = Vec::new();
     let mut cursor: Option<String> = None;
-    let mut viewer = String::new();
-    let mut default_branch = String::new();
-    let mut merged: Vec<MergedPr> = Vec::new();
+    let mut first: Option<Page> = None;
     let mut budget: Option<Budget> = None;
 
     loop {
@@ -89,97 +100,115 @@ pub fn fetch_prs(owner: &str, name: &str, max: usize) -> Result<Fetched> {
             cmd.arg("-F").arg(format!("cursor={c}"));
         }
 
-        // Generous, because a large repository paginates; the point is only
-        // that a stalled connection cannot hold the refresh forever.
-        let out = proc::run(&mut cmd, Duration::from_secs(45), Priority::Normal)
-            .context("gh api graphql")?;
+        let out = proc::run(&mut cmd, gh_timeout(), Priority::Normal).context("gh api graphql")?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             bail!("gh api graphql failed: {}", err.trim());
         }
-
         let v: Value = serde_json::from_slice(&out.stdout).context("parsing gh JSON response")?;
-        if let Some(errs) = v.get("errors").and_then(|e| e.as_array()) {
-            let msg: Vec<_> = errs
-                .iter()
-                .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
-                .collect();
-            bail!("GitHub returned errors: {}", msg.join("; "));
-        }
+        let mut page = parse_page(&v)?;
 
-        let data = v.get("data").context("response had no `data`")?;
-        // The merged list rides along on the same query. Pagination past the
-        // first page re-fetches it, which only happens on repos with more than
-        // 50 open PRs; reading it once keeps that harmless.
-        if let (Some(remaining), Some(limit), Some(reset)) = (
-            data.pointer("/rateLimit/remaining")
-                .and_then(|x| x.as_u64()),
-            data.pointer("/rateLimit/limit").and_then(|x| x.as_u64()),
-            data.pointer("/rateLimit/resetAt")
-                .and_then(|x| x.as_str())
-                .and_then(parse_iso8601),
-        ) {
-            budget = Some(Budget {
-                remaining: remaining as u32,
-                limit: limit as u32,
-                reset_at: reset,
-            });
-        }
-        if viewer.is_empty() {
-            viewer = str_at(data, &["viewer", "login"]).unwrap_or_default();
-            default_branch = str_at(data, &["repository", "defaultBranchRef", "name"])
-                .unwrap_or_else(|| "main".into());
-            for n in data
-                .pointer("/repository/mergedPullRequests/nodes")
-                .and_then(|n| n.as_array())
-                .into_iter()
-                .flatten()
-            {
-                merged.push(MergedPr {
-                    number: n.get("number").and_then(|x| x.as_u64()).unwrap_or(0),
-                    title: string(n, "title"),
-                    url: string(n, "url"),
-                    head_ref: string(n, "headRefName"),
-                    merged_at: opt_ts(n, "mergedAt").unwrap_or(0),
-                });
-            }
-        }
-
-        let conn = data
-            .pointer("/repository/pullRequests")
-            .context("repository not found or not accessible")?;
-        for node in conn
-            .pointer("/nodes")
-            .and_then(|n| n.as_array())
-            .into_iter()
-            .flatten()
-        {
-            prs.push(parse_pr(node));
-        }
-
-        let has_next = conn
-            .pointer("/pageInfo/hasNextPage")
-            .and_then(|b| b.as_bool())
-            .unwrap_or(false);
-        if !has_next || prs.len() >= max {
-            break;
-        }
-        cursor = conn
-            .pointer("/pageInfo/endCursor")
-            .and_then(|c| c.as_str())
-            .map(String::from);
-        if cursor.is_none() {
+        budget = page.budget.or(budget);
+        prs.append(&mut page.prs);
+        cursor = page.next_cursor.take();
+        // Viewer, default branch and the merged list come from the first page;
+        // later pages repeat them.
+        first.get_or_insert(page);
+        if cursor.is_none() || prs.len() >= max {
             break;
         }
     }
 
     prs.truncate(max);
+    let first = first.context("no page returned")?;
     Ok(Fetched {
         budget,
-        viewer,
-        default_branch,
+        viewer: first.viewer,
+        default_branch: first.default_branch,
         prs,
+        merged: first.merged,
+    })
+}
+
+/// One page of the GraphQL response, parsed. Pure, so it is tested against a
+/// recorded response rather than the network.
+struct Page {
+    budget: Option<Budget>,
+    viewer: String,
+    default_branch: String,
+    merged: Vec<MergedPr>,
+    prs: Vec<Pr>,
+    /// Set when there is another page to fetch.
+    next_cursor: Option<String>,
+}
+
+fn parse_page(v: &Value) -> Result<Page> {
+    if let Some(errs) = v.get("errors").and_then(|e| e.as_array()) {
+        let msg: Vec<_> = errs
+            .iter()
+            .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+            .collect();
+        bail!("GitHub returned errors: {}", msg.join("; "));
+    }
+    let data = v.get("data").context("response had no `data`")?;
+
+    let budget = match (
+        data.pointer("/rateLimit/remaining")
+            .and_then(|x| x.as_u64()),
+        data.pointer("/rateLimit/limit").and_then(|x| x.as_u64()),
+        data.pointer("/rateLimit/resetAt")
+            .and_then(|x| x.as_str())
+            .and_then(parse_iso8601),
+    ) {
+        (Some(remaining), Some(limit), Some(reset_at)) => Some(Budget {
+            remaining: remaining as u32,
+            limit: limit as u32,
+            reset_at,
+        }),
+        _ => None,
+    };
+
+    let merged = data
+        .pointer("/repository/mergedPullRequests/nodes")
+        .and_then(|n| n.as_array())
+        .into_iter()
+        .flatten()
+        .map(|n| MergedPr {
+            number: n.get("number").and_then(|x| x.as_u64()).unwrap_or(0),
+            title: string(n, "title"),
+            url: string(n, "url"),
+            head_ref: string(n, "headRefName"),
+            merged_at: opt_ts(n, "mergedAt").unwrap_or(0),
+        })
+        .collect();
+
+    let conn = data
+        .pointer("/repository/pullRequests")
+        .context("repository not found or not accessible")?;
+    let prs = conn
+        .pointer("/nodes")
+        .and_then(|n| n.as_array())
+        .into_iter()
+        .flatten()
+        .map(parse_pr)
+        .collect();
+    let has_next = conn
+        .pointer("/pageInfo/hasNextPage")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    let next_cursor = has_next
+        .then(|| conn.pointer("/pageInfo/endCursor").and_then(|c| c.as_str()))
+        .flatten()
+        .map(String::from);
+
+    Ok(Page {
+        budget,
+        viewer: str_at(data, &["viewer", "login"]).unwrap_or_default(),
+        default_branch: str_at(data, &["repository", "defaultBranchRef", "name"])
+            .unwrap_or_else(|| "main".into()),
         merged,
+        prs,
+        next_cursor,
     })
 }
 
@@ -345,4 +374,143 @@ fn str_at(v: &Value, path: &[&str]) -> Option<String> {
         cur = cur.get(p)?;
     }
     cur.as_str().map(String::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{CheckState, Mergeable, ReviewDecision};
+
+    const FIXTURE: &str = include_str!("../tests/fixtures/graphql_page.json");
+
+    fn page() -> Page {
+        parse_page(&serde_json::from_str(FIXTURE).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn reads_the_envelope() {
+        let p = page();
+        assert_eq!(p.viewer, "octocat");
+        assert_eq!(p.default_branch, "main");
+        let b = p.budget.expect("rateLimit");
+        assert_eq!((b.remaining, b.limit), (4812, 5000));
+        assert_eq!(b.reset_at, parse_iso8601("2027-01-15T10:00:00Z").unwrap());
+        assert_eq!(p.merged.len(), 1);
+        assert_eq!(p.merged[0].head_ref, "landed-branch");
+        assert_eq!(p.next_cursor, None, "hasNextPage is false");
+        assert_eq!(p.prs.len(), 3);
+    }
+
+    /// A branch pushed twice has two runs of `build`; only the newest counts,
+    /// or a fixed failure would keep showing red.
+    #[test]
+    fn keeps_only_the_newest_run_of_each_check() {
+        let pr = &page().prs[0];
+        let builds: Vec<_> = pr.checks.iter().filter(|c| c.name == "build").collect();
+        assert_eq!(builds.len(), 1);
+        assert_eq!(builds[0].state, CheckState::Success);
+        assert!(builds[0].url.as_deref().unwrap().ends_with("/runs/2/job/2"));
+    }
+
+    #[test]
+    fn failures_sort_first_and_legacy_statuses_count() {
+        let pr = &page().prs[0];
+        assert_eq!(pr.checks[0].name, "test", "the failing check leads");
+        assert!(
+            pr.checks
+                .iter()
+                .any(|c| c.name == "ci/legacy" && c.state == CheckState::Success)
+        );
+        let t = pr.tally();
+        assert_eq!((t.passed, t.failed, t.skipped, t.total), (2, 1, 1, 4));
+        assert_eq!(pr.rollup, CheckState::Failure);
+    }
+
+    #[test]
+    fn reads_people_and_metadata() {
+        let pr = &page().prs[0];
+        assert_eq!(pr.author, "octocat");
+        assert_eq!(
+            pr.review_requests,
+            vec!["hubot", "platform"],
+            "users and teams"
+        );
+        assert_eq!(pr.assignees, vec!["octocat"]);
+        assert_eq!(pr.labels, vec!["parser", "backend"]);
+        assert_eq!(pr.review_decision, Some(ReviewDecision::ReviewRequired));
+        assert_eq!(
+            (pr.additions, pr.deletions, pr.changed_files, pr.comments),
+            (220, 24, 6, 2)
+        );
+    }
+
+    #[test]
+    fn handles_drafts_conflicts_and_unstarted_checks() {
+        let pr = &page().prs[1];
+        assert!(pr.is_draft);
+        assert_eq!(pr.mergeable, Mergeable::Conflicting);
+        assert_eq!(pr.review_decision, None);
+        assert_eq!(pr.rollup, CheckState::Pending);
+        let queued = pr.checks.iter().find(|c| c.name == "lint").unwrap();
+        assert_eq!(queued.state, CheckState::Pending);
+        assert_eq!((queued.url.as_deref(), queued.started_at), (None, None));
+    }
+
+    /// A deleted account comes back as a null author; a commit with no checks
+    /// at all has a null rollup. Neither may drop the PR or crash.
+    #[test]
+    fn tolerates_nulls_github_really_sends() {
+        let pr = &page().prs[2];
+        assert_eq!(pr.author, "ghost");
+        assert_eq!(pr.rollup, CheckState::None);
+        assert!(pr.checks.is_empty());
+        assert_eq!(pr.mergeable, Mergeable::Unknown);
+        assert!(!pr.is_ready(), "mergeability not yet known is not ready");
+    }
+
+    #[test]
+    fn graphql_errors_become_one_readable_message() {
+        let v = serde_json::json!({ "errors": [
+            { "type": "RATE_LIMITED", "message": "API rate limit exceeded for user ID 1." },
+            { "message": "Something else." }
+        ]});
+        let err = parse_page(&v)
+            .err()
+            .expect("errors must fail the page")
+            .to_string();
+        assert!(
+            err.contains("API rate limit exceeded") && err.contains("Something else"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_missing_repository_is_an_error_not_an_empty_list() {
+        let v =
+            serde_json::json!({ "data": { "viewer": { "login": "octocat" }, "repository": null } });
+        assert!(parse_page(&v).is_err());
+    }
+
+    /// The contract with the real API: the query still parses against GitHub
+    /// as it is today. Needs `gh` authenticated and the network, so it is
+    /// ignored locally and run weekly in CI (.github/workflows/contract.yml).
+    #[test]
+    #[ignore = "live: needs network and gh auth"]
+    fn live_query_still_matches_the_github_schema() {
+        let f = fetch_prs("cli", "cli", 20).expect("live fetch");
+        assert!(!f.viewer.is_empty(), "viewer login");
+        assert!(!f.default_branch.is_empty(), "defaultBranchRef");
+        assert!(!f.prs.is_empty(), "cli/cli always has open pull requests");
+        assert!(f.budget.is_some(), "rateLimit is still in the schema");
+        assert!(
+            f.prs
+                .iter()
+                .all(|p| p.number > 0 && !p.url.is_empty() && !p.head_ref.is_empty()),
+            "every PR parsed its core fields"
+        );
+        assert!(
+            f.prs.iter().any(|p| !p.checks.is_empty()),
+            "check runs still come through the rollup"
+        );
+    }
 }

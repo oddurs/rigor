@@ -1,0 +1,91 @@
+{
+  "data": {
+    "rateLimit": { "remaining": 4812, "limit": 5000, "resetAt": "2027-01-15T10:00:00Z" },
+    "viewer": { "login": "octocat" },
+    "repository": {
+      "defaultBranchRef": { "name": "main" },
+      "mergedPullRequests": {
+        "nodes": [
+          { "number": 90, "title": "Drop the monospace count chips", "url": "https://github.com/acme/widget/pull/90", "headRefName": "landed-branch", "mergedAt": "2027-01-14T09:30:00Z" }
+        ]
+      },
+      "pullRequests": {
+        "pageInfo": { "hasNextPage": false, "endCursor": "Y3Vyc29yOjE=" },
+        "nodes": [
+          {
+            "number": 101,
+            "title": "Give the read path a retry budget",
+            "url": "https://github.com/acme/widget/pull/101",
+            "isDraft": false,
+            "updatedAt": "2027-01-15T09:55:00Z",
+            "author": { "login": "octocat" },
+            "headRefName": "retry-budget",
+            "baseRefName": "main",
+            "additions": 220, "deletions": 24, "changedFiles": 6,
+            "mergeable": "MERGEABLE",
+            "reviewDecision": "REVIEW_REQUIRED",
+            "assignees": { "nodes": [ { "login": "octocat" } ] },
+            "reviewRequests": { "nodes": [
+              { "requestedReviewer": { "__typename": "User", "login": "hubot" } },
+              { "requestedReviewer": { "__typename": "Team", "slug": "platform" } }
+            ] },
+            "labels": { "nodes": [ { "name": "parser" }, { "name": "backend" } ] },
+            "comments": { "totalCount": 2 },
+            "commits": { "nodes": [ { "commit": { "statusCheckRollup": {
+              "state": "FAILURE",
+              "contexts": { "nodes": [
+                { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://github.com/acme/widget/actions/runs/1/job/1", "startedAt": "2027-01-15T09:40:00Z", "completedAt": "2027-01-15T09:42:00Z" },
+                { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://github.com/acme/widget/actions/runs/2/job/2", "startedAt": "2027-01-15T09:50:00Z", "completedAt": "2027-01-15T09:51:42Z" },
+                { "__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://github.com/acme/widget/actions/runs/2/job/3", "startedAt": "2027-01-15T09:50:00Z", "completedAt": "2027-01-15T09:54:03Z" },
+                { "__typename": "CheckRun", "name": "docs", "status": "COMPLETED", "conclusion": "SKIPPED", "detailsUrl": "https://github.com/acme/widget/actions/runs/2/job/4", "startedAt": "2027-01-15T09:50:00Z", "completedAt": "2027-01-15T09:50:00Z" },
+                { "__typename": "StatusContext", "context": "ci/legacy", "state": "SUCCESS", "targetUrl": "https://ci.example.com/widget/101", "createdAt": "2027-01-15T09:52:00Z" }
+              ] }
+            } } } ] }
+          },
+          {
+            "number": 102,
+            "title": "Treat a filtered empty result as unknown",
+            "url": "https://github.com/acme/widget/pull/102",
+            "isDraft": true,
+            "updatedAt": "2027-01-12T09:00:00Z",
+            "author": { "login": "agent-bot" },
+            "headRefName": "filtered-empty",
+            "baseRefName": "main",
+            "additions": 12, "deletions": 3, "changedFiles": 1,
+            "mergeable": "CONFLICTING",
+            "reviewDecision": null,
+            "assignees": { "nodes": [] },
+            "reviewRequests": { "nodes": [] },
+            "labels": { "nodes": [] },
+            "comments": { "totalCount": 0 },
+            "commits": { "nodes": [ { "commit": { "statusCheckRollup": {
+              "state": "PENDING",
+              "contexts": { "nodes": [
+                { "__typename": "CheckRun", "name": "build", "status": "IN_PROGRESS", "conclusion": null, "detailsUrl": "https://github.com/acme/widget/actions/runs/3/job/5", "startedAt": "2027-01-12T08:58:00Z", "completedAt": null },
+                { "__typename": "CheckRun", "name": "lint", "status": "QUEUED", "conclusion": null, "detailsUrl": null, "startedAt": null, "completedAt": null }
+              ] }
+            } } } ] }
+          },
+          {
+            "number": 103,
+            "title": "Move the palette onto colour tokens",
+            "url": "https://github.com/acme/widget/pull/103",
+            "isDraft": false,
+            "updatedAt": "2027-01-10T12:00:00Z",
+            "author": null,
+            "headRefName": "colour-tokens",
+            "baseRefName": "main",
+            "additions": 40, "deletions": 40, "changedFiles": 3,
+            "mergeable": "UNKNOWN",
+            "reviewDecision": "APPROVED",
+            "assignees": { "nodes": [] },
+            "reviewRequests": { "nodes": [] },
+            "labels": { "nodes": [] },
+            "comments": { "totalCount": 1 },
+            "commits": { "nodes": [ { "commit": { "statusCheckRollup": null } } ] }
+          }
+        ]
+      }
+    }
+  }
+}

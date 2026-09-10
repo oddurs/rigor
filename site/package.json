@@ -6,7 +6,8 @@
     "build": "next build --webpack",
     "typecheck": "tsc --noEmit",
     "fmt": "prettier --write .",
-    "fmt:check": "prettier --check ."
+    "fmt:check": "prettier --check .",
+    "check:css": "node scripts/check-css.mjs"
   },
   "dependencies": {
     "next": "16.3.4",

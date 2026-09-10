@@ -56,6 +56,24 @@ a branch you have not run `check` on, and never use `--no-verify`,
 `continue-on-error`, or `|| true` to get past a failure. A red check is
 information, not an obstacle.
 
+## Tests
+
+- Every behaviour change comes with a test that fails without it. Run the test
+  against the old code, or break the new code on purpose, and watch it fail —
+  a test that has never failed has not been shown to test anything.
+- `scripts/task test` is the suite. Use `cargo nextest run <filter>` to iterate
+  on one test; finish with the full `scripts/task check`.
+- A failing snapshot means the screen changed. Read the diff in
+  `cargo insta review` and accept it only if the new screen is what you meant.
+  Never accept snapshots in bulk, and never commit a `.snap.new`.
+- Never add `#[ignore]`, `retries`, or a longer timeout to get past a failing
+  or flaky test. Find out why it fails. The `live_` tests are the only ignored
+  ones, and only because they need the network.
+- End-to-end tests wait on something only the target state draws. Text that is
+  already on screen elsewhere makes a wait pass before the action has landed.
+- Fixtures use neutral data (`acme/widget`, `octocat`). Strip `GIT_*` from the
+  environment before running git in a test.
+
 ## Commit convention
 
 ```

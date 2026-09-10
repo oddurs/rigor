@@ -2,6 +2,10 @@
 /target/
 **/*.rs.bk
 
+# Snapshot changes awaiting review: accept with `cargo insta review`, never commit
+*.snap.new
+*.pending-snap
+
 # Worktrees created by scripts/agent
 .worktrees/
 

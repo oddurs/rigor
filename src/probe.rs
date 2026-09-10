@@ -150,6 +150,16 @@ mod tests {
         assert!(!has_da1(b"\x1b[?62;4"), "incomplete: no final `c` yet");
     }
 
+    proptest::proptest! {
+        /// Whatever a terminal (or anything pretending to be one) sends back,
+        /// parsing it must not panic: this runs before the UI exists.
+        #[test]
+        fn arbitrary_replies_never_panic(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+            let _ = parse(&bytes);
+            let _ = has_da1(&bytes);
+        }
+    }
+
     #[test]
     fn malformed_specs_are_rejected_not_guessed() {
         assert_eq!(parse_rgb("rgb:12345/00/00"), None);

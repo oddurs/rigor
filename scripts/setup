@@ -16,11 +16,21 @@ else
 	exit 1
 fi
 
+printf 'checking test tools\n'
+missing=''
+for tool in cargo-nextest shellcheck; do
+	command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+	printf 'missing:%s\n  macOS: brew install%s\n  Linux: cargo install cargo-nextest --locked; apt-get install shellcheck\n' "$missing" "$missing" >&2
+	exit 1
+fi
+
 printf 'installing site dependencies\n'
 if command -v pnpm >/dev/null 2>&1; then
 	(cd site && pnpm install --frozen-lockfile)
 else
-	printf 'pnpm not found: install Node 22+ and `corepack enable pnpm`, then re-run\n' >&2
+	printf 'pnpm not found: install Node 22+, run: corepack enable pnpm, then re-run\n' >&2
 	exit 1
 fi
 

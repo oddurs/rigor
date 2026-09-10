@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A full testing workflow. nextest runs the suite, with per-test timeouts so a
+  hung end-to-end test is killed rather than stalling the run. Snapshot tests
+  pin every major screen state. Property tests cover column widths, date
+  round-trips, parser robustness, and that strings from a repository or the
+  GitHub API never reach the terminal as control or bidi characters.
+  End-to-end tests drive the real binary in a pseudo-terminal against a fake
+  `gh` and a throwaway repository with worktrees. The git hooks and
+  `scripts/agent` are tested in throwaway repositories. The GitHub parser is
+  tested against a recorded response and, weekly, against the live API. The
+  site's build is checked for classes without CSS. Shell scripts are linted
+  with shellcheck. CI runs on macOS and Linux, writes a test report, and
+  reports coverage (`scripts/task coverage`).
+
 ### Fixed
 
 - A `gh` call that stalled — a connection left half-open across sleep and wake
@@ -19,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Quitting, or receiving SIGTERM or SIGHUP, while a call was in flight could
   leave that call running. Calls still in flight are killed on the way out, and
   the terminal is restored on those signals.
+- Shutdown now also refuses to start new subprocesses, so a worker thread still
+  running during exit cannot start a child after the final sweep.
+- A SIGTERM or SIGHUP is honoured within 100ms, well inside the grace period a
+  terminal or supervisor allows before SIGKILL.
 - A panic in a background worker could leave a loading flag set forever. Workers
   now always report back, and such a panic no longer tears down the screen.
 

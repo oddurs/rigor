@@ -95,6 +95,14 @@ scripts/agent pr              # check, push, open the pull request
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, and
 [CLAUDE.md](CLAUDE.md) for the contract agents work under.
 
+### Tests
+
+`scripts/task test` runs unit, property, snapshot, end-to-end and hook tests
+under [nextest](https://nexte.st). The end-to-end tests drive the real binary
+in a pseudo-terminal against a fake `gh` and a throwaway repository. CI runs
+the suite on macOS and Linux, reports coverage, and checks the parser against
+GitHub's live API weekly. See [CONTRIBUTING.md](CONTRIBUTING.md#testing).
+
 ### The site
 
 `site/` is a single static page — landing and docs — built with Next.js and

@@ -313,6 +313,21 @@ mod tests {
         assert_eq!(t.border, Color::Indexed(8));
     }
 
+    proptest::proptest! {
+        /// A mix always lands between its two ends, channel by channel.
+        #[test]
+        fn mix_stays_between_its_ends(
+            a in proptest::prelude::any::<(u8, u8, u8)>(),
+            b in proptest::prelude::any::<(u8, u8, u8)>(),
+            t in 0.0f32..=1.0,
+        ) {
+            let m = mix(a, b, t);
+            for (x, y, z) in [(a.0, b.0, m.0), (a.1, b.1, m.1), (a.2, b.2, m.2)] {
+                proptest::prop_assert!(z >= x.min(y) && z <= x.max(y));
+            }
+        }
+    }
+
     #[test]
     fn mix_is_linear_per_channel() {
         assert_eq!(mix((0, 0, 0), (200, 100, 50), 0.5), (100, 50, 25));
