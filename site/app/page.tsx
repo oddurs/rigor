@@ -175,9 +175,9 @@ worktree_status = true`}</Code>
 
           <h3 {...stylex.props(s.h4)}>Theming</h3>
           <p {...stylex.props(s.body)}>
-            Colours resolve through your terminal’s own ANSI palette, so rigor renders in
+            Colors resolve through your terminal’s own ANSI palette, so rigor renders in
             whatever theme its parent is running — nothing is pinned to the fixed 256
-            colour cube. Override any slot with an ANSI name, a palette index, or a hex
+            color cube. Override any slot with an ANSI name, a palette index, or a hex
             value.
           </p>
           <Code>{`[theme]
@@ -187,7 +187,7 @@ failure = "red"`}</Code>
           <p {...stylex.props(s.body)}>
             <Mono>RIGOR_THEME</Mono> or <Mono>HERDR_THEME_FILE</Mono> point at a theme
             file, which lets a parent shell hand its palette down at launch.{' '}
-            <Mono>NO_COLOR</Mono> is honoured.
+            <Mono>NO_COLOR</Mono> is honored.
           </p>
         </section>
       </main>

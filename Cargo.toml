@@ -9,7 +9,18 @@ license = "MIT"
 readme = "README.md"
 keywords = ["tui", "github", "pull-request", "ci", "worktree"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["/.github", "/.githooks", "/scripts"]
+# What `cargo package` ships: the program, plus what its unit tests read. The
+# integration tests drive scripts/ and .githooks/ and stay in the repository.
+include = [
+  "/src",
+  "/tests/fixtures",
+  "/proptest-regressions",
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/README.md",
+  "/LICENSE",
+  "/CHANGELOG.md",
+]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -32,3 +43,32 @@ tempfile = "3.27.0"
 [target.'cfg(unix)'.dev-dependencies]
 portable-pty = "0.9.0"
 vt100 = "0.16.2"
+
+# The lint policy, for every target including tests. `scripts/task lint` runs
+# clippy with warnings denied, so everything below is effectively an error.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_qualifications = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Nursery lints are adopted one at a time, each because it found real code here.
+use_self = "warn"
+missing_const_for_fn = "warn"
+or_fun_call = "warn"
+needless_pass_by_ref_mut = "warn"
+useless_let_if_seq = "warn"
+significant_drop_tightening = "warn"
+suboptimal_flops = "warn"
+# Restriction lints. Panics are for tests (see clippy.toml); every unsafe block
+# states why it is sound; and a suppression must say why it exists and be an
+# `#[expect]`, so it fails once the thing it suppressed is gone.
+unwrap_used = "warn"
+expect_used = "warn"
+undocumented_unsafe_blocks = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"

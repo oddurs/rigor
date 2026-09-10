@@ -30,7 +30,9 @@ struct Live {
 
 impl Registry {
     fn lock(&self) -> std::sync::MutexGuard<'_, Live> {
-        self.live.lock().unwrap_or_else(|e| e.into_inner())
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn shutdown(&self) {
@@ -60,8 +62,12 @@ pub fn shutdown() {
 
 fn signal_group(pgid: u32) {
     #[cfg(unix)]
-    unsafe {
-        libc::kill(-(pgid as i32), libc::SIGKILL);
+    if let Ok(pgid) = libc::pid_t::try_from(pgid) {
+        // SAFETY: kill(2) takes plain integers and touches no memory. A
+        // negative pid names the process group this module created.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
     }
     #[cfg(not(unix))]
     let _ = pgid;
@@ -101,7 +107,9 @@ fn run_in(
         // would hold the pipes open.
         cmd.process_group(0);
         if matches!(priority, Priority::Background) {
-            // setpriority is async-signal-safe, which is what pre_exec requires.
+            // SAFETY: pre_exec runs between fork and exec, where only
+            // async-signal-safe calls are sound; setpriority(2) is one, and the
+            // closure touches nothing else.
             unsafe {
                 cmd.pre_exec(|| {
                     libc::setpriority(libc::PRIO_PROCESS, 0, 10);
@@ -233,7 +241,7 @@ mod tests {
             start.elapsed() < Duration::from_secs(3),
             "call survived shutdown"
         );
-        assert!(res.map(|o| !o.status.success()).unwrap_or(true));
+        assert!(res.map_or(true, |o| !o.status.success()));
 
         let after = run_in(
             &reg,

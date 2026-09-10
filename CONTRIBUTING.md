@@ -66,8 +66,10 @@ scripts/task check     # fmt:check && lint && test && build
 ```
 
 Individually: `scripts/task fmt`, `fmt:check`, `lint`, `test`, `build`. Lint
-runs with warnings denied. If CI and your machine ever disagree, the bug is in
-`scripts/task`, which is the only place either of them looks.
+runs with warnings denied. `scripts/task audit` checks dependencies; it needs
+the network, so it is not part of `check`, but CI runs it on every change. If CI
+and your machine ever disagree, the bug is in `scripts/task`, which is the only
+place either of them looks.
 
 The hooks are deliberately cheap to reason about:
 
@@ -77,19 +79,62 @@ The hooks are deliberately cheap to reason about:
 
 Never use `--no-verify`. If a hook is wrong, fix the hook.
 
+## Standards
+
+Each of these is checked by `scripts/task lint` or `audit`, so none of it is a
+matter of review taste.
+
+**Rust.** The lint policy is the `[lints]` table in `Cargo.toml`: rustc's
+idiom lints, all of clippy's pedantic group, and a chosen set from nursery and
+restriction. Warnings are errors.
+
+- Silence a lint with `#[expect(lint, reason = "...")]`, never `#[allow]`.
+  `expect` fails once the lint stops firing, so a stale suppression cannot
+  linger, and the reason is required.
+- No `unwrap` or `expect` outside tests. Handle the case or propagate it.
+- Every `unsafe` block has a `// SAFETY:` comment naming the invariant it
+  relies on.
+- No `as` cast that can truncate, wrap or lose a sign. Use `try_from`, or the
+  saturating `util::secs` and `util::cols`.
+
+**Shell.** POSIX `sh`, checked by shellcheck with the extra checks enabled in
+`.shellcheckrc`.
+
+- Assign a command substitution to a variable before using it. `set -e` does
+  not see a failure inside `"$(...)"` passed as an argument, so
+  `cd "$(git rev-parse --show-toplevel)"` carries on in the wrong directory.
+- No `|| true`. Name the fallback: `ref=$(git symbolic-ref ...) || ref=''`.
+- Every `case` has a default arm, even an empty one, so an unhandled value
+  reads as a decision.
+
+**Workflows.** Checked by actionlint, which also runs shellcheck over every
+`run:` block. Actions are pinned to a commit SHA with the version in a comment,
+and no job keeps the checkout's credentials.
+
+**Dependencies.** `deny.toml` is the policy: a known advisory or a yanked crate
+fails, licenses must be on an explicit allow-list, and crates come only from
+crates.io.
+
+**Spelling.** American English, checked by typos (`_typos.toml`).
+
+**Site.** TypeScript runs in strict mode with the stricter flags on as well:
+`exactOptionalPropertyTypes`, `noUnusedLocals`, `noImplicitReturns` and the
+rest in `site/tsconfig.json`.
+
 ## Testing
 
 `scripts/task test` runs every layer below; `scripts/task check` runs it along
-with formatting, lint and the build. Two tools are required beyond Rust and
-Node: `cargo-nextest` and `shellcheck` (`scripts/setup` checks for both).
+with formatting, lint and the build. Beyond Rust and Node, `check` needs
+`cargo-nextest`, `shellcheck`, `typos` and `actionlint`, and `audit` needs
+`cargo-deny`. `scripts/setup` and `scripts/agent doctor` check for all of them.
 
 | Layer | Where | What it pins |
 |---|---|---|
-| Unit | next to the code (`#[cfg(test)]`) | behaviour of one function or type |
+| Unit | next to the code (`#[cfg(test)]`) | behavior of one function or type |
 | Property | `proptest!` blocks | invariants over generated input: column widths, date round-trips, parsers never panicking, untrusted strings never reaching the terminal as control characters |
 | Snapshot | `src/ui/snapshots/` | the rendered screen in every major state |
 | Parser | `src/github.rs` against `tests/fixtures/graphql_page.json` | the GitHub response shape, including the awkward cases |
-| End to end | `tests/e2e.rs` | the real binary in a pseudo-terminal, against a fake `gh` and a throwaway repository with worktrees: timeouts, shutdown, signals, the colour probe, lock-free git, focus |
+| End to end | `tests/e2e.rs` | the real binary in a pseudo-terminal, against a fake `gh` and a throwaway repository with worktrees: timeouts, shutdown, signals, the color probe, lock-free git, focus |
 | Hooks | `tests/hooks.rs` | `commit-msg`, `pre-commit`, `pre-push` and `scripts/agent`, in throwaway repositories |
 | Site | `site/scripts/check-css.mjs`, run by `build` | every class on the page has a CSS rule |
 | Live contract | `scripts/task test:live`, weekly in CI | the parser still matches GitHub's real API |

@@ -9,17 +9,17 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{App, Row, WtState};
 use crate::config::View;
-use crate::model::{CheckState, Mergeable, MergedPr, Pr, Worktree};
+use crate::model::{CheckState, Mergeable, MergedPr, Pr, Worktree, WorktreeStatus};
 use crate::theme::Theme;
-use crate::util::{cell, now_secs, pad, rel_time, right, truncate};
+use crate::util::{cell, cols, now_secs, pad, rel_time, right, truncate};
 
-pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
+pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let t = app.theme;
     let height = area.height as usize;
     app.clamp_scroll(height);
 
     if app.rows.is_empty() {
-        let msg = if app.loading_prs && app.prs.is_empty() {
+        let msg = if app.in_flight.prs && app.prs.is_empty() {
             "loading…".to_string()
         } else if !app.filter.is_empty() {
             format!("Nothing matches “{}”.", app.filter)
@@ -51,39 +51,34 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let now = now_secs();
-    let width = area.width as usize;
+    let home = app.home.clone();
+    let ctx = RowCtx {
+        width: usize::from(area.width),
+        now: now_secs(),
+        theme: &t,
+        home: home.as_deref(),
+        // In Mine every author is you; give the title the room instead.
+        authors: app.view != View::Mine,
+    };
     let mut lines = Vec::with_capacity(height);
 
     let end = (app.offset + height).min(app.rows.len());
     for i in app.offset..end {
         let selected = i == app.selected;
-        let y = area.y + (i - app.offset) as u16;
+        let y = area.y + cols(i - app.offset);
         app.hits.rows.push((y, i));
 
         let line = match app.rows[i] {
             Row::Pr(pi) => {
                 let pr = &app.prs[pi];
-                // In Mine every author is you; give the title the room instead.
-                let authors = app.view != View::Mine;
-                pr_line(pr, app.worktree_for(pr), selected, authors, width, now, &t)
+                pr_line(pr, app.worktree_for(pr), selected, &ctx)
             }
             Row::Wt(wi) => {
                 let w = &app.worktrees[wi];
                 let pr = w.branch.as_deref().and_then(|b| app.pr_for_branch(b));
                 let merged = w.branch.as_deref().and_then(|b| app.merged_for_branch(b));
                 let state = app.wt_state(w);
-                wt_line(
-                    w,
-                    pr,
-                    merged,
-                    state,
-                    selected,
-                    width,
-                    now,
-                    &t,
-                    app.home.as_deref(),
-                )
+                wt_line(w, pr, merged, state, selected, &ctx)
             }
         };
         lines.push(line);
@@ -95,8 +90,8 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
 /// The selected row: a full-width band mixed from the terminal's own
 /// background (see `probe`), a slim accent bar at the edge, a bold title, and
 /// the dim columns lifted to full foreground. Where the terminal does not
-/// report its colours there is no band, and the bar and weight carry it alone.
-fn row_style(selected: bool, t: &Theme) -> Style {
+/// report its colors there is no band, and the bar and weight carry it alone.
+const fn row_style(selected: bool, t: &Theme) -> Style {
     if selected {
         Style::new().bg(t.sel_bg).fg(t.sel_fg)
     } else {
@@ -106,7 +101,7 @@ fn row_style(selected: bool, t: &Theme) -> Style {
 
 /// Columns that are dim on an unselected row come up to foreground on the
 /// selected one, so the whole row brightens as you move through the list.
-fn dim(selected: bool, t: &Theme) -> Color {
+const fn dim(selected: bool, t: &Theme) -> Color {
     if selected { t.fg } else { t.muted }
 }
 
@@ -123,17 +118,21 @@ fn next_view(app: &App) -> Option<(View, usize, String)> {
         })
 }
 
-/// `▎#4846  ✗ 1/3   ✔ ⌂ Give the read path a retry budget      octocat     3m`
-#[allow(clippy::too_many_arguments)]
-fn pr_line(
-    pr: &Pr,
-    wt: Option<&Worktree>,
-    selected: bool,
-    authors: bool,
+/// What every row of the list shares.
+struct RowCtx<'a> {
     width: usize,
+    /// The instant the frame is drawn at, for ages.
     now: i64,
-    t: &Theme,
-) -> Line<'static> {
+    theme: &'a Theme,
+    /// `$HOME`, to shorten paths to `~`.
+    home: Option<&'a str>,
+    /// Whether the author column earns its width.
+    authors: bool,
+}
+
+/// `▎#4846  ✗ 1/3   ✔ ⌂ Give the read path a retry budget      octocat     3m`
+fn pr_line(pr: &Pr, wt: Option<&Worktree>, selected: bool, ctx: &RowCtx<'_>) -> Line<'static> {
+    let (t, width, now, authors) = (ctx.theme, ctx.width, ctx.now, ctx.authors);
     let base = row_style(selected, t);
     let title_color = if pr.is_draft { dim(selected, t) } else { t.fg };
 
@@ -234,25 +233,23 @@ fn review_cell(pr: &Pr, t: &Theme) -> (&'static str, Color) {
 }
 
 /// Worktree view: the workspace, what it is on, and whether it has a PR yet.
-#[allow(clippy::too_many_arguments)]
 fn wt_line(
     w: &Worktree,
     pr: Option<&Pr>,
     merged: Option<&MergedPr>,
     state: WtState,
     selected: bool,
-    width: usize,
-    now: i64,
-    t: &Theme,
-    home: Option<&str>,
+    ctx: &RowCtx<'_>,
 ) -> Line<'static> {
+    let (t, width, now, home) = (ctx.theme, ctx.width, ctx.now, ctx.home);
     let base = row_style(selected, t);
     let mut spans = vec![Span::styled(
         if selected { "▎" } else { " " },
         base.fg(t.accent),
     )];
 
-    let st = w.status.clone().unwrap_or_default();
+    let unknown = WorktreeStatus::default();
+    let st = w.status.as_ref().unwrap_or(&unknown);
     let (glyph, glyph_color) = match state {
         WtState::Working => ("●", t.warn),
         WtState::Removable => ("⌫", t.success),

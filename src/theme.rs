@@ -30,7 +30,7 @@ pub struct ThemeConfig {
 }
 
 impl ThemeConfig {
-    pub fn merge(&mut self, other: ThemeConfig) {
+    pub fn merge(&mut self, other: Self) {
         macro_rules! take {
             ($($f:ident),*) => { $( if other.$f.is_some() { self.$f = other.$f; } )* };
         }
@@ -58,7 +58,7 @@ pub struct Theme {
 impl Default for Theme {
     /// Every slot here resolves through the terminal's own palette: ANSI 0–15
     /// are theme-defined, so they track whatever herdr / the terminal is themed
-    /// with. Nothing is pinned to the fixed 256-colour cube, which would render
+    /// with. Nothing is pinned to the fixed 256-color cube, which would render
     /// as a flat off-hue patch against a tinted background.
     fn default() -> Self {
         Self {
@@ -84,7 +84,7 @@ impl Theme {
     /// `probed` carries the terminal's own foreground and background when it
     /// answered OSC 10/11. The selection band and the hairlines are mixed from
     /// them, so they sit inside the user's theme rather than on top of it.
-    pub fn resolve(cfg: &ThemeConfig, probed: Probed) -> Result<Self> {
+    pub fn resolve(cfg: &ThemeConfig, cli: Option<&Path>, probed: Probed) -> Result<Self> {
         let mut merged = cfg.clone();
 
         for var in ["HERDR_THEME_FILE", "RIGOR_THEME"] {
@@ -96,11 +96,16 @@ impl Theme {
             }
             merged.merge(load_theme_file(Path::new(&val))?);
         }
-
-        let mut t = Theme::default();
-        if no_color() {
-            t = Theme::monochrome();
+        // `--theme` last: an explicit flag beats anything inherited.
+        if let Some(path) = cli {
+            merged.merge(load_theme_file(path)?);
         }
+
+        let mut t = if no_color() {
+            Self::monochrome()
+        } else {
+            Self::default()
+        };
 
         macro_rules! set {
             ($($f:ident),*) => { $(
@@ -113,15 +118,14 @@ impl Theme {
             fg, bg, accent, success, failure, pending, muted, warn, border, sel_bg, sel_fg
         );
 
-        // Explicit colours always win; derivation only fills what was left to
+        // Explicit colors always win; derivation only fills what was left to
         // the terminal. A configured hex background is a better base than the
-        // probed one, because it is the colour rigor actually paints.
+        // probed one, because it is the color rigor actually paints.
         if !no_color() {
-            let base_bg = rgb_of(t.bg).or(probed.bg);
-            let base_fg = rgb_of(t.fg).or(probed.fg);
-            if let Some(bg) = base_bg {
+            let foreground = rgb_of(t.fg).or(probed.fg);
+            if let Some(bg) = rgb_of(t.bg).or(probed.bg) {
                 let dark = luminance(bg) < 0.5;
-                let toward = base_fg.unwrap_or(if dark { (255, 255, 255) } else { (0, 0, 0) });
+                let toward = foreground.unwrap_or(if dark { (255, 255, 255) } else { (0, 0, 0) });
                 if merged.sel_bg.is_none() {
                     t.sel_bg = to_color(mix(bg, toward, if dark { 0.11 } else { 0.075 }));
                 }
@@ -133,9 +137,9 @@ impl Theme {
         Ok(t)
     }
 
-    /// NO_COLOR: keep the layout, drop the hue. With no band to lean on, the
+    /// `NO_COLOR`: keep the layout, drop the hue. With no band to lean on, the
     /// selection is carried by the bar glyph and weight alone.
-    fn monochrome() -> Self {
+    const fn monochrome() -> Self {
         Self {
             fg: Color::Reset,
             bg: Color::Reset,
@@ -152,38 +156,44 @@ impl Theme {
     }
 }
 
-fn rgb_of(c: Color) -> Option<Rgb> {
+const fn rgb_of(c: Color) -> Option<Rgb> {
     match c {
         Color::Rgb(r, g, b) => Some((r, g, b)),
         _ => None,
     }
 }
 
-fn to_color((r, g, b): Rgb) -> Color {
+const fn to_color((r, g, b): Rgb) -> Color {
     Color::Rgb(r, g, b)
 }
 
 /// `a` moved toward `b` by `t` (0 = a, 1 = b), per channel.
 pub fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
-    let ch = |x: u8, y: u8| {
-        (x as f32 + (y as f32 - x as f32) * t)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
+    let ch = |x: u8, y: u8| channel((f32::from(y) - f32::from(x)).mul_add(t, f32::from(x)));
     (ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2))
+}
+
+/// A color channel from a float, rounded and clamped into range.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is clamped to 0.0..=255.0 on the line before the cast"
+)]
+const fn channel(v: f32) -> u8 {
+    v.round().clamp(0.0, 255.0) as u8
 }
 
 /// Relative luminance (sRGB, WCAG), 0 for black to 1 for white.
 fn luminance((r, g, b): Rgb) -> f32 {
     let lin = |c: u8| {
-        let c = c as f32 / 255.0;
+        let c = f32::from(c) / 255.0;
         if c <= 0.03928 {
             c / 12.92
         } else {
             ((c + 0.055) / 1.055).powf(2.4)
         }
     };
-    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    0.0722f32.mul_add(lin(b), 0.7152f32.mul_add(lin(g), 0.2126 * lin(r)))
 }
 
 pub fn no_color() -> bool {
@@ -191,14 +201,14 @@ pub fn no_color() -> bool {
 }
 
 fn load_theme_file(path: &Path) -> Result<ThemeConfig> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading theme file {}", path.display()))?;
-
     // Accept either a bare table of slots or a file with a [theme] section.
     #[derive(Deserialize)]
     struct Wrapper {
         theme: Option<ThemeConfig>,
     }
+
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading theme file {}", path.display()))?;
     if let Ok(w) = toml::from_str::<Wrapper>(&text)
         && let Some(t) = w.theme
     {
@@ -208,24 +218,30 @@ fn load_theme_file(path: &Path) -> Result<ThemeConfig> {
         .with_context(|| format!("parsing theme file {}", path.display()))
 }
 
-/// `#7dd3fc`, a 0–255 palette index, an ANSI name, or `inherit`.
-pub fn parse_color(s: &str) -> Option<Color> {
-    let s = s.trim();
-    if let Some(hex) = s.strip_prefix('#') {
-        let v = u32::from_str_radix(hex, 16).ok()?;
+/// `#7dd3fc` or `#7df`, a 0–255 palette index, an ANSI name, or `inherit`.
+pub fn parse_color(spec: &str) -> Option<Color> {
+    let spec = spec.trim();
+    if let Some(hex) = spec.strip_prefix('#') {
+        // Every character a hex digit: `from_str_radix` alone accepts a sign.
+        if !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let digits = |at: usize, len: usize| u8::from_str_radix(hex.get(at..at + len)?, 16).ok();
         return match hex.len() {
-            6 => Some(Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)),
-            3 => {
-                let (r, g, b) = ((v >> 8) & 0xf, (v >> 4) & 0xf, v & 0xf);
-                Some(Color::Rgb((r * 17) as u8, (g * 17) as u8, (b * 17) as u8))
-            }
+            6 => Some(Color::Rgb(digits(0, 2)?, digits(2, 2)?, digits(4, 2)?)),
+            // #abc is #aabbcc: each digit repeated, i.e. times 17.
+            3 => Some(Color::Rgb(
+                digits(0, 1)? * 17,
+                digits(1, 1)? * 17,
+                digits(2, 1)? * 17,
+            )),
             _ => None,
         };
     }
-    if let Ok(n) = s.parse::<u8>() {
+    if let Ok(n) = spec.parse::<u8>() {
         return Some(Color::Indexed(n));
     }
-    match s.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+    match spec.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
         "inherit" | "default" | "reset" | "none" => Some(Color::Reset),
         "black" => Some(Color::Black),
         "red" => Some(Color::Red),
@@ -261,21 +277,21 @@ mod tests {
     };
 
     fn rgb(c: Color) -> Rgb {
-        rgb_of(c).expect("expected a derived rgb colour")
+        rgb_of(c).expect("expected a derived rgb color")
     }
 
     /// The band must be visible but quiet: a small step from the background
     /// toward the foreground, in the right direction for the theme.
     #[test]
     fn the_band_is_a_small_step_toward_the_foreground() {
-        let dark = Theme::resolve(&ThemeConfig::default(), DARK).unwrap();
+        let dark = Theme::resolve(&ThemeConfig::default(), None, DARK).unwrap();
         let band = rgb(dark.sel_bg);
         assert!(
             band.0 > 0x16 && band.0 < 0x40,
             "dark band {band:?} should lift slightly"
         );
 
-        let light = Theme::resolve(&ThemeConfig::default(), LIGHT).unwrap();
+        let light = Theme::resolve(&ThemeConfig::default(), None, LIGHT).unwrap();
         let band = rgb(light.sel_bg);
         assert!(
             band.0 < 0xfb && band.0 > 0xdc,
@@ -287,28 +303,28 @@ mod tests {
     /// and divider still read on top of a selected row.
     #[test]
     fn hairlines_are_stronger_than_the_band() {
-        let t = Theme::resolve(&ThemeConfig::default(), DARK).unwrap();
+        let t = Theme::resolve(&ThemeConfig::default(), None, DARK).unwrap();
         assert!(rgb(t.border).0 > rgb(t.sel_bg).0);
     }
 
     /// No answer from the terminal means nothing to mix from: fall back to the
-    /// palette and the bar-and-weight selection rather than guessing a colour.
+    /// palette and the bar-and-weight selection rather than guessing a color.
     #[test]
     fn an_unanswered_probe_leaves_the_palette_alone() {
-        let t = Theme::resolve(&ThemeConfig::default(), Probed::default()).unwrap();
+        let t = Theme::resolve(&ThemeConfig::default(), None, Probed::default()).unwrap();
         assert_eq!(t.sel_bg, Color::Reset);
         assert_eq!(t.border, Color::DarkGray);
     }
 
     /// Anything the user set by hand beats derivation.
     #[test]
-    fn explicit_colours_win_over_derived_ones() {
+    fn explicit_colors_win_over_derived_ones() {
         let cfg = ThemeConfig {
             sel_bg: Some("#123456".into()),
             border: Some("8".into()),
             ..ThemeConfig::default()
         };
-        let t = Theme::resolve(&cfg, DARK).unwrap();
+        let t = Theme::resolve(&cfg, None, DARK).unwrap();
         assert_eq!(t.sel_bg, Color::Rgb(0x12, 0x34, 0x56));
         assert_eq!(t.border, Color::Indexed(8));
     }
@@ -325,6 +341,15 @@ mod tests {
             for (x, y, z) in [(a.0, b.0, m.0), (a.1, b.1, m.1), (a.2, b.2, m.2)] {
                 proptest::prop_assert!(z >= x.min(y) && z <= x.max(y));
             }
+        }
+    }
+
+    #[test]
+    fn hex_colors_parse_strictly() {
+        assert_eq!(parse_color("#7dd3fc"), Some(Color::Rgb(0x7d, 0xd3, 0xfc)));
+        assert_eq!(parse_color("#fa0"), Some(Color::Rgb(0xff, 0xaa, 0x00)));
+        for bad in ["#+fffff", "#12345", "#gggggg", "#", "#1234567"] {
+            assert_eq!(parse_color(bad), None, "{bad}");
         }
     }
 

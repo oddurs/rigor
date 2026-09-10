@@ -65,7 +65,7 @@ pub fn discover(start: &Path, repo_override: Option<&str>) -> Result<RepoInfo> {
     })
 }
 
-/// Prefer `gh`'s own resolution (it honours `remote.origin.gh-resolved`), fall
+/// Prefer `gh`'s own resolution (it honors `remote.origin.gh-resolved`), fall
 /// back to parsing the origin URL so we still work offline-ish.
 fn resolve_slug(root: &Path) -> Result<(String, String)> {
     if let Ok(out) = proc::run(
@@ -174,24 +174,21 @@ pub fn worktree_status(wt: &Worktree, default_branch: &str) -> WorktreeStatus {
     // upstream that is exactly what `@{upstream}..HEAD` counts; with no upstream
     // the branch has never been published, so everything since it left the
     // default branch is unpushed.
-    match git_ok(p, &["rev-list", "--count", "@{upstream}..HEAD"]) {
-        Some(c) => {
-            st.published = true;
-            st.unpushed = c.trim().parse().unwrap_or(0);
-        }
-        None => {
-            st.published = false;
-            st.unpushed = git_ok(
-                p,
-                &[
-                    "rev-list",
-                    "--count",
-                    &format!("origin/{default_branch}..HEAD"),
-                ],
-            )
-            .and_then(|c| c.trim().parse().ok())
-            .unwrap_or(0);
-        }
+    if let Some(c) = git_ok(p, &["rev-list", "--count", "@{upstream}..HEAD"]) {
+        st.published = true;
+        st.unpushed = c.trim().parse().unwrap_or(0);
+    } else {
+        st.published = false;
+        st.unpushed = git_ok(
+            p,
+            &[
+                "rev-list",
+                "--count",
+                &format!("origin/{default_branch}..HEAD"),
+            ],
+        )
+        .and_then(|c| c.trim().parse().ok())
+        .unwrap_or(0);
     }
 
     if let Some(l) = git_ok(p, &["log", "-1", "--format=%ct%x00%s%x00%an"]) {
@@ -253,8 +250,7 @@ pub fn scan(
     // Four at a time: enough to finish promptly, few enough that a scan of a
     // large repository never saturates the disk while agents are building.
     let workers = std::thread::available_parallelism()
-        .map(|n| n.get().min(4))
-        .unwrap_or(2)
+        .map_or(2, |n| n.get().min(4))
         .min(which.len().max(1));
 
     std::thread::scope(|s| {
@@ -266,10 +262,16 @@ pub fn scan(
                     let w = &wts[i];
                     let sig = signature(&w.path);
                     let st = worktree_status(w, default_branch);
-                    results.lock().unwrap().push((w.path.clone(), sig, st));
+                    // A panicked worker cannot corrupt a Vec push; keep going.
+                    results
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((w.path.clone(), sig, st));
                 }
             });
         }
     });
-    results.into_inner().unwrap()
+    results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

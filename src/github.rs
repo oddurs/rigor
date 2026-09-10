@@ -14,7 +14,7 @@ use crate::proc::{self, Priority};
 use crate::model::{Check, CheckState, Mergeable, MergedPr, Pr, ReviewDecision};
 use crate::util::parse_iso8601;
 
-const QUERY: &str = r#"
+const QUERY: &str = r"
 query($owner:String!, $name:String!, $cursor:String) {
   rateLimit { remaining limit resetAt }
   viewer { login }
@@ -47,7 +47,7 @@ query($owner:String!, $name:String!, $cursor:String) {
     }
   }
 }
-"#;
+";
 
 /// Where the GraphQL budget stood after this fetch. rigor shares the budget
 /// with every other `gh` call on the machine — agents included — so it backs
@@ -153,16 +153,15 @@ fn parse_page(v: &Value) -> Result<Page> {
     let data = v.get("data").context("response had no `data`")?;
 
     let budget = match (
-        data.pointer("/rateLimit/remaining")
-            .and_then(|x| x.as_u64()),
-        data.pointer("/rateLimit/limit").and_then(|x| x.as_u64()),
+        data.pointer("/rateLimit/remaining").and_then(Value::as_u64),
+        data.pointer("/rateLimit/limit").and_then(Value::as_u64),
         data.pointer("/rateLimit/resetAt")
             .and_then(|x| x.as_str())
             .and_then(parse_iso8601),
     ) {
         (Some(remaining), Some(limit), Some(reset_at)) => Some(Budget {
-            remaining: remaining as u32,
-            limit: limit as u32,
+            remaining: count(Some(remaining)),
+            limit: count(Some(limit)),
             reset_at,
         }),
         _ => None,
@@ -174,7 +173,7 @@ fn parse_page(v: &Value) -> Result<Page> {
         .into_iter()
         .flatten()
         .map(|n| MergedPr {
-            number: n.get("number").and_then(|x| x.as_u64()).unwrap_or(0),
+            number: n.get("number").and_then(Value::as_u64).unwrap_or(0),
             title: string(n, "title"),
             url: string(n, "url"),
             head_ref: string(n, "headRefName"),
@@ -194,7 +193,7 @@ fn parse_page(v: &Value) -> Result<Page> {
         .collect();
     let has_next = conn
         .pointer("/pageInfo/hasNextPage")
-        .and_then(|b| b.as_bool())
+        .and_then(Value::as_bool)
         .unwrap_or(false);
     let next_cursor = has_next
         .then(|| conn.pointer("/pageInfo/endCursor").and_then(|c| c.as_str()))
@@ -217,14 +216,13 @@ fn parse_pr(n: &Value) -> Pr {
     let rollup = n
         .pointer("/commits/nodes/0/commit/statusCheckRollup/state")
         .and_then(|s| s.as_str())
-        .map(CheckState::from_status)
-        .unwrap_or(CheckState::None);
+        .map_or(CheckState::None, CheckState::from_status);
 
     Pr {
-        number: n.get("number").and_then(|x| x.as_u64()).unwrap_or(0),
+        number: n.get("number").and_then(Value::as_u64).unwrap_or(0),
         title: string(n, "title"),
         url: string(n, "url"),
-        is_draft: n.get("isDraft").and_then(|x| x.as_bool()).unwrap_or(false),
+        is_draft: n.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
         updated_at: opt_ts(n, "updatedAt").unwrap_or(0),
         author: str_at(n, &["author", "login"]).unwrap_or_else(|| "ghost".into()),
         head_ref: string(n, "headRefName"),
@@ -235,8 +233,7 @@ fn parse_pr(n: &Value) -> Pr {
         mergeable: n
             .get("mergeable")
             .and_then(|x| x.as_str())
-            .map(Mergeable::parse)
-            .unwrap_or(Mergeable::Unknown),
+            .map_or(Mergeable::Unknown, Mergeable::parse),
         review_decision: n
             .get("reviewDecision")
             .and_then(|x| x.as_str())
@@ -266,10 +263,7 @@ fn parse_pr(n: &Value) -> Pr {
                     .collect()
             })
             .unwrap_or_default(),
-        comments: n
-            .pointer("/comments/totalCount")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
+        comments: count(n.pointer("/comments/totalCount").and_then(Value::as_u64)),
         checks,
         rollup,
     }
@@ -306,8 +300,7 @@ fn parse_checks(n: &Value) -> Vec<Check> {
                 state: c
                     .get("state")
                     .and_then(|s| s.as_str())
-                    .map(CheckState::from_status)
-                    .unwrap_or(CheckState::None),
+                    .map_or(CheckState::None, CheckState::from_status),
                 url: c
                     .get("targetUrl")
                     .and_then(|s| s.as_str())
@@ -361,7 +354,13 @@ fn string(v: &Value, key: &str) -> String {
 }
 
 fn num(v: &Value, key: &str) -> u32 {
-    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0) as u32
+    count(v.get(key).and_then(Value::as_u64))
+}
+
+/// A count from the API as `u32`: absent is zero, and anything too large
+/// saturates rather than wrapping around to a small number.
+fn count(v: Option<u64>) -> u32 {
+    v.map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
 }
 
 fn opt_ts(v: &Value, key: &str) -> Option<i64> {

@@ -20,61 +20,61 @@ pub enum View {
 
 impl View {
     /// Every view that exists, for config validation and tests.
-    pub const ALL: [View; 7] = [
-        View::Ready,
-        View::Mine,
-        View::Review,
-        View::Assigned,
-        View::Blocked,
-        View::All,
-        View::Worktrees,
+    pub const ALL: [Self; 7] = [
+        Self::Ready,
+        Self::Mine,
+        Self::Review,
+        Self::Assigned,
+        Self::Blocked,
+        Self::All,
+        Self::Worktrees,
     ];
 
     /// The tabs shown when config says nothing. Ready leads because merging what
     /// is already green is the job this dashboard exists to do.
-    pub const DEFAULT: [View; 6] = [
-        View::Ready,
-        View::Mine,
-        View::Review,
-        View::Blocked,
-        View::All,
-        View::Worktrees,
+    pub const DEFAULT: [Self; 6] = [
+        Self::Ready,
+        Self::Mine,
+        Self::Review,
+        Self::Blocked,
+        Self::All,
+        Self::Worktrees,
     ];
 
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "ready" | "mergeable" => Some(View::Ready),
-            "mine" | "authored" => Some(View::Mine),
-            "review" | "reviews" => Some(View::Review),
-            "assigned" => Some(View::Assigned),
-            "blocked" | "stuck" => Some(View::Blocked),
-            "all" => Some(View::All),
-            "worktrees" | "agents" => Some(View::Worktrees),
+            "ready" | "mergeable" => Some(Self::Ready),
+            "mine" | "authored" => Some(Self::Mine),
+            "review" | "reviews" => Some(Self::Review),
+            "assigned" => Some(Self::Assigned),
+            "blocked" | "stuck" => Some(Self::Blocked),
+            "all" => Some(Self::All),
+            "worktrees" | "agents" => Some(Self::Worktrees),
             _ => None,
         }
     }
 
-    pub fn title(self) -> &'static str {
+    pub const fn title(self) -> &'static str {
         match self {
-            View::Ready => "Ready",
-            View::Mine => "Mine",
-            View::Review => "Review",
-            View::Assigned => "Assigned",
-            View::Blocked => "Blocked",
-            View::All => "All",
-            View::Worktrees => "Worktrees",
+            Self::Ready => "Ready",
+            Self::Mine => "Mine",
+            Self::Review => "Review",
+            Self::Assigned => "Assigned",
+            Self::Blocked => "Blocked",
+            Self::All => "All",
+            Self::Worktrees => "Worktrees",
         }
     }
 
-    pub fn empty_hint(self) -> &'static str {
+    pub const fn empty_hint(self) -> &'static str {
         match self {
-            View::Ready => "Nothing is ready to merge right now.",
-            View::Mine => "No open PRs authored by you in this repo.",
-            View::Review => "Nothing is waiting on your review.",
-            View::Assigned => "No open PRs are assigned to you.",
-            View::Blocked => "Nothing is blocked — no red CI, conflicts or requested changes.",
-            View::All => "No open PRs in this repo.",
-            View::Worktrees => "No git worktrees found.",
+            Self::Ready => "Nothing is ready to merge right now.",
+            Self::Mine => "No open PRs authored by you in this repo.",
+            Self::Review => "Nothing is waiting on your review.",
+            Self::Assigned => "No open PRs are assigned to you.",
+            Self::Blocked => "Nothing is blocked — no red CI, conflicts or requested changes.",
+            Self::All => "No open PRs in this repo.",
+            Self::Worktrees => "No git worktrees found.",
         }
     }
 }
@@ -116,7 +116,7 @@ pub struct ConfigFile {
 }
 
 impl ConfigFile {
-    fn merge(&mut self, other: ConfigFile) {
+    fn merge(&mut self, other: Self) {
         macro_rules! take {
             ($($f:ident),*) => { $( if other.$f.is_some() { self.$f = other.$f; } )* };
         }
@@ -183,7 +183,7 @@ impl Default for Settings {
     }
 }
 
-fn default_open() -> &'static str {
+const fn default_open() -> &'static str {
     if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -191,7 +191,7 @@ fn default_open() -> &'static str {
     }
 }
 
-fn default_copy() -> &'static str {
+const fn default_copy() -> &'static str {
     if cfg!(target_os = "macos") {
         "pbcopy"
     } else {
@@ -343,7 +343,7 @@ worktree_scan_secs = 300
 # fg      = "inherit"
 # bg      = "inherit"
 
-# The selected row's band and the hairlines are mixed from the colours your
+# The selected row's band and the hairlines are mixed from the colors your
 # terminal reports for itself, so they sit inside your theme. Terminals that
 # do not report them get no band: an accent bar and a bolder line instead.
 # Set either to pin it:

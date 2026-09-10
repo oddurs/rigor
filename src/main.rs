@@ -8,6 +8,7 @@ mod github;
 mod model;
 mod probe;
 mod proc;
+mod schedule;
 mod theme;
 mod ui;
 mod util;
@@ -99,14 +100,14 @@ fn main() -> Result<()> {
     if cli.no_mouse {
         settings.mouse = false;
     }
-    if let Some(p) = &cli.theme {
-        // A CLI theme is handed to the resolver the same way a parent shell would.
-        unsafe { std::env::set_var("RIGOR_THEME", p) };
-    }
 
-    // Resolved here so a bad colour fails before the terminal is taken over,
+    // Resolved here so a bad color fails before the terminal is taken over,
     // and so --print-config never writes a query to the tty.
-    theme::Theme::resolve(&settings.theme, probe::Probed::default())?;
+    theme::Theme::resolve(
+        &settings.theme,
+        cli.theme.as_deref(),
+        probe::Probed::default(),
+    )?;
 
     if cli.print_config {
         print_config(&repo, &settings);
@@ -118,16 +119,16 @@ fn main() -> Result<()> {
 
     let mouse = settings.mouse;
     let (mut term, probed) = setup(mouse)?;
-    let theme = match theme::Theme::resolve(&settings.theme, probed) {
+    let theme = match theme::Theme::resolve(&settings.theme, cli.theme.as_deref(), probed) {
         Ok(t) => t,
         Err(e) => {
-            restore(&mut term, mouse)?;
+            restore(&mut term, mouse);
             return Err(e);
         }
     };
     let (mut a, rx) = App::new(repo, settings, theme);
-    let result = run(&mut term, &mut a, rx);
-    restore(&mut term, mouse)?;
+    let result = run(&mut term, &mut a, &rx);
+    restore(&mut term, mouse);
     proc::shutdown();
     result
 }
@@ -135,7 +136,7 @@ fn main() -> Result<()> {
 fn run(
     term: &mut Terminal<CrosstermBackend<Stdout>>,
     a: &mut App,
-    rx: std::sync::mpsc::Receiver<app::Msg>,
+    rx: &std::sync::mpsc::Receiver<app::Msg>,
 ) -> Result<()> {
     let mut input = event::Input::default();
     let stop = stop_on_signal();
@@ -144,7 +145,7 @@ fn run(
     loop {
         term.draw(|f| ui::draw(f, a))?;
 
-        // Short enough that a SIGTERM or SIGHUP is honoured well inside the
+        // Short enough that a SIGTERM or SIGHUP is honored well inside the
         // grace period a terminal or supervisor gives before SIGKILL — which
         // would orphan any git or gh call still in flight. Idle, this costs
         // about 0.2% of a core; input returns at once regardless.
@@ -155,7 +156,7 @@ fn run(
                     if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
                         a.quit = true;
                     } else {
-                        input.key(a, k);
+                        event::key(a, k);
                     }
                 }
                 Event::Mouse(m) => input.mouse(a, m),
@@ -198,7 +199,7 @@ fn setup(mouse: bool) -> Result<(Terminal<CrosstermBackend<Stdout>>, probe::Prob
     enable_raw_mode()?;
     // In raw mode and before the event loop owns stdin, so the terminal's
     // replies are read here rather than arriving as keystrokes.
-    let probed = probe::query(std::time::Duration::from_millis(250));
+    let probed = probe::query(Duration::from_millis(250));
     let mut out = stdout();
     // ratatui's first draw only writes cells that differ from its blank start
     // buffer, so anything already on screen would survive wherever the frame is
@@ -238,14 +239,13 @@ fn setup(mouse: bool) -> Result<(Terminal<CrosstermBackend<Stdout>>, probe::Prob
 
 /// Best effort throughout: after a SIGHUP the terminal may already be gone,
 /// and failing to write to it is not an error worth reporting.
-fn restore(term: &mut Terminal<CrosstermBackend<Stdout>>, mouse: bool) -> Result<()> {
+fn restore(term: &mut Terminal<CrosstermBackend<Stdout>>, mouse: bool) {
     if mouse {
         let _ = execute!(term.backend_mut(), DisableMouseCapture);
     }
     let _ = execute!(term.backend_mut(), DisableFocusChange, LeaveAlternateScreen);
     let _ = disable_raw_mode();
     let _ = term.show_cursor();
-    Ok(())
 }
 
 fn init_config() -> Result<()> {

@@ -1,0 +1,3 @@
+# Tests may panic: an unwrap in a test is an assertion.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

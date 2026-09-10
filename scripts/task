@@ -13,11 +13,13 @@ usage: scripts/task <target>
 targets:
   fmt        format in place
   fmt:check  verify formatting, non-zero on drift
-  lint       lint; warnings are errors (clippy, shellcheck, site types)
+  lint       lint; warnings are errors (spelling, shell, workflows, clippy,
+             site types)
   test       full test suite: unit, property, snapshot, end-to-end, hooks
   build      compile all targets, and verify the site's CSS
   check      fmt:check && lint && test && build
 
+  audit      dependency policy: advisories, licenses, bans, sources
   coverage   line coverage report (not part of check)
   test:live  contract tests against the real GitHub API (needs gh auth)
 
@@ -62,10 +64,15 @@ fmt:check)
 	site fmt:check
 	;;
 lint)
-	"$CARGO" clippy --all-targets --all-features --locked -- -D warnings
+	# The fast checks first; clippy compiles.
 	need shellcheck "Install: brew install shellcheck (or apt-get install shellcheck)"
 	# shellcheck disable=SC2086 # the list is split on purpose
 	shellcheck $SHELL_SCRIPTS
+	need typos "Install: brew install typos-cli (or cargo install typos-cli --locked)"
+	typos
+	need actionlint "Install: brew install actionlint (see github.com/rhysd/actionlint)"
+	actionlint
+	"$CARGO" clippy --all-targets --all-features --locked -- -D warnings
 	site typecheck
 	;;
 test)
@@ -74,13 +81,20 @@ test)
 	# NEXTEST_PROFILE=ci, which also writes JUnit.
 	need cargo-nextest "Install: brew install cargo-nextest (or cargo install cargo-nextest --locked)"
 	"$CARGO" nextest run --all-features --locked
-	# The site's behaviour is its build output; build verifies it.
+	# The site's behavior is its build output; build verifies it.
 	;;
 build)
 	"$CARGO" build --all-targets --locked
 	site build
 	# A green `next build` has shipped an unstyled page before.
 	site check:css
+	;;
+audit)
+	# Not part of check: advisories change with the world, not with the tree,
+	# and fetching them needs the network. CI runs it on every change. Policy
+	# is in deny.toml.
+	need cargo-deny "Install: brew install cargo-deny (or cargo install cargo-deny --locked)"
+	"$CARGO" deny check
 	;;
 coverage)
 	need cargo-llvm-cov "Install: brew install cargo-llvm-cov (or cargo install cargo-llvm-cov --locked)"

@@ -1,4 +1,4 @@
-//! Ask the terminal which colours it is actually drawing with.
+//! Ask the terminal which colors it is actually drawing with.
 //!
 //! OSC 10 and OSC 11 report the default foreground and background. With those,
 //! the selection band and the hairlines can be mixed from the user's real theme
@@ -27,13 +27,14 @@ pub fn query(timeout: Duration) -> Probed {
     use std::time::Instant;
 
     // Only meaningful when both ends are a terminal.
+    // SAFETY: isatty(3) takes a plain descriptor number and touches no memory.
     if unsafe { libc::isatty(0) == 0 || libc::isatty(1) == 0 } {
         return Probed::default();
     }
     let mut out = std::io::stdout();
     if out
         .write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[c")
-        .and_then(|_| out.flush())
+        .and_then(|()| out.flush())
         .is_err()
     {
         return Probed::default();
@@ -52,15 +53,21 @@ pub fn query(timeout: Duration) -> Probed {
             events: libc::POLLIN,
             revents: 0,
         };
-        let ms = left.as_millis().min(i32::MAX as u128) as i32;
-        if unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
+        let ms = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+        // SAFETY: `pfd` is a live, initialized pollfd and the count is 1, so
+        // poll(2) reads and writes exactly that one struct.
+        if unsafe { libc::poll(&raw mut pfd, 1, ms) } <= 0 {
             break;
         }
-        let n = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
-        if n <= 0 {
+        // SAFETY: the pointer and length describe `chunk`, a live buffer that
+        // read(2) may fill; it never writes past `chunk.len()` bytes.
+        let read = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
+        // Negative is an error, zero is end of input: both end the probe.
+        let Ok(n) = usize::try_from(read) else { break };
+        if n == 0 {
             break;
         }
-        buf.extend_from_slice(&chunk[..n as usize]);
+        buf.extend_from_slice(&chunk[..n]);
     }
     parse(&buf)
 }
@@ -94,14 +101,14 @@ pub fn parse(buf: &[u8]) -> Probed {
     }
 }
 
-/// The colour in an OSC reply, terminated by BEL or by ST (`ESC \`).
+/// The color in an OSC reply, terminated by BEL or by ST (`ESC \`).
 fn reply(s: &str, prefix: &str) -> Option<Rgb> {
     let rest = &s[s.find(prefix)? + prefix.len()..];
     let end = rest.find(['\x07', '\x1b']).unwrap_or(rest.len());
     parse_rgb(&rest[..end])
 }
 
-/// `rgb:RRRR/GGGG/BBBB`, one to four hex digits per channel (X11 colour spec).
+/// `rgb:RRRR/GGGG/BBBB`, one to four hex digits per channel (X11 color spec).
 fn parse_rgb(spec: &str) -> Option<Rgb> {
     let mut channels = spec.strip_prefix("rgb:")?.split('/');
     let mut next = || -> Option<u8> {
@@ -111,7 +118,7 @@ fn parse_rgb(spec: &str) -> Option<Rgb> {
         }
         let v = u32::from_str_radix(hex, 16).ok()?;
         let max = (1u32 << (4 * hex.len())) - 1;
-        Some(((v * 255 + max / 2) / max) as u8)
+        u8::try_from((v * 255 + max / 2) / max).ok()
     };
     Some((next()?, next()?, next()?))
 }
@@ -121,7 +128,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_both_colours_terminated_by_st() {
+    fn reads_both_colors_terminated_by_st() {
         let r =
             parse(b"\x1b]10;rgb:d4d4/d8d8/dede\x1b\\\x1b]11;rgb:1616/1818/1c1c\x1b\\\x1b[?62;22c");
         assert_eq!(r.fg, Some((0xd4, 0xd8, 0xde)));

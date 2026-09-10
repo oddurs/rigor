@@ -1,0 +1,6 @@
+# Optional checks on top of shellcheck's defaults. Each catches a real mistake
+# in scripts that run with `set -e`; the brace-every-variable style check
+# (SC2250) is left off as taste.
+enable=check-extra-masked-returns
+enable=add-default-case
+enable=quote-safe-variables

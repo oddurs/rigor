@@ -2,7 +2,8 @@
 # Fast gate: formatting and lint. The full suite runs in pre-push.
 set -eu
 
-cd "$(git rev-parse --show-toplevel)"
+top=$(git rev-parse --show-toplevel)
+cd "$top"
 
 # Nothing staged means nothing to check (e.g. `git commit` during a merge).
 if git diff --cached --quiet; then

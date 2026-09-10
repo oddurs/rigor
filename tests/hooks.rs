@@ -4,48 +4,25 @@
 //! footgun that made `start` exit silently, `commit` exiting zero on an empty
 //! index, a BSD-only `tr` failure. These keep them fixed.
 #![cfg(unix)]
+#![expect(
+    clippy::unwrap_used,
+    reason = "in a test an unwrap is an assertion: a failed setup step is a failed test"
+)]
 
+mod common;
+
+use common::{isolated, write_exe};
+
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Output, Stdio};
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// A command with every `GIT_*` variable removed. The pre-push hook runs this
-/// suite, and git can hand hooks GIT_DIR or GIT_INDEX_FILE; inherited, they
-/// would point these throwaway commands at the real repository.
-fn cmd(program: &str, cwd: &Path) -> Command {
-    let mut c = Command::new(program);
-    c.current_dir(cwd);
-    for (k, _) in std::env::vars() {
-        if k.starts_with("GIT_") {
-            c.env_remove(k);
-        }
-    }
-    // Modern git starts background maintenance after writes (commit, fetch,
-    // worktree add) and it can outlive the command that started it — a
-    // process still running after the test ends. Tests turn it off.
-    for (k, v) in quiet_git() {
-        c.env(k, v);
-    }
-    c
-}
-
-/// git configuration, passed through the environment so it reaches every git
-/// a test starts — including those started by scripts/agent and the hooks.
-fn quiet_git() -> [(&'static str, &'static str); 5] {
-    [
-        ("GIT_CONFIG_COUNT", "2"),
-        ("GIT_CONFIG_KEY_0", "maintenance.auto"),
-        ("GIT_CONFIG_VALUE_0", "false"),
-        ("GIT_CONFIG_KEY_1", "gc.auto"),
-        ("GIT_CONFIG_VALUE_1", "0"),
-    ]
-}
-
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    cmd("git", cwd).args(args).output().unwrap()
+    isolated("git", cwd).args(args).output().unwrap()
 }
 
 fn ok(o: &Output) -> bool {
@@ -63,9 +40,9 @@ struct Repo {
 }
 
 impl Repo {
-    fn new() -> Repo {
+    fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let r = Repo { dir };
+        let r = Self { dir };
         let (work, origin) = (r.work(), r.dir.path().join("origin.git"));
         std::fs::create_dir_all(&work).unwrap();
         for args in [
@@ -99,7 +76,7 @@ impl Repo {
     /// Point git at this repository's real hooks, with a stub `scripts/task`
     /// standing in for the project's checks: every target passes except the
     /// ones named in `failing`.
-    fn with_hooks(self, failing: &[&str]) -> Repo {
+    fn with_hooks(self, failing: &[&str]) -> Self {
         let hooks = root().join(".githooks");
         assert!(ok(&git(
             &self.work(),
@@ -113,13 +90,10 @@ impl Repo {
         } else {
             failing.join("|")
         };
-        std::fs::write(
+        write_exe(
             &task,
-            format!("#!/bin/sh\ncase \"$1\" in {fails}) echo \"$1 failed\" >&2; exit 1 ;; esac\n"),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&task, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\ncase \"$1\" in {fails}) echo \"$1 failed\" >&2; exit 1 ;; esac\n"),
+        );
         // The stub is local scaffolding, not part of any commit under test.
         std::fs::write(self.work().join(".git/info/exclude"), "scripts/\n").unwrap();
         self
@@ -134,14 +108,15 @@ impl Repo {
         );
         assert!(ok(&o), "{}", stderr(&o));
     }
+}
 
-    fn agent(&self, args: &[&str], cwd: &Path) -> Output {
-        cmd("sh", cwd)
-            .arg(root().join("scripts/agent"))
-            .args(args)
-            .output()
-            .unwrap()
-    }
+/// `scripts/agent` with `args`, run from `cwd`.
+fn agent(args: &[&str], cwd: &Path) -> Output {
+    isolated("sh", cwd)
+        .arg(root().join("scripts/agent"))
+        .args(args)
+        .output()
+        .unwrap()
 }
 
 // ---------------------------------------------------------------- commit-msg
@@ -149,7 +124,7 @@ impl Repo {
 fn commit_msg(message: &str) -> Output {
     let f = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(f.path(), message).unwrap();
-    cmd("sh", &root())
+    isolated("sh", &root())
         .arg(root().join(".githooks/commit-msg"))
         .arg(f.path())
         .output()
@@ -178,7 +153,7 @@ fn commit_msg_rejects_everything_else() {
     let long = format!("feat: {}", "x".repeat(70));
     for m in [
         "add a thing",
-        "Feat: capitalised type",
+        "Feat: capitalized type",
         "feat:no space",
         "feat: trailing period.",
         "wip: not a type",
@@ -202,6 +177,34 @@ fn commit_msg_rejects_assistant_attribution() {
         assert!(!ok(&o), "accepted attribution {trailer:?}");
         assert!(stderr(&o).contains("attribution"), "{}", stderr(&o));
     }
+}
+
+/// One pattern file feeds the hook, `scripts/agent` and the release workflow.
+/// An empty line in it would be an empty pattern, which matches everything.
+#[test]
+fn the_attribution_pattern_is_exactly_one_line() {
+    let text = std::fs::read_to_string(root().join(".githooks/attribution.ere")).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(!lines[0].trim().is_empty());
+}
+
+/// Without its pattern the hook refuses to commit: a check that cannot run is
+/// not a check that passed.
+#[test]
+fn commit_msg_fails_closed_without_its_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let hook = dir.path().join("commit-msg");
+    std::fs::copy(root().join(".githooks/commit-msg"), &hook).unwrap();
+    let msg = dir.path().join("MSG");
+    std::fs::write(&msg, "feat: a clean message").unwrap();
+    let o = isolated("sh", dir.path())
+        .arg(&hook)
+        .arg(&msg)
+        .output()
+        .unwrap();
+    assert!(!ok(&o), "committed with no attribution check");
+    assert!(stderr(&o).contains("cannot read"), "{}", stderr(&o));
 }
 
 // ------------------------------------------------------------------ pre-push
@@ -263,12 +266,43 @@ fn pre_push_allows_the_first_publish_of_a_new_repository() {
     assert!(ok(&o), "{}", stderr(&o));
 }
 
+/// The same exemption from a SHA-256 repository, where the id of a ref that
+/// does not exist yet is 64 zeros, not 40. Anything else is a real ref.
+#[test]
+fn pre_push_reads_any_length_of_zeros_as_a_missing_ref() {
+    let r = Repo::new().with_hooks(&[]);
+    let push = |remote_sha: &str| {
+        let mut hook = isolated("sh", &r.work())
+            .arg(root().join(".githooks/pre-push"))
+            .arg("origin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let local = "1".repeat(64);
+        let line = format!("refs/heads/main {local} refs/heads/main {remote_sha}\n");
+        hook.stdin
+            .take()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        hook.wait_with_output().unwrap()
+    };
+    for zeros in [40, 64] {
+        let o = push(&"0".repeat(zeros));
+        assert!(ok(&o), "{zeros} zeros: {}", stderr(&o));
+    }
+    let o = push(&"a0".repeat(32));
+    assert!(!ok(&o), "an existing SHA-256 main was advanced");
+}
+
 // ------------------------------------------------------------- scripts/agent
 
 #[test]
 fn agent_start_validates_names_and_makes_one_worktree_per_branch() {
     let r = Repo::new();
-    let bad = r.agent(&["start", "Feature/Bad_Name"], &r.work());
+    let bad = agent(&["start", "Feature/Bad_Name"], &r.work());
     assert!(!ok(&bad));
     assert!(
         stderr(&bad).contains("branch name must match"),
@@ -276,7 +310,7 @@ fn agent_start_validates_names_and_makes_one_worktree_per_branch() {
         stderr(&bad)
     );
 
-    let good = r.agent(&["start", "feat/ready-view"], &r.work());
+    let good = agent(&["start", "feat/ready-view"], &r.work());
     assert!(ok(&good), "{}", stderr(&good));
     let path = r.dir.path().join(".worktrees/widget/feat/ready-view");
     assert!(
@@ -289,7 +323,7 @@ fn agent_start_validates_names_and_makes_one_worktree_per_branch() {
         "prints the cd path"
     );
 
-    let again = r.agent(&["start", "feat/ready-view"], &r.work());
+    let again = agent(&["start", "feat/ready-view"], &r.work());
     assert!(!ok(&again), "a second worktree for one branch");
     assert!(
         stderr(&again).contains("already exists"),
@@ -301,7 +335,7 @@ fn agent_start_validates_names_and_makes_one_worktree_per_branch() {
 #[test]
 fn agent_commit_refuses_an_empty_index_and_a_bad_message() {
     let r = Repo::new();
-    let empty = r.agent(&["commit", "feat: nothing staged"], &r.work());
+    let empty = agent(&["commit", "feat: nothing staged"], &r.work());
     assert!(!ok(&empty), "exited zero with nothing staged");
     assert!(
         stderr(&empty).contains("nothing staged"),
@@ -311,7 +345,7 @@ fn agent_commit_refuses_an_empty_index_and_a_bad_message() {
 
     std::fs::write(r.work().join("b.txt"), "b").unwrap();
     assert!(ok(&git(&r.work(), &["add", "b.txt"])));
-    let bad = r.agent(&["commit", "added b"], &r.work());
+    let bad = agent(&["commit", "added b"], &r.work());
     assert!(!ok(&bad));
     assert!(
         stderr(&bad).contains("not a Conventional Commit"),
@@ -319,16 +353,16 @@ fn agent_commit_refuses_an_empty_index_and_a_bad_message() {
         stderr(&bad)
     );
 
-    let good = r.agent(&["commit", "feat: add b"], &r.work());
+    let good = agent(&["commit", "feat: add b"], &r.work());
     assert!(ok(&good), "{}", stderr(&good));
 }
 
 #[test]
 fn agent_done_refuses_to_delete_the_worktree_it_runs_in() {
     let r = Repo::new();
-    assert!(ok(&r.agent(&["start", "fix/thing"], &r.work())));
+    assert!(ok(&agent(&["start", "fix/thing"], &r.work())));
     let inside = r.dir.path().join(".worktrees/widget/fix/thing");
-    let o = r.agent(&["done"], &inside);
+    let o = agent(&["done"], &inside);
     assert!(!ok(&o));
     assert!(
         stderr(&o).contains("run this from the primary checkout"),
