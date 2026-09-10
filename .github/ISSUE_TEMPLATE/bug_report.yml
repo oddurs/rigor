@@ -1,0 +1,59 @@
+name: Bug report
+description: Something behaves differently from what it should.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: >
+        The command you ran and the state of the repository it ran in. Describe
+        the shape of any private data rather than pasting it.
+      placeholder: |
+        1. cd into a repo with N open pull requests
+        2. run `rigor -v worktrees`
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: rigor version
+      description: Output of `rigor --version`.
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: Terminal and OS
+      description: Terminal emulator, its size, and your OS.
+      placeholder: Ghostty 1.2 at 170x42, macOS 15.5
+    validations:
+      required: true
+
+  - type: input
+    id: gh
+    attributes:
+      label: gh version
+      description: Output of `gh --version`.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Output of `rigor --print-config`, plus any `[theme]` overrides.
+      render: toml
+    validations:
+      required: false

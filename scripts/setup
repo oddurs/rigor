@@ -1,0 +1,22 @@
+#!/bin/sh
+# Run once after cloning. Idempotent.
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+printf 'wiring git hooks -> .githooks\n'
+git config core.hooksPath .githooks
+chmod +x .githooks/* 2>/dev/null || true
+
+printf 'installing toolchain components from rust-toolchain.toml\n'
+if command -v rustup >/dev/null 2>&1; then
+	rustup show >/dev/null
+else
+	printf 'rustup not found: install from https://rustup.rs and re-run\n' >&2
+	exit 1
+fi
+
+printf 'verifying the project builds green\n'
+scripts/task check
+
+printf '\nready. next: scripts/agent start <type>/<slug>\n'

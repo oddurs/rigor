@@ -1,0 +1,338 @@
+//! Layered configuration: built-in defaults, user config, repo-local config,
+//! then environment and CLI overrides.
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+
+use crate::theme::ThemeConfig;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Ready,
+    Mine,
+    Review,
+    Assigned,
+    Blocked,
+    All,
+    Worktrees,
+}
+
+impl View {
+    /// Every view that exists, for config validation and tests.
+    pub const ALL: [View; 7] = [
+        View::Ready,
+        View::Mine,
+        View::Review,
+        View::Assigned,
+        View::Blocked,
+        View::All,
+        View::Worktrees,
+    ];
+
+    /// The tabs shown when config says nothing. Ready leads because merging what
+    /// is already green is the job this dashboard exists to do.
+    pub const DEFAULT: [View; 6] = [
+        View::Ready,
+        View::Mine,
+        View::Review,
+        View::Blocked,
+        View::All,
+        View::Worktrees,
+    ];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ready" | "mergeable" => Some(View::Ready),
+            "mine" | "authored" => Some(View::Mine),
+            "review" | "reviews" => Some(View::Review),
+            "assigned" => Some(View::Assigned),
+            "blocked" | "stuck" => Some(View::Blocked),
+            "all" => Some(View::All),
+            "worktrees" | "agents" => Some(View::Worktrees),
+            _ => None,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            View::Ready => "Ready",
+            View::Mine => "Mine",
+            View::Review => "Review",
+            View::Assigned => "Assigned",
+            View::Blocked => "Blocked",
+            View::All => "All",
+            View::Worktrees => "Worktrees",
+        }
+    }
+
+    pub fn empty_hint(self) -> &'static str {
+        match self {
+            View::Ready => "Nothing is ready to merge right now.",
+            View::Mine => "No open PRs authored by you in this repo.",
+            View::Review => "Nothing is waiting on your review.",
+            View::Assigned => "No open PRs are assigned to you.",
+            View::Blocked => "Nothing is blocked — no red CI, conflicts or requested changes.",
+            View::All => "No open PRs in this repo.",
+            View::Worktrees => "No git worktrees found.",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    Auto,
+    Split,
+    Stack,
+}
+
+impl LayoutMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "split" | "side" | "horizontal" => Some(Self::Split),
+            "stack" | "vertical" => Some(Self::Stack),
+            _ => None,
+        }
+    }
+}
+
+/// The on-disk shape. Everything optional so files can set only what they mean to.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigFile {
+    pub default_view: Option<String>,
+    pub views: Option<Vec<String>>,
+    pub refresh_secs: Option<u64>,
+    pub layout: Option<String>,
+    pub max_prs: Option<usize>,
+    pub show_drafts: Option<bool>,
+    pub mouse: Option<bool>,
+    pub worktree_status: Option<bool>,
+    pub open_command: Option<String>,
+    pub copy_command: Option<String>,
+    pub theme: Option<ThemeConfig>,
+}
+
+impl ConfigFile {
+    fn merge(&mut self, other: ConfigFile) {
+        macro_rules! take {
+            ($($f:ident),*) => { $( if other.$f.is_some() { self.$f = other.$f; } )* };
+        }
+        take!(
+            default_view,
+            views,
+            refresh_secs,
+            layout,
+            max_prs,
+            show_drafts,
+            mouse,
+            worktree_status,
+            open_command,
+            copy_command
+        );
+        if let Some(t) = other.theme {
+            match self.theme.as_mut() {
+                Some(base) => base.merge(t),
+                None => self.theme = Some(t),
+            }
+        }
+    }
+}
+
+/// Fully resolved settings the app actually runs on.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    pub default_view: View,
+    /// The tabs, in the order they are shown. Number keys index this list.
+    pub views: Vec<View>,
+    pub refresh_secs: u64,
+    pub layout: LayoutMode,
+    pub max_prs: usize,
+    pub show_drafts: bool,
+    pub mouse: bool,
+    pub worktree_status: bool,
+    pub open_command: String,
+    pub copy_command: String,
+    pub theme: ThemeConfig,
+    pub sources: Vec<PathBuf>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            default_view: View::Ready,
+            views: View::DEFAULT.to_vec(),
+            refresh_secs: 90,
+            layout: LayoutMode::Auto,
+            max_prs: 200,
+            show_drafts: true,
+            mouse: true,
+            worktree_status: true,
+            open_command: default_open().into(),
+            copy_command: default_copy().into(),
+            theme: ThemeConfig::default(),
+            sources: Vec::new(),
+        }
+    }
+}
+
+fn default_open() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    }
+}
+
+fn default_copy() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "pbcopy"
+    } else {
+        "xclip -selection clipboard"
+    }
+}
+
+/// `$RIGOR_CONFIG`, else `$XDG_CONFIG_HOME/rigor/config.toml`, else `~/.config/rigor/config.toml`.
+pub fn user_config_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("RIGOR_CONFIG") {
+        return Some(PathBuf::from(p));
+    }
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".config"))
+        })?;
+    Some(base.join("rigor").join("config.toml"))
+}
+
+fn read(path: &Path) -> Result<Option<ConfigFile>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let cfg: ConfigFile =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(cfg))
+}
+
+/// Load user config, then `<repo>/.rigor.toml` on top of it.
+pub fn load(repo_root: &Path, explicit: Option<&Path>) -> Result<Settings> {
+    let mut merged = ConfigFile::default();
+    let mut sources = Vec::new();
+
+    let user_path = match explicit {
+        Some(p) => Some(p.to_path_buf()),
+        None => user_config_path(),
+    };
+    if let Some(p) = user_path
+        && let Some(c) = read(&p)?
+    {
+        merged.merge(c);
+        sources.push(p);
+    }
+
+    let local = repo_root.join(".rigor.toml");
+    if let Some(c) = read(&local)? {
+        merged.merge(c);
+        sources.push(local);
+    }
+
+    let mut s = Settings::default();
+    if let Some(names) = &merged.views {
+        let mut views: Vec<View> = Vec::new();
+        for n in names {
+            let v = View::parse(n).with_context(|| {
+                let names: Vec<&str> = View::ALL.iter().map(|v| v.title()).collect();
+                format!(
+                    "views: `{n}` is not a view name (try {})",
+                    names.join(", ").to_lowercase()
+                )
+            })?;
+            if !views.contains(&v) {
+                views.push(v);
+            }
+        }
+        if !views.is_empty() {
+            s.views = views;
+        }
+    }
+    if let Some(v) = merged.default_view.as_deref().and_then(View::parse) {
+        s.default_view = v;
+    }
+    // Landing on a tab that is not on the tab bar would leave the bar with
+    // nothing highlighted, so fall back to the first configured view.
+    if !s.views.contains(&s.default_view) {
+        s.default_view = s.views[0];
+    }
+    if let Some(v) = merged.refresh_secs {
+        s.refresh_secs = v;
+    }
+    if let Some(v) = merged.layout.as_deref().and_then(LayoutMode::parse) {
+        s.layout = v;
+    }
+    if let Some(v) = merged.max_prs {
+        s.max_prs = v.clamp(1, 1000);
+    }
+    if let Some(v) = merged.show_drafts {
+        s.show_drafts = v;
+    }
+    if let Some(v) = merged.mouse {
+        s.mouse = v;
+    }
+    if let Some(v) = merged.worktree_status {
+        s.worktree_status = v;
+    }
+    if let Some(v) = merged.open_command {
+        s.open_command = v;
+    }
+    if let Some(v) = merged.copy_command {
+        s.copy_command = v;
+    }
+    if let Some(t) = merged.theme {
+        s.theme.merge(t);
+    }
+    s.sources = sources;
+    Ok(s)
+}
+
+/// A commented starter config, written by `rigor --init-config`.
+pub const SAMPLE: &str = r##"# rigor — PR dashboard configuration
+# Also read from <repo>/.rigor.toml, which overrides this file.
+
+default_view    = "ready"  # any name from `views` below
+# The tab bar, in order. Number keys 1-9 select them positionally.
+# Available: ready | mine | review | assigned | blocked | all | worktrees
+views = ["ready", "mine", "review", "blocked", "all", "worktrees"]
+refresh_secs    = 90       # 0 disables background refresh
+layout          = "auto"   # auto | split (side-by-side) | stack (list over detail)
+max_prs         = 200
+show_drafts     = true
+mouse           = true
+worktree_status = true     # off skips per-worktree git status on very large repos
+# open_command  = "open"
+# copy_command  = "pbcopy"
+
+# Colors are inherited from the terminal by default, so rigor picks up whatever
+# theme its parent (herdr, tmux, the terminal itself) is running. Set any of
+# these to override: an ANSI name ("cyan"), a 256-color index ("117"), or a hex
+# value ("#7dd3fc"). "inherit" hands the slot back to the terminal.
+[theme]
+# accent  = "cyan"
+# success = "green"
+# failure = "red"
+# pending = "yellow"
+# muted   = "darkgray"
+# fg      = "inherit"
+# bg      = "inherit"
+
+# The selected row is marked with an accent bar and a brighter, bolder line
+# rather than a coloured band, so it cannot clash with your terminal theme.
+# Set sel_bg (and sel_fg) if you would rather have a band:
+# sel_bg  = "8"        # ANSI bright-black, i.e. whatever your theme calls it
+# sel_fg  = "inherit"
+"##;

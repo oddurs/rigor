@@ -1,0 +1,53 @@
+#!/bin/sh
+# The single seam between this project and all of its automation.
+#
+# CI, the git hooks and scripts/agent only ever call these targets, so nothing
+# outside this file knows the project is written in Rust. Change toolchains by
+# editing this file; nothing else needs to move.
+set -eu
+
+usage() {
+	cat >&2 <<'USAGE'
+usage: scripts/task <target>
+
+targets:
+  fmt        format in place
+  fmt:check  verify formatting, non-zero on drift
+  lint       lint; warnings are errors
+  test       full test suite
+  build      compile all targets
+  check      fmt:check && lint && test && build
+USAGE
+	exit 2
+}
+
+# The pinned toolchain in rust-toolchain.toml is installed on demand by rustup.
+CARGO="${CARGO:-cargo}"
+
+case "${1:-}" in
+fmt)
+	"$CARGO" fmt --all
+	;;
+fmt:check)
+	"$CARGO" fmt --all -- --check
+	;;
+lint)
+	"$CARGO" clippy --all-targets --all-features --locked -- -D warnings
+	;;
+test)
+	"$CARGO" test --all-features --locked
+	;;
+build)
+	"$CARGO" build --all-targets --locked
+	;;
+check)
+	# Ordered cheapest-first so the fastest signal fails first.
+	"$0" fmt:check
+	"$0" lint
+	"$0" test
+	"$0" build
+	;;
+*)
+	usage
+	;;
+esac

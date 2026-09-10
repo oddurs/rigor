@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads the channel and components from rust-toolchain.toml, and caches
+      # the registry and target directory.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+
+      # The only command CI runs. Local hooks run the same one, so the two
+      # cannot drift.
+      - run: scripts/task check
+
+  required:
+    name: required
+    runs-on: ubuntu-latest
+    needs: [check]
+    steps:
+      - run: echo "all required jobs passed"

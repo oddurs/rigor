@@ -1,0 +1,21 @@
+# Matches rustfmt's defaults (hard tabs off, 4 spaces, 100 columns).
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.rs]
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+[*.{yml,yaml,toml,md,json}]
+indent_style = space
+indent_size = 2
+
+[{scripts/*,.githooks/*}]
+indent_style = tab
+indent_size = 4
