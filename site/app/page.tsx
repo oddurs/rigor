@@ -15,7 +15,7 @@ const ANSWERS = [
   },
   {
     title: 'Which worktrees can I delete?',
-    body: 'Every worktree is mapped to its branch and pull request. One whose branch has landed and whose tree is clean is marked removable. One holding uncommitted or unpushed work never is.',
+    body: 'Every worktree is mapped to its branch and pull request. One still at the exact commit its pull request merged at, with a clean tree, is marked removable. One holding uncommitted or unpushed work never is.',
   },
 ];
 
@@ -36,6 +36,7 @@ const KEYS = [
   ['y', 'copy the pull request URL'],
   ['/', 'filter by title, branch, author or label'],
   ['s', 'sort by recency or by merge-readiness'],
+  ['d', 'show or hide drafts'],
   ['r', 'refresh now'],
   ['?', 'every key, including the mouse bindings'],
 ];
