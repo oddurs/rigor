@@ -46,9 +46,10 @@ struct Cli {
     #[arg(short = 'R', long)]
     repo: Option<String>,
 
-    /// Start on this view: mine, review, assigned, all, worktrees
-    #[arg(short = 'v', long)]
-    view: Option<String>,
+    /// Start on this view: ready, mine, review, assigned, blocked, all or
+    /// worktrees
+    #[arg(short = 'v', long, value_parser = parse_view)]
+    view: Option<View>,
 
     /// Background refresh interval in seconds (0 disables)
     #[arg(short = 'i', long)]
@@ -90,9 +91,12 @@ fn main() -> Result<()> {
     let mut repo = git::discover(&start, cli.repo.as_deref())?;
     let mut settings = config::load(&repo.root, cli.config.as_deref())?;
 
-    if let Some(v) = cli.view.as_deref() {
-        settings.default_view =
-            View::parse(v).context("--view must be mine, review, assigned, all or worktrees")?;
+    if let Some(v) = cli.view {
+        // Asked for by name, so it gets a tab even if config leaves it off the bar.
+        if !settings.views.contains(&v) {
+            settings.views.push(v);
+        }
+        settings.default_view = v;
     }
     if let Some(r) = cli.refresh {
         settings.refresh_secs = r;
@@ -131,6 +135,10 @@ fn main() -> Result<()> {
     restore(&mut term, mouse);
     proc::shutdown();
     result
+}
+
+fn parse_view(name: &str) -> Result<View, String> {
+    View::parse(name).ok_or_else(|| format!("not a view; try {}", View::names()))
 }
 
 fn run(
@@ -262,29 +270,62 @@ fn init_config() -> Result<()> {
     Ok(())
 }
 
+/// Values are spelled the way a config file spells them, so a line can be
+/// copied straight into one.
 fn print_config(repo: &model::RepoInfo, s: &config::Settings) {
-    let mut o = stdout();
-    let _ = writeln!(o, "repo            {}", repo.slug());
-    let _ = writeln!(o, "root            {}", repo.root.display());
-    let _ = writeln!(
-        o,
-        "default_view    {}",
-        s.default_view.title().to_lowercase()
-    );
-    let _ = writeln!(o, "refresh_secs    {}", s.refresh_secs);
-    let _ = writeln!(o, "layout          {:?}", s.layout);
-    let _ = writeln!(o, "max_prs         {}", s.max_prs);
-    let _ = writeln!(o, "show_drafts     {}", s.show_drafts);
-    let _ = writeln!(o, "mouse           {}", s.mouse);
-    let _ = writeln!(o, "worktree_status {}", s.worktree_status);
-    let _ = writeln!(o, "worktree_scan_secs {}", s.worktree_scan_secs);
-    let _ = writeln!(o, "open_command    {}", s.open_command);
-    let _ = writeln!(o, "copy_command    {}", s.copy_command);
+    let views: Vec<String> = s.views.iter().map(|v| v.name()).collect();
+    let mut rows = vec![
+        ("repo", repo.slug()),
+        ("root", repo.root.display().to_string()),
+        ("default_view", s.default_view.name()),
+        ("views", views.join(", ")),
+        ("refresh_secs", s.refresh_secs.to_string()),
+        ("layout", s.layout.name().to_string()),
+        ("max_prs", s.max_prs.to_string()),
+        ("show_drafts", s.show_drafts.to_string()),
+        ("mouse", s.mouse.to_string()),
+        ("worktree_status", s.worktree_status.to_string()),
+        ("worktree_scan_secs", s.worktree_scan_secs.to_string()),
+        ("open_command", s.open_command.clone()),
+        ("copy_command", s.copy_command.clone()),
+    ];
     if s.sources.is_empty() {
-        let _ = writeln!(o, "config files    (none; using defaults)");
-    } else {
-        for p in &s.sources {
-            let _ = writeln!(o, "config file     {}", p.display());
+        rows.push(("config file", "(none; using defaults)".into()));
+    }
+    rows.extend(
+        s.sources
+            .iter()
+            .map(|p| ("config file", p.display().to_string())),
+    );
+    // A closed pipe (`rigor --print-config | head -1`) is not an error.
+    let mut o = stdout().lock();
+    for (key, value) in rows {
+        let _ = writeln!(o, "{key:<18} {value}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    /// `--view`'s help lists its values by hand; this keeps it honest.
+    #[test]
+    fn view_help_names_every_view() {
+        let help = Cli::command().render_long_help().to_string();
+        for v in View::ALL {
+            assert!(
+                help.contains(&v.name()),
+                "--help does not mention {}",
+                v.name()
+            );
         }
+        assert!(parse_view("nope").unwrap_err().contains("worktrees"));
+        assert_eq!(parse_view("Ready"), Ok(View::Ready));
     }
 }
