@@ -23,6 +23,6 @@
     "@types/react-dom": "19.3.0",
     "autoprefixer": "10.4.21",
     "prettier": "3.6.2",
-    "typescript": "5.9.3"
+    "typescript": "7.0.2"
   }
 }
