@@ -178,6 +178,34 @@ fn commit_msg_rejects_assistant_attribution() {
     }
 }
 
+/// One pattern file feeds the hook, `scripts/agent` and the release workflow.
+/// An empty line in it would be an empty pattern, which matches everything.
+#[test]
+fn the_attribution_pattern_is_exactly_one_line() {
+    let text = std::fs::read_to_string(root().join(".githooks/attribution.ere")).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(!lines[0].trim().is_empty());
+}
+
+/// Without its pattern the hook refuses to commit: a check that cannot run is
+/// not a check that passed.
+#[test]
+fn commit_msg_fails_closed_without_its_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let hook = dir.path().join("commit-msg");
+    std::fs::copy(root().join(".githooks/commit-msg"), &hook).unwrap();
+    let msg = dir.path().join("MSG");
+    std::fs::write(&msg, "feat: a clean message").unwrap();
+    let o = isolated("sh", dir.path())
+        .arg(&hook)
+        .arg(&msg)
+        .output()
+        .unwrap();
+    assert!(!ok(&o), "committed with no attribution check");
+    assert!(stderr(&o).contains("cannot read"), "{}", stderr(&o));
+}
+
 // ------------------------------------------------------------------ pre-push
 
 #[test]
