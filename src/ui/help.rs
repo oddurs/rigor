@@ -12,7 +12,7 @@ const KEYS: &[(&str, &str)] = &[
     ("j / k, ↓ / ↑", "move selection"),
     ("g / G", "first / last"),
     ("PgUp / PgDn", "page"),
-    ("1…5, tab", "switch view"),
+    ("1–9, tab", "switch view (by position)"),
     ("enter, o", "open PR in browser"),
     ("c", "open the PR's checks page"),
     ("y", "copy PR URL to clipboard"),

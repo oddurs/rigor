@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{App, Hits};
-use crate::config::LayoutMode;
+use crate::config::{LayoutMode, View};
 use crate::util::{now_secs, rel_time};
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -50,7 +50,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let t = app.theme;
     f.render_widget(Block::new().style(Style::new().bg(t.bg).fg(t.fg)), area);
 
-    let [header, tabs, body, footer] = Layout::vertical([
+    // Three rows of chrome: a top nav (who and where), a subnav (the views),
+    // and a rail that underlines the active view and separates chrome from
+    // content.
+    let [nav, subnav, rail, body, footer] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(3),
@@ -58,9 +62,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     ])
     .areas(area);
 
-    draw_header(f, header, app);
-    draw_tabs(f, tabs, app);
-    draw_body(f, body, app);
+    // Laid out before the chrome is drawn so the rail knows where the detail
+    // pane's divider will meet it.
+    let split = body_layout(app, body);
+
+    draw_nav(f, nav, app);
+    draw_subnav(f, subnav, rail, app, split.divider_x);
+    draw_body(f, split, app);
     draw_footer(f, footer, app);
 
     if app.show_help {
@@ -68,107 +76,237 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let t = app.theme;
-    let mut left = vec![
-        Span::styled(
-            "rigor",
-            Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ", Style::new()),
-        Span::styled(
-            app.repo.slug(),
-            Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if let Some(b) = &app.repo.current_branch {
-        left.push(Span::styled(format!("  ⎇ {b}"), Style::new().fg(t.muted)));
-    }
-    if !app.viewer.is_empty() {
-        left.push(Span::styled(
-            format!("  @{}", app.viewer),
-            Style::new().fg(t.muted),
-        ));
-    }
+fn width_of(spans: &[Span]) -> usize {
+    spans.iter().map(|s| crate::util::width(&s.content)).sum()
+}
 
-    let right = if app.loading_prs || app.loading_wts {
-        format!("{} loading ", SPINNER[app.spinner % SPINNER.len()])
+/// `▌rigor▐  acme/widget › ⎇ main                              @octocat  ⟳ 12s ago`
+///
+/// The wordmark is a badge drawn in reverse video, so it takes its colours from
+/// the terminal's own palette. When the line is too narrow, context is dropped
+/// in order of how little it helps: the branch, then the user, then the status.
+fn draw_nav(f: &mut Frame, area: Rect, app: &App) {
+    let t = app.theme;
+    let muted = Style::new().fg(t.muted);
+
+    let badge = Span::styled(
+        " rigor ",
+        Style::new()
+            .fg(t.accent)
+            .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+    );
+    let repo = Span::styled(
+        app.repo.slug(),
+        Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
+    );
+    let branch = app.repo.current_branch.as_ref().map(|b| {
+        [
+            Span::styled(" › ", Style::new().fg(t.border)),
+            Span::styled(format!("⎇ {b}"), muted),
+        ]
+    });
+
+    let status: Vec<Span> = if app.loading_prs || app.loading_wts {
+        vec![
+            Span::styled(
+                SPINNER[app.spinner % SPINNER.len()],
+                Style::new().fg(t.accent),
+            ),
+            Span::styled(" refreshing", muted),
+        ]
     } else if app.last_refresh > 0 {
-        format!("⟳ {} ago ", rel_time(app.last_refresh, now_secs()))
+        vec![Span::styled(
+            format!("⟳ {} ago", rel_time(app.last_refresh, now_secs())),
+            muted,
+        )]
     } else {
-        String::new()
+        Vec::new()
+    };
+    let viewer = (!app.viewer.is_empty()).then(|| Span::styled(format!("@{}", app.viewer), muted));
+
+    let width = area.width as usize;
+    let (mut show_branch, mut show_viewer, mut show_status) = (true, true, true);
+    let assemble = |sb: bool, sv: bool, ss: bool| -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+        let mut left = vec![badge.clone(), Span::raw("  "), repo.clone()];
+        if sb && let Some(b) = &branch {
+            left.extend(b.iter().cloned());
+        }
+        let mut right = Vec::new();
+        if sv && let Some(v) = &viewer {
+            right.push(v.clone());
+        }
+        if ss && !status.is_empty() {
+            if !right.is_empty() {
+                right.push(Span::raw("  "));
+            }
+            right.extend(status.iter().cloned());
+        }
+        if !right.is_empty() {
+            right.push(Span::raw(" "));
+        }
+        (left, right)
     };
 
-    let used: usize = left.iter().map(|s| s.content.chars().count()).sum();
-    let gap = (area.width as usize).saturating_sub(used + right.chars().count());
-    left.push(Span::raw(" ".repeat(gap)));
-    left.push(Span::styled(right, Style::new().fg(t.muted)));
+    let (mut left, mut right) = assemble(show_branch, show_viewer, show_status);
+    for step in 0..3 {
+        if width_of(&left) + width_of(&right) < width {
+            break;
+        }
+        match step {
+            0 => show_branch = false,
+            1 => show_viewer = false,
+            _ => show_status = false,
+        }
+        (left, right) = assemble(show_branch, show_viewer, show_status);
+    }
 
+    let gap = width.saturating_sub(width_of(&left) + width_of(&right));
+    left.push(Span::raw(" ".repeat(gap)));
+    left.extend(right);
     f.render_widget(Paragraph::new(Line::from(left)), area);
 }
 
-fn draw_tabs(f: &mut Frame, area: Rect, app: &mut App) {
+/// ` Ready 2   Mine 14   Review 0   Blocked 9   All 33   Worktrees 49      sort recent `
+/// `──────────━━━━━━━━━────────────────────────────┬───────────────────────────────────`
+///
+/// Tabs carry a title and a count and nothing else. Key numbers used to sit in
+/// front of each title, which put two bare digits side by side (`Ready 2  2
+/// Mine`); the number keys are positional and listed in the footer instead.
+fn draw_subnav(f: &mut Frame, area: Rect, rail: Rect, app: &mut App, divider_x: Option<u16>) {
     let t = app.theme;
-    let mut spans = Vec::new();
+    let mut spans: Vec<Span> = Vec::new();
     let mut x = area.x;
+    let mut underline: Option<(u16, u16)> = None;
 
-    for (i, v) in app.settings.views.clone().iter().enumerate() {
-        let count = app.count_for(*v);
-        let active = *v == app.view;
+    for v in app.settings.views.clone() {
+        let count = app.count_for(v);
+        let active = v == app.view;
         let base = if active {
             Style::new().bg(t.sel_bg)
         } else {
             Style::new()
         };
-        let key = format!(" {} ", i + 1);
-        let title = v.title().to_string();
-        let num = format!(" {count} ");
-        let w = (key.chars().count() + title.chars().count() + num.chars().count()) as u16;
+        let title_style = if active {
+            base.fg(t.accent).add_modifier(Modifier::BOLD)
+        } else {
+            base.fg(t.fg)
+        };
+        // Two counts carry meaning at a glance: something is ready to merge,
+        // or something is blocked. The rest are just sizes.
+        let count_color = match v {
+            View::Ready if count > 0 => t.success,
+            View::Blocked if count > 0 => t.failure,
+            _ if active => t.accent,
+            _ => t.muted,
+        };
 
-        spans.push(Span::styled(key, base.fg(t.muted)));
-        spans.push(Span::styled(
-            title,
-            if active {
-                base.fg(t.accent).add_modifier(Modifier::BOLD)
-            } else {
-                base.fg(t.fg)
-            },
-        ));
-        spans.push(Span::styled(
-            num,
-            base.fg(if active { t.accent } else { t.muted }),
-        ));
+        let title = v.title();
+        let num = count.to_string();
+        let w = (title.chars().count() + num.chars().count() + 3) as u16;
+
+        spans.push(Span::styled(" ", base));
+        spans.push(Span::styled(title, title_style));
+        spans.push(Span::styled(" ", base));
+        spans.push(Span::styled(num, base.fg(count_color)));
+        spans.push(Span::styled(" ", base));
+        spans.push(Span::raw(" "));
+
         if x < area.right() {
-            app.hits
-                .tabs
-                .push((Rect::new(x, area.y, w.min(area.right() - x), 1), *v));
+            let visible = w.min(area.right() - x);
+            // The hitbox covers the tab and its stretch of rail, so the target
+            // is two rows tall.
+            app.hits.tabs.push((Rect::new(x, area.y, visible, 2), v));
+            if active {
+                underline = Some((x, visible));
+            }
         }
-        x = x.saturating_add(w);
+        x = x.saturating_add(w + 1);
     }
 
-    let mut right = format!("sort {} ", app.sort.label());
-    // The one number worth carrying on the chrome: desks that can be collected.
+    let mut right: Vec<Span> = Vec::new();
     let removable = app.removable_count();
     if removable > 0 {
-        right = format!("{removable} removable   {right}");
+        right.push(Span::styled("⌫ ", Style::new().fg(t.success)));
+        right.push(Span::styled(
+            format!("{removable} removable   "),
+            Style::new().fg(t.muted),
+        ));
     }
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let gap = (area.width as usize).saturating_sub(used + right.chars().count());
-    spans.push(Span::raw(" ".repeat(gap)));
-    spans.push(Span::styled(right, Style::new().fg(t.muted)));
+    right.push(Span::styled(
+        format!("sort {} ", app.sort.label()),
+        Style::new().fg(t.muted),
+    ));
 
+    let used = width_of(&spans);
+    let width = area.width as usize;
+    if used + width_of(&right) < width {
+        spans.push(Span::raw(" ".repeat(width - used - width_of(&right))));
+        spans.extend(right);
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    f.render_widget(
+        Paragraph::new(rail_line(rail, underline, divider_x, &t)),
+        rail,
+    );
 }
 
-fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
-    let t = app.theme;
+/// The rule under the tabs: light everywhere, heavy and accented under the
+/// active tab, and a `┬` where the detail pane's divider comes down to meet it.
+fn rail_line(
+    rail: Rect,
+    underline: Option<(u16, u16)>,
+    divider_x: Option<u16>,
+    t: &crate::theme::Theme,
+) -> Line<'static> {
+    let light = Style::new().fg(t.border);
+    let heavy = Style::new().fg(t.accent);
+
+    let mut cells: Vec<(char, Style)> = (rail.x..rail.right()).map(|_| ('─', light)).collect();
+    if let Some(dx) = divider_x
+        && dx >= rail.x
+        && dx < rail.right()
+    {
+        cells[(dx - rail.x) as usize] = ('┬', light);
+    }
+    if let Some((ux, uw)) = underline {
+        for cx in ux..(ux + uw).min(rail.right()) {
+            cells[(cx - rail.x) as usize] = ('━', heavy);
+        }
+    }
+
+    // Merge runs of one style into a single span.
+    let mut spans: Vec<Span> = Vec::new();
+    let mut run = String::new();
+    let mut run_style = light;
+    for (ch, st) in cells {
+        if st != run_style && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style));
+        }
+        run_style = st;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style));
+    }
+    Line::from(spans)
+}
+
+struct BodySplit {
+    list: Rect,
+    detail_outer: Rect,
+    side_by_side: bool,
+    /// Column of the vertical divider when list and detail sit side by side.
+    divider_x: Option<u16>,
+}
+
+fn body_layout(app: &App, area: Rect) -> BodySplit {
     let side_by_side = match app.settings.layout {
         LayoutMode::Split => true,
         LayoutMode::Stack => false,
         LayoutMode::Auto => area.width >= 140,
     };
-
-    let (list_area, detail_outer) = if side_by_side {
+    let (list, detail_outer) = if side_by_side {
         let [l, d] =
             Layout::horizontal([Constraint::Min(48), Constraint::Percentage(42)]).areas(area);
         (l, d)
@@ -176,21 +314,30 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         let [l, d] = Layout::vertical([Constraint::Min(4), Constraint::Percentage(48)]).areas(area);
         (l, d)
     };
+    BodySplit {
+        list,
+        detail_outer,
+        side_by_side,
+        divider_x: side_by_side.then_some(detail_outer.x),
+    }
+}
 
+fn draw_body(f: &mut Frame, split: BodySplit, app: &mut App) {
+    let t = app.theme;
     let block = Block::new()
-        .borders(if side_by_side {
+        .borders(if split.side_by_side {
             Borders::LEFT
         } else {
             Borders::TOP
         })
         .border_style(Style::new().fg(t.border));
-    let detail_area = block.inner(detail_outer);
-    f.render_widget(block, detail_outer);
+    let detail_area = block.inner(split.detail_outer);
+    f.render_widget(block, split.detail_outer);
 
-    app.hits.list = list_area;
+    app.hits.list = split.list;
     app.hits.detail = detail_area;
 
-    list::draw(f, list_area, app);
+    list::draw(f, split.list, app);
     detail::draw(f, detail_area, app);
 }
 
@@ -225,8 +372,15 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    let views = app.settings.views.len();
+    let view_keys = if views > 1 {
+        format!("1–{}", views.min(9))
+    } else {
+        "1".into()
+    };
     let mut spans = vec![Span::raw(" ")];
     for (k, d) in [
+        (view_keys.as_str(), "view"),
         ("o", "open"),
         ("c", "checks"),
         ("y", "copy"),
@@ -236,8 +390,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         ("?", "help"),
         ("q", "quit"),
     ] {
-        spans.push(Span::styled(k, Style::new().fg(t.accent)));
-        spans.push(Span::styled(format!(" {d}   "), Style::new().fg(t.muted)));
+        spans.push(Span::styled(k.to_string(), Style::new().fg(t.accent)));
+        spans.push(Span::styled(format!(" {d}  "), Style::new().fg(t.muted)));
     }
     if !app.filter.is_empty() {
         spans.push(Span::styled(

@@ -389,6 +389,117 @@ fn pr_num(a: &App, r: &crate::app::Row) -> u64 {
     }
 }
 
+fn frame(a: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| draw(f, a)).unwrap();
+    term.backend().buffer().clone()
+}
+
+fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+    (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+}
+
+/// The subnav used to read `1 Ready 2  2 Mine 14` — two bare digits side by
+/// side, so a count could be mistaken for the next key. Tabs now lead with
+/// their title and carry only a count.
+#[test]
+fn tabs_lead_with_their_title_not_a_key_digit() {
+    let mut a = sample_app();
+    let buf = frame(&mut a, 160, 24);
+    let subnav = row_text(&buf, 1);
+    assert!(subnav.starts_with(" Ready 1"), "subnav: {subnav:?}");
+    assert!(
+        !subnav.contains("1 Ready"),
+        "key digit crept back: {subnav:?}"
+    );
+}
+
+/// The active view is marked by a heavy underline on the rail, spanning
+/// exactly the tab above it — this is what makes the row read as a subnav,
+/// and it survives NO_COLOR because it is a glyph, not a colour.
+#[test]
+fn the_rail_underlines_exactly_the_active_tab() {
+    for view in [View::Ready, View::Blocked, View::Worktrees] {
+        let mut a = sample_app();
+        a.set_view(view);
+        let buf = frame(&mut a, 160, 24);
+        let (rect, _) = *a.hits.tabs.iter().find(|(_, v)| *v == view).unwrap();
+        for x in 0..buf.area.width {
+            let under = x >= rect.x && x < rect.x + rect.width;
+            let glyph = buf[(x, 2)].symbol();
+            if under {
+                assert_eq!(
+                    glyph, "━",
+                    "{view:?}: column {x} under the tab is not underlined"
+                );
+            } else {
+                assert_ne!(
+                    glyph, "━",
+                    "{view:?}: column {x} outside the tab is underlined"
+                );
+            }
+        }
+    }
+}
+
+/// Side by side, the rail carries a `┬` in the same column as the detail
+/// pane's divider, so the two rules join instead of crossing.
+#[test]
+fn the_rail_joins_the_detail_divider() {
+    let mut a = sample_app();
+    a.settings.layout = LayoutMode::Split;
+    a.set_view(View::Ready); // keep the underline away from the junction
+    let buf = frame(&mut a, 160, 24);
+    let x = (0..160)
+        .find(|&x| buf[(x, 2)].symbol() == "┬")
+        .expect("no junction on the rail");
+    assert_eq!(
+        buf[(x, 3)].symbol(),
+        "│",
+        "the junction is not above the divider"
+    );
+}
+
+/// Two counts mean something at a glance: work that is ready, and work that is
+/// stuck. They take the success and failure colours when non-zero.
+#[test]
+fn ready_and_blocked_counts_carry_meaning_in_colour() {
+    let mut a = sample_app();
+    a.set_view(View::All);
+    let buf = frame(&mut a, 160, 24);
+    let subnav = row_text(&buf, 1);
+    let digit_after = |title: &str| {
+        let col = subnav.find(title).unwrap() + title.len() + 1;
+        buf[(col as u16, 1)].fg
+    };
+    assert_eq!(digit_after("Ready"), a.theme.success);
+    assert_eq!(digit_after("Blocked"), a.theme.failure);
+    assert_eq!(
+        digit_after("Mine"),
+        a.theme.muted,
+        "an ordinary count stays quiet"
+    );
+}
+
+/// The top nav gives up context in order of how little it helps — branch, then
+/// user, then status — and always keeps the badge and the repository.
+#[test]
+fn the_nav_sheds_context_before_it_loses_the_repo() {
+    let mut a = sample_app();
+    let wide = row_text(&frame(&mut a, 160, 24), 0);
+    assert!(wide.contains("⎇ chore/release-notes") && wide.contains("@octocat"));
+
+    let narrow = row_text(&frame(&mut a, 44, 24), 0);
+    assert!(
+        narrow.contains("rigor") && narrow.contains("acme/widget"),
+        "{narrow:?}"
+    );
+    assert!(
+        !narrow.contains("⎇"),
+        "the branch should go first: {narrow:?}"
+    );
+}
+
 /// Print a frame for eyeballing: `cargo test -- --nocapture preview`.
 #[test]
 fn preview() {
