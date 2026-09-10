@@ -47,8 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the session, and the opener inherited the terminal's input.
 - A `--config` or `RIGOR_CONFIG` path that did not exist was ignored, and so was
   an unknown `default_view` or `layout` value. Each is now an error.
-- `--view` accepted only some view names and could open on a tab missing from
-  the tab bar. It takes every view, and adds that view to the bar if needed.
+- `--view`'s help and error message left out `ready` and `blocked`, and it could
+  open on a view missing from the tab bar, with no tab highlighted. The help
+  lists every view, and a view missing from the bar is added to it.
 
 - A `gh` call that stalled — a connection left half-open across sleep and wake
   is the usual cause — stopped all further refreshes for good. Every `gh` and
