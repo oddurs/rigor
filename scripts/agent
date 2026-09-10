@@ -131,11 +131,33 @@ cmd_start() {
 cmd_check() { scripts/task check; }
 
 cmd_commit() {
-	[ "$#" -gt 0 ] || die 'usage: scripts/agent commit <message>'
+	all=''
+	if [ "${1:-}" = '-a' ] || [ "${1:-}" = '--all' ]; then
+		all='yes'
+		shift
+	fi
+	[ "$#" -gt 0 ] || die 'usage: scripts/agent commit [-a] <message>'
 	msg="$*"
-	# The commit-msg hook is the authority; fail early with the same rule.
+
+	# The commit-msg hook is the authority; fail early with the same rule so the
+	# error arrives before the editor and the checks do.
 	printf '%s' "$msg" | grep -Eq '^(feat|fix|chore|docs|perf|refactor|test|build|ci|style)(\([a-z0-9._/-]+\))?!?: .+' ||
 		die "message is not a Conventional Commit: $msg"
+
+	if [ -n "$all" ]; then
+		say 'staging all tracked changes'
+		git add -u
+	fi
+
+	# `git commit` with an empty index prints advice and exits non-zero; say
+	# what to do about it instead of letting that scroll past.
+	if git diff --cached --quiet; then
+		die 'nothing staged. stage the change first:
+    git add -A                       (everything, including new files)
+    git add <path>...                (a specific set)
+    scripts/agent commit -a "<msg>"  (all tracked modifications)'
+	fi
+
 	say 'committing'
 	git commit -m "$msg"
 }
@@ -152,8 +174,10 @@ cmd_pr() {
 		die "refusing to open a pull request from $base"
 	fi
 
-	if existing=$(gh pr view --json url -q .url 2>/dev/null); then
-		ok "a pull request already exists: $existing"
+	# Only an OPEN pull request means there is nothing to do. `gh pr view`
+	# matches by branch name and will happily return a closed or merged one.
+	if [ "$(gh pr view --json state -q .state 2>/dev/null || echo NONE)" = 'OPEN' ]; then
+		ok "a pull request is already open: $(gh pr view --json url -q .url)"
 		return 0
 	fi
 
@@ -174,7 +198,14 @@ cmd_pr() {
 		fi
 	} | strip_attribution >"$body"
 
-	title=$(git log "origin/$base..HEAD" --format='%s' | tail -n 1)
+	# One commit: use its subject. Several: derive from the branch, which is
+	# more descriptive than whichever commit happened to be first.
+	if [ "$(git rev-list --count "origin/$base..HEAD")" = '1' ]; then
+		title=$(git log -1 --format='%s')
+	else
+		# '_-' not '-_': BSD tr reads a leading dash as an option flag.
+		title="${branch%%/*}: $(printf '%s' "${branch#*/}" | tr '_-' '  ')"
+	fi
 	say 'opening the pull request'
 	# shellcheck disable=SC2086
 	gh pr create --base "$base" --head "$branch" --title "$title" --body-file "$body" $draft
@@ -251,7 +282,7 @@ usage: scripts/agent <command>
   doctor                 verify the environment and wire git hooks
   start <type>/<slug>    branch from origin/<default> in a fresh worktree
   check                  scripts/task check
-  commit <message>       commit with a validated Conventional Commit message
+  commit [-a] <message>  commit with a validated Conventional Commit message
   pr [--draft]           check, push, open the pull request
   sync                   rebase the current branch onto origin/<default>
   done [branch]          confirm merged, then remove the worktree and branch
