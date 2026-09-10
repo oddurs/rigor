@@ -214,6 +214,10 @@ pub struct MergedPr {
     pub title: String,
     pub url: String,
     pub head_ref: String,
+    /// The PR's final commit. A worktree still at this commit has nothing that
+    /// did not land; the branch name alone cannot say that, since names are
+    /// reused.
+    pub head_oid: String,
     pub merged_at: i64,
 }
 

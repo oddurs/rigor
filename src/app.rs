@@ -21,7 +21,7 @@ use crate::util::now_secs;
 pub enum Msg {
     Prs(Result<github::Fetched, String>),
     Worktrees(Result<Vec<Worktree>, String>),
-    Statuses(Result<Vec<(PathBuf, git::Signature, WorktreeStatus)>, String>),
+    Statuses(Result<Vec<git::Scanned>, String>),
 }
 
 /// Run `work` off the UI thread and always answer. A panic inside becomes an
@@ -79,10 +79,40 @@ pub enum Row {
 pub enum WtState {
     /// Uncommitted or unpushed work lives here. Never suggest removing it.
     Working,
-    /// Its branch is merged and nothing local is at risk.
+    /// Its work landed in a merged PR and nothing local is at risk.
     Removable,
-    /// Everything is pushed and there is nothing merged to collect.
+    /// Nothing to act on: work in progress with a PR, nothing merged to
+    /// collect, or a status not yet known.
     Idle,
+}
+
+/// Everything the worktree view says about one desk, worked out in one place
+/// so the list, the detail pane and the counts cannot disagree.
+pub struct Desk<'a> {
+    pub wt: &'a Worktree,
+    /// The open PR for its branch.
+    pub pr: Option<&'a Pr>,
+    /// The merged PR its branch name last landed as.
+    pub merged: Option<&'a MergedPr>,
+    /// HEAD is that merged PR's final commit, so everything here reached
+    /// GitHub. Compared by commit because branch names are reused, and
+    /// because after a squash merge whose remote branch was deleted, git alone
+    /// counts every commit on the branch as unpushed.
+    pub landed: bool,
+    pub state: WtState,
+}
+
+impl Desk<'_> {
+    /// The desk's status, with commits that landed counted as pushed. `None`
+    /// until a scan has read it: unknown is not clean.
+    pub fn status(&self) -> Option<WorktreeStatus> {
+        let mut st = self.wt.status.clone()?;
+        if self.landed {
+            st.unpushed = 0;
+            st.published = true;
+        }
+        Some(st)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,8 +338,14 @@ impl App {
                 for (path, sig, st) in results {
                     // Adopt only for worktrees still present.
                     if let Some(w) = self.worktrees.iter_mut().find(|w| w.path == path) {
-                        w.status = Some(st);
-                        self.scanned.insert(path, sig);
+                        // A status git could not read is forgotten, not kept
+                        // stale, and the desk is scanned again next round.
+                        if st.is_some() {
+                            self.scanned.insert(path, sig);
+                        } else {
+                            self.scanned.remove(&path);
+                        }
+                        w.status = st;
                     }
                 }
                 self.rebuild();
@@ -328,10 +364,7 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, w)| {
-                let candidate = !w.is_main
-                    && w.branch
-                        .as_deref()
-                        .is_some_and(|b| self.merged_for_branch(b).is_some());
+                let candidate = !w.is_main && self.desk(w).landed;
                 schedule::needs_scan(
                     full,
                     self.scanned.get(&w.path),
@@ -369,28 +402,32 @@ impl App {
         self.merged_by_branch.get(branch).map(|&i| &self.merged[i])
     }
 
-    /// A worktree is only collectable when nothing local would be lost and its
-    /// branch has actually landed. The main worktree is never collectable, and
-    /// a detached one has no branch to match, so both stay Idle.
-    pub fn wt_state(&self, w: &Worktree) -> WtState {
-        // Unknown status counts as clean here, as it always has: `Working`
-        // needs evidence of local work, and "removable" also needs the branch
-        // to have landed, which is checked below.
-        if w.status
-            .as_ref()
-            .is_some_and(|st| st.dirty > 0 || st.unpushed > 0)
-        {
-            return WtState::Working;
-        }
-        if w.is_main {
-            return WtState::Idle;
-        }
-        match w.branch.as_deref() {
-            Some(b) if self.pr_for_branch(b).is_none() && self.merged_for_branch(b).is_some() => {
-                WtState::Removable
-            }
+    /// A worktree is only collectable when its work landed and a scan found
+    /// nothing local that would be lost. The main worktree is never
+    /// collectable, and a detached one has no branch to match.
+    pub fn desk<'a>(&'a self, wt: &'a Worktree) -> Desk<'a> {
+        let branch = wt.branch.as_deref();
+        let pr = branch.and_then(|b| self.pr_for_branch(b));
+        let merged = branch.and_then(|b| self.merged_for_branch(b));
+        let landed = merged.is_some_and(|m| !m.head_oid.is_empty() && m.head_oid == wt.head);
+        let state = match &wt.status {
+            Some(st) if st.dirty > 0 || (st.unpushed > 0 && !landed) => WtState::Working,
+            Some(_) if landed && !wt.is_main && pr.is_none() => WtState::Removable,
+            // Includes a desk not scanned yet, or with status off: with no
+            // evidence either way, it is neither working nor removable.
             _ => WtState::Idle,
+        };
+        Desk {
+            wt,
+            pr,
+            merged,
+            landed,
+            state,
         }
+    }
+
+    pub fn wt_state(&self, w: &Worktree) -> WtState {
+        self.desk(w).state
     }
 
     pub fn removable_count(&self) -> usize {

@@ -49,6 +49,7 @@ fn sample_app() -> App {
                 title: "Drop the monospace count chips".into(),
                 url: "https://github.com/acme/widget/pull/4700".into(),
                 head_ref: "drop-mono".into(),
+                head_oid: "0f1e2d3c4b5a6978".into(),
                 merged_at: now - 86400 * 4,
             },
             MergedPr {
@@ -56,6 +57,7 @@ fn sample_app() -> App {
                 title: "Fix the row hover state".into(),
                 url: "https://github.com/acme/widget/pull/4701".into(),
                 head_ref: "row-hover".into(),
+                head_oid: "0f1e2d3c4b5a6978".into(),
                 merged_at: now - 86400 * 5,
             },
         ],
@@ -967,4 +969,118 @@ fn snapshots() {
     a.error = None;
 
     insta::assert_snapshot!("narrow_60x16", render(&mut a, 60, 16));
+}
+
+// ------------------------------------------------------------- worktrees
+
+fn select_worktree(a: &mut App, name: &str) {
+    a.set_view(View::Worktrees);
+    let at = a
+        .rows
+        .iter()
+        .position(|r| matches!(r, crate::app::Row::Wt(i) if a.worktrees[*i].name() == name))
+        .unwrap();
+    a.select(at);
+}
+
+fn worktree_mut<'a>(a: &'a mut App, name: &str) -> &'a mut Worktree {
+    a.worktrees.iter_mut().find(|w| w.name() == name).unwrap()
+}
+
+/// After a squash merge whose remote branch was deleted and pruned, git has
+/// no upstream to compare with and counts every commit on the branch as
+/// unpushed. They are not: they are the PR that merged.
+#[test]
+fn a_squash_merged_desk_with_its_remote_branch_gone_is_removable() {
+    let mut a = sample_app();
+    let st = worktree_mut(&mut a, "drop-mono").status.as_mut().unwrap();
+    st.published = false;
+    st.unpushed = 2;
+    let w = a
+        .worktrees
+        .iter()
+        .find(|w| w.name() == "drop-mono")
+        .unwrap();
+    assert_eq!(a.wt_state(w), WtState::Removable);
+
+    select_worktree(&mut a, "drop-mono");
+    let out = render(&mut a, 160, 24);
+    assert!(
+        !out.contains("⇡2"),
+        "landed commits shown as unpushed:\n{out}"
+    );
+    assert!(!out.contains("not on origin"), "{out}");
+    assert!(
+        out.contains("git worktree remove ~/src/widget-wt/drop-mono"),
+        "{out}"
+    );
+}
+
+/// Branch names are reused. A desk on a name that merged before, holding new
+/// commits that never did, must not be offered for removal.
+#[test]
+fn a_reused_branch_name_is_not_a_landed_desk() {
+    let mut a = sample_app();
+    worktree_mut(&mut a, "drop-mono").head = "9a8b7c6d5e4f3021".into();
+    let w = a
+        .worktrees
+        .iter()
+        .find(|w| w.name() == "drop-mono")
+        .unwrap();
+    assert_eq!(a.wt_state(w), WtState::Idle);
+    assert_eq!(a.removable_count(), 0);
+
+    select_worktree(&mut a, "drop-mono");
+    let out = render(&mut a, 160, 24);
+    assert!(!out.contains("git worktree remove"), "{out}");
+    assert!(out.contains("merged, but not at this commit"), "{out}");
+}
+
+/// A desk nobody has scanned has said nothing about local work, so it is
+/// neither clean nor removable, and the screen does not claim either.
+#[test]
+fn an_unscanned_desk_makes_no_claims() {
+    let mut a = sample_app();
+    worktree_mut(&mut a, "drop-mono").status = None;
+    let w = a
+        .worktrees
+        .iter()
+        .find(|w| w.name() == "drop-mono")
+        .unwrap();
+    assert_eq!(a.wt_state(w), WtState::Idle);
+
+    select_worktree(&mut a, "drop-mono");
+    let out = render(&mut a, 160, 24);
+    // Side by side, the detail pane shares screen lines with the list; read
+    // only the list's columns.
+    let list_width = usize::from(a.hits.list.width);
+    let row = out
+        .lines()
+        .map(|l| l.chars().take(list_width).collect::<String>())
+        .find(|l| l.contains("drop-mono"))
+        .unwrap();
+    assert!(
+        !row.contains("local") && !row.contains("removable"),
+        "{row}"
+    );
+    assert!(out.contains("not checked: worktree_status is off"), "{out}");
+    assert!(!out.contains("clean"), "{out}");
+}
+
+#[test]
+fn cleanup_commands_quote_paths_that_need_it() {
+    let home = Some("/home/dev");
+    let at = |path: &str| Worktree {
+        path: path.into(),
+        branch: None,
+        head: String::new(),
+        is_main: false,
+        detached: false,
+        status: None,
+    };
+    let shell = |path: &str| super::detail::shell_path(&at(path), home);
+    assert_eq!(shell("/home/dev/src/wt/drop-mono"), "~/src/wt/drop-mono");
+    // Quoted, the full path: the shell expands `~` only outside quotes.
+    assert_eq!(shell("/home/dev/my desk"), "'/home/dev/my desk'");
+    assert_eq!(shell("/home/dev/it's"), r"'/home/dev/it'\''s'");
 }

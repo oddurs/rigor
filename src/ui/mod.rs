@@ -468,7 +468,8 @@ fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let has_pr = app.selected_pr().is_some();
-    let landed = app
+    // `o` on a desk with no open PR opens the one its branch merged as.
+    let has_merged = app
         .selected_worktree()
         .and_then(|w| w.branch.as_deref())
         .is_some_and(|b| app.merged_for_branch(b).is_some());
@@ -480,7 +481,7 @@ fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let mut left: Vec<Vec<Span<'_>>> = vec![key(&view_keys, "view")];
-    if has_pr || landed {
+    if has_pr || has_merged {
         left.push(key("o", "open"));
     }
     if has_pr {
