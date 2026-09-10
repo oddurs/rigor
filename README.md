@@ -70,6 +70,11 @@ A repo-local `.rigor.toml` overrides the user config. `RIGOR_THEME` (or
 `HERDR_THEME_FILE`) points at a theme file, which lets a parent shell hand its
 palette down at launch. `NO_COLOR` is honoured.
 
+The selection band and the hairlines are the exception to palette slots: rigor
+asks the terminal for its actual foreground and background (OSC 10/11) and mixes
+them from those, so they can never clash with a tinted theme. A terminal that
+does not answer gets no band — just an accent bar and a bolder line.
+
 ## Development
 
 Requires a Rust toolchain and Node 22+ with pnpm — the landing page and docs in

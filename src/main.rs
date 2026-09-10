@@ -6,6 +6,7 @@ mod event;
 mod git;
 mod github;
 mod model;
+mod probe;
 mod theme;
 mod ui;
 mod util;
@@ -19,7 +20,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use std::io::{Stdout, Write, stdout};
 use std::path::PathBuf;
@@ -103,7 +104,9 @@ fn main() -> Result<()> {
         unsafe { std::env::set_var("RIGOR_THEME", p) };
     }
 
-    let theme = theme::Theme::resolve(&settings.theme)?;
+    // Resolved here so a bad colour fails before the terminal is taken over,
+    // and so --print-config never writes a query to the tty.
+    theme::Theme::resolve(&settings.theme, probe::Probed::default())?;
 
     if cli.print_config {
         print_config(&repo, &settings);
@@ -114,8 +117,15 @@ fn main() -> Result<()> {
     repo.default_branch = "main".into();
 
     let mouse = settings.mouse;
+    let (mut term, probed) = setup(mouse)?;
+    let theme = match theme::Theme::resolve(&settings.theme, probed) {
+        Ok(t) => t,
+        Err(e) => {
+            restore(&mut term, mouse)?;
+            return Err(e);
+        }
+    };
     let (mut a, rx) = App::new(repo, settings, theme);
-    let mut term = setup(mouse)?;
     let result = run(&mut term, &mut a, rx);
     restore(&mut term, mouse)?;
     result
@@ -169,10 +179,17 @@ fn run(
     }
 }
 
-fn setup(mouse: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {
+fn setup(mouse: bool) -> Result<(Terminal<CrosstermBackend<Stdout>>, probe::Probed)> {
     enable_raw_mode()?;
+    // In raw mode and before the event loop owns stdin, so the terminal's
+    // replies are read here rather than arriving as keystrokes.
+    let probed = probe::query(std::time::Duration::from_millis(250));
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
+    // ratatui's first draw only writes cells that differ from its blank start
+    // buffer, so anything already on screen would survive wherever the frame is
+    // blank. Clear here rather than with `Terminal::clear`, which first asks the
+    // terminal for its cursor position and fails on any host that won't answer.
+    execute!(out, EnterAlternateScreen, Clear(ClearType::All))?;
     if mouse {
         execute!(out, EnableMouseCapture)?;
     }
@@ -186,7 +203,7 @@ fn setup(mouse: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {
         hook(info);
     }));
 
-    Ok(Terminal::new(CrosstermBackend::new(out))?)
+    Ok((Terminal::new(CrosstermBackend::new(out))?, probed))
 }
 
 fn restore(term: &mut Terminal<CrosstermBackend<Stdout>>, mouse: bool) -> Result<()> {

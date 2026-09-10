@@ -414,9 +414,9 @@ fn tabs_lead_with_their_title_not_a_key_digit() {
     );
 }
 
-/// The active view is marked by a heavy underline on the rail, spanning
-/// exactly the tab above it — this is what makes the row read as a subnav,
-/// and it survives NO_COLOR because it is a glyph, not a colour.
+/// The active view is marked by a heavy underline on the rail that hugs its
+/// label — not the padding around it. It is what makes the row read as a
+/// subnav, and it survives NO_COLOR because it is a glyph, not a colour.
 #[test]
 fn the_rail_underlines_exactly_the_active_tab() {
     for view in [View::Ready, View::Blocked, View::Worktrees] {
@@ -424,8 +424,9 @@ fn the_rail_underlines_exactly_the_active_tab() {
         a.set_view(view);
         let buf = frame(&mut a, 160, 24);
         let (rect, _) = *a.hits.tabs.iter().find(|(_, v)| *v == view).unwrap();
+        let (lo, hi) = (rect.x + 1, rect.x + rect.width - 1);
         for x in 0..buf.area.width {
-            let under = x >= rect.x && x < rect.x + rect.width;
+            let under = x >= lo && x < hi;
             let glyph = buf[(x, 2)].symbol();
             if under {
                 assert_eq!(
@@ -497,6 +498,102 @@ fn the_nav_sheds_context_before_it_loses_the_repo() {
     assert!(
         !narrow.contains("⎇"),
         "the branch should go first: {narrow:?}"
+    );
+}
+
+/// With a background the terminal reported, the selected row is a band that
+/// runs the full width of the list — edge to edge, not just under the text.
+#[test]
+fn the_selected_row_is_a_full_width_band_when_the_terminal_reports_its_colours() {
+    let mut a = sample_app();
+    a.theme = Theme::resolve(
+        &crate::theme::ThemeConfig::default(),
+        crate::probe::Probed {
+            fg: Some((0xd4, 0xd8, 0xde)),
+            bg: Some((0x16, 0x18, 0x1c)),
+        },
+    )
+    .unwrap();
+    a.settings.layout = LayoutMode::Split;
+    a.set_view(View::All);
+    let buf = frame(&mut a, 160, 24);
+
+    let (y, _) = a.hits.rows[0];
+    let list = a.hits.list;
+    for x in list.x..list.x + list.width {
+        assert_eq!(
+            buf[(x, y)].bg,
+            a.theme.sel_bg,
+            "column {x} of the selected row is unbanded"
+        );
+    }
+    let (y2, _) = a.hits.rows[1];
+    assert_ne!(
+        buf[(list.x + 10, y2)].bg,
+        a.theme.sel_bg,
+        "an unselected row is banded"
+    );
+    assert_eq!(
+        buf[(list.x, y)].symbol(),
+        "▎",
+        "the accent bar marks the edge"
+    );
+}
+
+/// The subnav no longer paints a band behind the active tab — the underline
+/// is the marker — so a derived band never leaks into the chrome.
+#[test]
+fn the_band_stays_out_of_the_tab_bar() {
+    let mut a = sample_app();
+    a.theme.sel_bg = ratatui::style::Color::Rgb(0x28, 0x2b, 0x30);
+    a.set_view(View::Mine);
+    let buf = frame(&mut a, 160, 24);
+    for x in 0..buf.area.width {
+        assert_ne!(
+            buf[(x, 1)].bg,
+            a.theme.sel_bg,
+            "column {x} of the subnav is banded"
+        );
+    }
+}
+
+/// The status dot tells the user whether to trust the screen: green when
+/// fresh, amber when stale, red when the last sync failed.
+#[test]
+fn the_sync_dot_reports_freshness() {
+    let dot_colour = |a: &mut App| {
+        let buf = frame(a, 160, 24);
+        let row = row_text(&buf, 0);
+        let col = row.chars().position(|c| c == '●').expect("no status dot") as u16;
+        buf[(col, 0)].fg
+    };
+
+    let mut a = sample_app();
+    a.last_refresh = now_secs() - 5;
+    assert_eq!(dot_colour(&mut a), a.theme.success);
+
+    a.last_refresh = now_secs() - (a.settings.refresh_secs as i64 * 3);
+    assert_eq!(dot_colour(&mut a), a.theme.pending);
+
+    a.error = Some("gh api graphql failed".into());
+    assert_eq!(dot_colour(&mut a), a.theme.failure);
+}
+
+/// An accepted filter is shown beside the list it narrows, not in the footer.
+#[test]
+fn an_active_filter_shows_in_the_subnav() {
+    let mut a = sample_app();
+    a.filter = "retry".into();
+    a.rebuild();
+    let buf = frame(&mut a, 160, 24);
+    assert!(
+        row_text(&buf, 1).contains("/retry"),
+        "{:?}",
+        row_text(&buf, 1)
+    );
+    assert!(
+        !row_text(&buf, 23).contains("retry"),
+        "the footer still shows it"
     );
 }
 

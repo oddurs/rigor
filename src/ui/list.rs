@@ -72,9 +72,10 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// The selected row is marked without painting an absolute background: the
-/// accent bar, a bold title, and the dim columns lifted to full foreground.
-/// That reads on any terminal theme. Setting `theme.sel_bg` adds a band on top.
+/// The selected row: a full-width band mixed from the terminal's own
+/// background (see `probe`), a slim accent bar at the edge, a bold title, and
+/// the dim columns lifted to full foreground. Where the terminal does not
+/// report its colours there is no band, and the bar and weight carry it alone.
 fn row_style(selected: bool, t: &Theme) -> Style {
     if selected {
         Style::new().bg(t.sel_bg).fg(t.sel_fg)
@@ -102,7 +103,7 @@ fn pr_line(
     let title_color = if pr.is_draft { dim(selected, t) } else { t.fg };
 
     let mut spans = vec![
-        Span::styled(if selected { "▌" } else { " " }, base.fg(t.accent)),
+        Span::styled(if selected { "▎" } else { " " }, base.fg(t.accent)),
         Span::styled(
             pad(&format!("#{}", pr.number), 7),
             base.fg(if pr.is_draft { t.muted } else { t.accent }),
@@ -202,7 +203,7 @@ fn wt_line(
 ) -> Line<'static> {
     let base = row_style(selected, t);
     let mut spans = vec![Span::styled(
-        if selected { "▌" } else { " " },
+        if selected { "▎" } else { " " },
         base.fg(t.accent),
     )];
 

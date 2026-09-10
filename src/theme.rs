@@ -11,6 +11,8 @@ use ratatui::style::Color;
 use serde::Deserialize;
 use std::path::Path;
 
+use crate::probe::{Probed, Rgb};
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThemeConfig {
@@ -78,7 +80,11 @@ impl Default for Theme {
 impl Theme {
     /// Config first, then `RIGOR_THEME` / `HERDR_THEME_FILE`, which win because
     /// they are how a parent shell hands its palette down at launch time.
-    pub fn resolve(cfg: &ThemeConfig) -> Result<Self> {
+    ///
+    /// `probed` carries the terminal's own foreground and background when it
+    /// answered OSC 10/11. The selection band and the hairlines are mixed from
+    /// them, so they sit inside the user's theme rather than on top of it.
+    pub fn resolve(cfg: &ThemeConfig, probed: Probed) -> Result<Self> {
         let mut merged = cfg.clone();
 
         for var in ["HERDR_THEME_FILE", "RIGOR_THEME"] {
@@ -106,11 +112,29 @@ impl Theme {
         set!(
             fg, bg, accent, success, failure, pending, muted, warn, border, sel_bg, sel_fg
         );
+
+        // Explicit colours always win; derivation only fills what was left to
+        // the terminal. A configured hex background is a better base than the
+        // probed one, because it is the colour rigor actually paints.
+        if !no_color() {
+            let base_bg = rgb_of(t.bg).or(probed.bg);
+            let base_fg = rgb_of(t.fg).or(probed.fg);
+            if let Some(bg) = base_bg {
+                let dark = luminance(bg) < 0.5;
+                let toward = base_fg.unwrap_or(if dark { (255, 255, 255) } else { (0, 0, 0) });
+                if merged.sel_bg.is_none() {
+                    t.sel_bg = to_color(mix(bg, toward, if dark { 0.11 } else { 0.075 }));
+                }
+                if merged.border.is_none() {
+                    t.border = to_color(mix(bg, toward, if dark { 0.22 } else { 0.18 }));
+                }
+            }
+        }
         Ok(t)
     }
 
-    /// NO_COLOR: keep the layout, drop the hue. Selection still needs contrast,
-    /// so it inverts rather than tints.
+    /// NO_COLOR: keep the layout, drop the hue. With no band to lean on, the
+    /// selection is carried by the bar glyph and weight alone.
     fn monochrome() -> Self {
         Self {
             fg: Color::Reset,
@@ -126,6 +150,40 @@ impl Theme {
             sel_fg: Color::Reset,
         }
     }
+}
+
+fn rgb_of(c: Color) -> Option<Rgb> {
+    match c {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        _ => None,
+    }
+}
+
+fn to_color((r, g, b): Rgb) -> Color {
+    Color::Rgb(r, g, b)
+}
+
+/// `a` moved toward `b` by `t` (0 = a, 1 = b), per channel.
+pub fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    let ch = |x: u8, y: u8| {
+        (x as f32 + (y as f32 - x as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    (ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2))
+}
+
+/// Relative luminance (sRGB, WCAG), 0 for black to 1 for white.
+fn luminance((r, g, b): Rgb) -> f32 {
+    let lin = |c: u8| {
+        let c = c as f32 / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
 }
 
 pub fn no_color() -> bool {
@@ -186,5 +244,78 @@ pub fn parse_color(s: &str) -> Option<Color> {
         "lightcyan" | "brightcyan" => Some(Color::LightCyan),
         "brightwhite" => Some(Color::White),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DARK: Probed = Probed {
+        fg: Some((0xd4, 0xd8, 0xde)),
+        bg: Some((0x16, 0x18, 0x1c)),
+    };
+    const LIGHT: Probed = Probed {
+        fg: Some((0x2b, 0x2f, 0x33)),
+        bg: Some((0xfb, 0xfb, 0xfa)),
+    };
+
+    fn rgb(c: Color) -> Rgb {
+        rgb_of(c).expect("expected a derived rgb colour")
+    }
+
+    /// The band must be visible but quiet: a small step from the background
+    /// toward the foreground, in the right direction for the theme.
+    #[test]
+    fn the_band_is_a_small_step_toward_the_foreground() {
+        let dark = Theme::resolve(&ThemeConfig::default(), DARK).unwrap();
+        let band = rgb(dark.sel_bg);
+        assert!(
+            band.0 > 0x16 && band.0 < 0x40,
+            "dark band {band:?} should lift slightly"
+        );
+
+        let light = Theme::resolve(&ThemeConfig::default(), LIGHT).unwrap();
+        let band = rgb(light.sel_bg);
+        assert!(
+            band.0 < 0xfb && band.0 > 0xdc,
+            "light band {band:?} should darken slightly"
+        );
+    }
+
+    /// Hairlines sit further from the background than the band, so the rail
+    /// and divider still read on top of a selected row.
+    #[test]
+    fn hairlines_are_stronger_than_the_band() {
+        let t = Theme::resolve(&ThemeConfig::default(), DARK).unwrap();
+        assert!(rgb(t.border).0 > rgb(t.sel_bg).0);
+    }
+
+    /// No answer from the terminal means nothing to mix from: fall back to the
+    /// palette and the bar-and-weight selection rather than guessing a colour.
+    #[test]
+    fn an_unanswered_probe_leaves_the_palette_alone() {
+        let t = Theme::resolve(&ThemeConfig::default(), Probed::default()).unwrap();
+        assert_eq!(t.sel_bg, Color::Reset);
+        assert_eq!(t.border, Color::DarkGray);
+    }
+
+    /// Anything the user set by hand beats derivation.
+    #[test]
+    fn explicit_colours_win_over_derived_ones() {
+        let cfg = ThemeConfig {
+            sel_bg: Some("#123456".into()),
+            border: Some("8".into()),
+            ..ThemeConfig::default()
+        };
+        let t = Theme::resolve(&cfg, DARK).unwrap();
+        assert_eq!(t.sel_bg, Color::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(t.border, Color::Indexed(8));
+    }
+
+    #[test]
+    fn mix_is_linear_per_channel() {
+        assert_eq!(mix((0, 0, 0), (200, 100, 50), 0.5), (100, 50, 25));
+        assert_eq!(mix((10, 20, 30), (99, 99, 99), 0.0), (10, 20, 30));
     }
 }
