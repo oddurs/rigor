@@ -7,12 +7,16 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Command;
+use std::time::Duration;
+
+use crate::proc::{self, Priority};
 
 use crate::model::{Check, CheckState, Mergeable, MergedPr, Pr, ReviewDecision};
 use crate::util::parse_iso8601;
 
 const QUERY: &str = r#"
 query($owner:String!, $name:String!, $cursor:String) {
+  rateLimit { remaining limit resetAt }
   viewer { login }
   repository(owner:$owner, name:$name) {
     defaultBranchRef { name }
@@ -45,7 +49,18 @@ query($owner:String!, $name:String!, $cursor:String) {
 }
 "#;
 
+/// Where the GraphQL budget stood after this fetch. rigor shares the budget
+/// with every other `gh` call on the machine — agents included — so it backs
+/// off well before the budget runs out rather than being what exhausts it.
+#[derive(Debug, Clone, Copy)]
+pub struct Budget {
+    pub remaining: u32,
+    pub limit: u32,
+    pub reset_at: i64,
+}
+
 pub struct Fetched {
+    pub budget: Option<Budget>,
     pub viewer: String,
     pub default_branch: String,
     pub prs: Vec<Pr>,
@@ -60,6 +75,7 @@ pub fn fetch_prs(owner: &str, name: &str, max: usize) -> Result<Fetched> {
     let mut viewer = String::new();
     let mut default_branch = String::new();
     let mut merged: Vec<MergedPr> = Vec::new();
+    let mut budget: Option<Budget> = None;
 
     loop {
         let mut cmd = Command::new("gh");
@@ -73,9 +89,10 @@ pub fn fetch_prs(owner: &str, name: &str, max: usize) -> Result<Fetched> {
             cmd.arg("-F").arg(format!("cursor={c}"));
         }
 
-        let out = cmd
-            .output()
-            .context("running `gh api graphql` (is gh installed?)")?;
+        // Generous, because a large repository paginates; the point is only
+        // that a stalled connection cannot hold the refresh forever.
+        let out = proc::run(&mut cmd, Duration::from_secs(45), Priority::Normal)
+            .context("gh api graphql")?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             bail!("gh api graphql failed: {}", err.trim());
@@ -94,6 +111,20 @@ pub fn fetch_prs(owner: &str, name: &str, max: usize) -> Result<Fetched> {
         // The merged list rides along on the same query. Pagination past the
         // first page re-fetches it, which only happens on repos with more than
         // 50 open PRs; reading it once keeps that harmless.
+        if let (Some(remaining), Some(limit), Some(reset)) = (
+            data.pointer("/rateLimit/remaining")
+                .and_then(|x| x.as_u64()),
+            data.pointer("/rateLimit/limit").and_then(|x| x.as_u64()),
+            data.pointer("/rateLimit/resetAt")
+                .and_then(|x| x.as_str())
+                .and_then(parse_iso8601),
+        ) {
+            budget = Some(Budget {
+                remaining: remaining as u32,
+                limit: limit as u32,
+                reset_at: reset,
+            });
+        }
         if viewer.is_empty() {
             viewer = str_at(data, &["viewer", "login"]).unwrap_or_default();
             default_branch = str_at(data, &["repository", "defaultBranchRef", "name"])
@@ -144,6 +175,7 @@ pub fn fetch_prs(owner: &str, name: &str, max: usize) -> Result<Fetched> {
 
     prs.truncate(max);
     Ok(Fetched {
+        budget,
         viewer,
         default_branch,
         prs,

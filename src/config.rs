@@ -109,6 +109,7 @@ pub struct ConfigFile {
     pub show_drafts: Option<bool>,
     pub mouse: Option<bool>,
     pub worktree_status: Option<bool>,
+    pub worktree_scan_secs: Option<u64>,
     pub open_command: Option<String>,
     pub copy_command: Option<String>,
     pub theme: Option<ThemeConfig>,
@@ -128,6 +129,7 @@ impl ConfigFile {
             show_drafts,
             mouse,
             worktree_status,
+            worktree_scan_secs,
             open_command,
             copy_command
         );
@@ -152,6 +154,9 @@ pub struct Settings {
     pub show_drafts: bool,
     pub mouse: bool,
     pub worktree_status: bool,
+    /// How often every worktree is rescanned for unstaged edits. Between full
+    /// scans only desks whose git state moved are rescanned. 0: only on `r`.
+    pub worktree_scan_secs: u64,
     pub open_command: String,
     pub copy_command: String,
     pub theme: ThemeConfig,
@@ -169,6 +174,7 @@ impl Default for Settings {
             show_drafts: true,
             mouse: true,
             worktree_status: true,
+            worktree_scan_secs: 300,
             open_command: default_open().into(),
             copy_command: default_copy().into(),
             theme: ThemeConfig::default(),
@@ -287,6 +293,9 @@ pub fn load(repo_root: &Path, explicit: Option<&Path>) -> Result<Settings> {
     if let Some(v) = merged.worktree_status {
         s.worktree_status = v;
     }
+    if let Some(v) = merged.worktree_scan_secs {
+        s.worktree_scan_secs = v;
+    }
     if let Some(v) = merged.open_command {
         s.open_command = v;
     }
@@ -313,7 +322,11 @@ layout          = "auto"   # auto | split (side-by-side) | stack (list over deta
 max_prs         = 200
 show_drafts     = true
 mouse           = true
-worktree_status = true     # off skips per-worktree git status on very large repos
+worktree_status = true     # off skips per-worktree git status entirely
+# Every refresh rescans only worktrees whose git state moved (a commit, staging,
+# a checkout). This is how often all of them are rescanned, to catch unstaged
+# edits too. 0 rescans everything only when you press r.
+worktree_scan_secs = 300
 # open_command  = "open"
 # copy_command  = "pbcopy"
 

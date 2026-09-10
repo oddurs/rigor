@@ -68,6 +68,7 @@ fn sample_app() -> App {
     // Route through the real message path so the merged-branch index is built
     // the way a live fetch builds it.
     a.on_msg(crate::app::Msg::Prs(Ok(crate::github::Fetched {
+        budget: None,
         viewer: "octocat".into(),
         default_branch: "main".into(),
         prs,

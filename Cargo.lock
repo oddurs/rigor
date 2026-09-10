@@ -1203,6 +1203,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "signal-hook",
  "toml",
  "unicode-width",
 ]
