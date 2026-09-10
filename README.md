@@ -59,7 +59,7 @@ safe to collect.
 
 ## Configuration
 
-Colours come from ANSI slots by default, so `rigor` renders in whatever palette
+Colors come from ANSI slots by default, so `rigor` renders in whatever palette
 your terminal is themed with. Everything is optional:
 
 ```sh
@@ -68,7 +68,7 @@ rigor --init-config   # writes a commented ~/.config/rigor/config.toml
 
 A repo-local `.rigor.toml` overrides the user config. `RIGOR_THEME` (or
 `HERDR_THEME_FILE`) points at a theme file, which lets a parent shell hand its
-palette down at launch. `NO_COLOR` is honoured.
+palette down at launch. `NO_COLOR` is honored.
 
 The selection band and the hairlines are the exception to palette slots: rigor
 asks the terminal for its actual foreground and background (OSC 10/11) and mixes

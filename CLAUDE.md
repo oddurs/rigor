@@ -47,7 +47,7 @@ scripts/task check      # all of the above
 
 Do not invoke `cargo` directly in a script, a hook, or a workflow. CI runs
 `scripts/task check` and nothing else, so this is the only place local and CI
-behaviour can diverge. If a target is missing something, fix `scripts/task`.
+behavior can diverge. If a target is missing something, fix `scripts/task`.
 
 ## Be green before you open a pull request
 
@@ -58,7 +58,7 @@ information, not an obstacle.
 
 ## Tests
 
-- Every behaviour change comes with a test that fails without it. Run the test
+- Every behavior change comes with a test that fails without it. Run the test
   against the old code, or break the new code on purpose, and watch it fail —
   a test that has never failed has not been shown to test anything.
 - `scripts/task test` is the suite. Use `cargo nextest run <filter>` to iterate

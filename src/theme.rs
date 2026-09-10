@@ -58,7 +58,7 @@ pub struct Theme {
 impl Default for Theme {
     /// Every slot here resolves through the terminal's own palette: ANSI 0–15
     /// are theme-defined, so they track whatever herdr / the terminal is themed
-    /// with. Nothing is pinned to the fixed 256-colour cube, which would render
+    /// with. Nothing is pinned to the fixed 256-color cube, which would render
     /// as a flat off-hue patch against a tinted background.
     fn default() -> Self {
         Self {
@@ -118,9 +118,9 @@ impl Theme {
             fg, bg, accent, success, failure, pending, muted, warn, border, sel_bg, sel_fg
         );
 
-        // Explicit colours always win; derivation only fills what was left to
+        // Explicit colors always win; derivation only fills what was left to
         // the terminal. A configured hex background is a better base than the
-        // probed one, because it is the colour rigor actually paints.
+        // probed one, because it is the color rigor actually paints.
         if !no_color() {
             let foreground = rgb_of(t.fg).or(probed.fg);
             if let Some(bg) = rgb_of(t.bg).or(probed.bg) {
@@ -277,7 +277,7 @@ mod tests {
     };
 
     fn rgb(c: Color) -> Rgb {
-        rgb_of(c).expect("expected a derived rgb colour")
+        rgb_of(c).expect("expected a derived rgb color")
     }
 
     /// The band must be visible but quiet: a small step from the background
@@ -308,7 +308,7 @@ mod tests {
     }
 
     /// No answer from the terminal means nothing to mix from: fall back to the
-    /// palette and the bar-and-weight selection rather than guessing a colour.
+    /// palette and the bar-and-weight selection rather than guessing a color.
     #[test]
     fn an_unanswered_probe_leaves_the_palette_alone() {
         let t = Theme::resolve(&ThemeConfig::default(), None, Probed::default()).unwrap();
@@ -318,7 +318,7 @@ mod tests {
 
     /// Anything the user set by hand beats derivation.
     #[test]
-    fn explicit_colours_win_over_derived_ones() {
+    fn explicit_colors_win_over_derived_ones() {
         let cfg = ThemeConfig {
             sel_bg: Some("#123456".into()),
             border: Some("8".into()),

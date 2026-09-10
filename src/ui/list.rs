@@ -90,7 +90,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
 /// The selected row: a full-width band mixed from the terminal's own
 /// background (see `probe`), a slim accent bar at the edge, a bold title, and
 /// the dim columns lifted to full foreground. Where the terminal does not
-/// report its colours there is no band, and the bar and weight carry it alone.
+/// report its colors there is no band, and the bar and weight carry it alone.
 const fn row_style(selected: bool, t: &Theme) -> Style {
     if selected {
         Style::new().bg(t.sel_bg).fg(t.sel_fg)

@@ -85,11 +85,11 @@ Node: `cargo-nextest` and `shellcheck` (`scripts/setup` checks for both).
 
 | Layer | Where | What it pins |
 |---|---|---|
-| Unit | next to the code (`#[cfg(test)]`) | behaviour of one function or type |
+| Unit | next to the code (`#[cfg(test)]`) | behavior of one function or type |
 | Property | `proptest!` blocks | invariants over generated input: column widths, date round-trips, parsers never panicking, untrusted strings never reaching the terminal as control characters |
 | Snapshot | `src/ui/snapshots/` | the rendered screen in every major state |
 | Parser | `src/github.rs` against `tests/fixtures/graphql_page.json` | the GitHub response shape, including the awkward cases |
-| End to end | `tests/e2e.rs` | the real binary in a pseudo-terminal, against a fake `gh` and a throwaway repository with worktrees: timeouts, shutdown, signals, the colour probe, lock-free git, focus |
+| End to end | `tests/e2e.rs` | the real binary in a pseudo-terminal, against a fake `gh` and a throwaway repository with worktrees: timeouts, shutdown, signals, the color probe, lock-free git, focus |
 | Hooks | `tests/hooks.rs` | `commit-msg`, `pre-commit`, `pre-push` and `scripts/agent`, in throwaway repositories |
 | Site | `site/scripts/check-css.mjs`, run by `build` | every class on the page has a CSS rule |
 | Live contract | `scripts/task test:live`, weekly in CI | the parser still matches GitHub's real API |

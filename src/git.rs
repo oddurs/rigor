@@ -65,7 +65,7 @@ pub fn discover(start: &Path, repo_override: Option<&str>) -> Result<RepoInfo> {
     })
 }
 
-/// Prefer `gh`'s own resolution (it honours `remote.origin.gh-resolved`), fall
+/// Prefer `gh`'s own resolution (it honors `remote.origin.gh-resolved`), fall
 /// back to parsing the origin URL so we still work offline-ish.
 fn resolve_slug(root: &Path) -> Result<(String, String)> {
     if let Ok(out) = proc::run(

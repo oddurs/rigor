@@ -74,7 +74,7 @@ test)
 	# NEXTEST_PROFILE=ci, which also writes JUnit.
 	need cargo-nextest "Install: brew install cargo-nextest (or cargo install cargo-nextest --locked)"
 	"$CARGO" nextest run --all-features --locked
-	# The site's behaviour is its build output; build verifies it.
+	# The site's behavior is its build output; build verifies it.
 	;;
 build)
 	"$CARGO" build --all-targets --locked

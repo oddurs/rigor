@@ -101,7 +101,7 @@ fn main() -> Result<()> {
         settings.mouse = false;
     }
 
-    // Resolved here so a bad colour fails before the terminal is taken over,
+    // Resolved here so a bad color fails before the terminal is taken over,
     // and so --print-config never writes a query to the tty.
     theme::Theme::resolve(
         &settings.theme,
@@ -145,7 +145,7 @@ fn run(
     loop {
         term.draw(|f| ui::draw(f, a))?;
 
-        // Short enough that a SIGTERM or SIGHUP is honoured well inside the
+        // Short enough that a SIGTERM or SIGHUP is honored well inside the
         // grace period a terminal or supervisor gives before SIGKILL — which
         // would orphan any git or gh call still in flight. Idle, this costs
         // about 0.2% of a core; input returns at once regardless.

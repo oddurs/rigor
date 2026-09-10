@@ -343,7 +343,7 @@ worktree_scan_secs = 300
 # fg      = "inherit"
 # bg      = "inherit"
 
-# The selected row's band and the hairlines are mixed from the colours your
+# The selected row's band and the hairlines are mixed from the colors your
 # terminal reports for itself, so they sit inside your theme. Terminals that
 # do not report them get no band: an accent bar and a bolder line instead.
 # Set either to pin it:

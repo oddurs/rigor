@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the terminal is restored on those signals.
 - Shutdown now also refuses to start new subprocesses, so a worker thread still
   running during exit cannot start a child after the final sweep.
-- A SIGTERM or SIGHUP is honoured within 100ms, well inside the grace period a
+- A SIGTERM or SIGHUP is honored within 100ms, well inside the grace period a
   terminal or supervisor allows before SIGKILL.
 - A panic in a background worker could leave a loading flag set forever. Workers
   now always report back, and such a panic no longer tears down the screen.
@@ -60,7 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rigor` badge and a `repo › branch` breadcrumb, and sheds the branch, then the
   user, then the status as the terminal narrows. The subnav's tabs show a title
   and a count only — key digits no longer sit beside counts — with Ready and
-  Blocked counts coloured when non-zero. A rail beneath underlines the active
+  Blocked counts colored when non-zero. A rail beneath underlines the active
   view and joins the detail pane's divider. Number keys are listed in the footer.
 - The nav drops its filled badge: `rigor` takes the accent beside a hairline,
   and the repository is the one bold thing on the line. Sync status is a dot —
@@ -68,14 +68,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The tab underline hugs the label, and an active filter shows in the subnav
   instead of the footer.
 - The selected row is a full-width band mixed from the terminal's own reported
-  colours (OSC 10/11), with a slim accent bar at its edge. Hairlines are mixed
-  the same way. Terminals that do not report their colours keep the bar and a
+  colors (OSC 10/11), with a slim accent bar at its edge. Hairlines are mixed
+  the same way. Terminals that do not report their colors keep the bar and a
   bolder line, with no band.
 - A pass over the rest of the interface. The list drops the review glyph for
   "review required" — the resting state of nearly every PR — keeping only
   approved, changes requested and conflicts; mutes passing CI counts so failures
   stand out; right-aligns ages; hides the author in Mine; and shows your
-  position on the rail when the list overflows. The detail pane colours diff
+  position on the rail when the list overflows. The detail pane colors diff
   counts, puts the base branch on the merge row, makes `checks` a label like the
   others with its rows aligned under the values, collapses skipped jobs into one
   line and right-aligns durations. The footer only offers actions that apply to
@@ -99,7 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose tree is clean is reported as removable.
 - Theming from the terminal's own ANSI palette, overridable per slot in
   `config.toml`, `.rigor.toml`, `RIGOR_THEME`, or `HERDR_THEME_FILE`. `NO_COLOR`
-  is honoured.
+  is honored.
 - Mouse support: click a tab, a row, or a check run; scroll either pane.
 - `site/`: a single-page landing and docs site, built with Next.js and StyleX
   and exported to static HTML. Its hero shows a frame captured from the

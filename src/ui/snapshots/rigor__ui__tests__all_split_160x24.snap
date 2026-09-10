@@ -6,7 +6,7 @@ expression: "render(&mut a, 160, 24)"
  Ready 1   Mine 2   Review 1   Blocked 1   All 3   Worktrees 5                                                                         ⌫ 1 removable   ↕ recent
 ───────────────────────────────────────────━━━━━─────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────
 ▎#4846  ✗ 1/3     ⌂ Give the read path a retry budget                     octocat         3m │ #4846 Give the read path a retry budget
- #4840  ✓ 3     ✔ ⌂ Move the palette onto colour tokens                   octocat         2h │ octocat · 3m ago · +220 −24 · 6 files · 2 comments
+ #4840  ✓ 3     ✔ ⌂ Move the palette onto color tokens                    octocat         2h │ octocat · 3m ago · +220 −24 · 6 files · 2 comments
  #4801  ◐ 2/3   ⚠   draft · Treat a filtered empty result as unknown      agent-bot       3d │  review    review required
                                                                                              │  merge     no conflicts  → main
                                                                                              │  labels    parser, backend

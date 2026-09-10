@@ -124,7 +124,7 @@ pub fn pad(s: &str, n: usize) -> String {
 }
 
 /// A column followed by more text: truncated one short of `n` so it always
-/// keeps a gutter. `pad` alone lets a full-width value run into its neighbour.
+/// keeps a gutter. `pad` alone lets a full-width value run into its neighbor.
 pub fn cell(s: &str, n: usize) -> String {
     pad(&truncate(s, n.saturating_sub(1)), n)
 }

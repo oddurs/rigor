@@ -152,7 +152,7 @@ fn commit_msg_rejects_everything_else() {
     let long = format!("feat: {}", "x".repeat(70));
     for m in [
         "add a thing",
-        "Feat: capitalised type",
+        "Feat: capitalized type",
         "feat:no space",
         "feat: trailing period.",
         "wip: not a type",

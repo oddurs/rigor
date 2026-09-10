@@ -80,7 +80,7 @@ fn sample_prs(now: i64) -> Vec<Pr> {
         ),
         pr(
             4840,
-            "Move the palette onto colour tokens",
+            "Move the palette onto color tokens",
             "octocat",
             "color-tokens",
             CheckState::Success,
@@ -434,7 +434,7 @@ fn tabs_lead_with_their_title_not_a_key_digit() {
 
 /// The active view is marked by a heavy underline on the rail that hugs its
 /// label — not the padding around it. It is what makes the row read as a
-/// subnav, and it survives `NO_COLOR` because it is a glyph, not a colour.
+/// subnav, and it survives `NO_COLOR` because it is a glyph, not a color.
 #[test]
 fn the_rail_underlines_exactly_the_active_tab() {
     for view in [View::Ready, View::Blocked, View::Worktrees] {
@@ -480,9 +480,9 @@ fn the_rail_joins_the_detail_divider() {
 }
 
 /// Two counts mean something at a glance: work that is ready, and work that is
-/// stuck. They take the success and failure colours when non-zero.
+/// stuck. They take the success and failure colors when non-zero.
 #[test]
-fn ready_and_blocked_counts_carry_meaning_in_colour() {
+fn ready_and_blocked_counts_carry_meaning_in_color() {
     let mut a = sample_app();
     a.set_view(View::All);
     let buf = frame(&mut a, 160, 24);
@@ -522,7 +522,7 @@ fn the_nav_sheds_context_before_it_loses_the_repo() {
 /// With a background the terminal reported, the selected row is a band that
 /// runs the full width of the list — edge to edge, not just under the text.
 #[test]
-fn the_selected_row_is_a_full_width_band_when_the_terminal_reports_its_colours() {
+fn the_selected_row_is_a_full_width_band_when_the_terminal_reports_its_colors() {
     let mut a = sample_app();
     a.theme = Theme::resolve(
         &crate::theme::ThemeConfig::default(),
@@ -580,7 +580,7 @@ fn the_band_stays_out_of_the_tab_bar() {
 /// fresh, amber when stale, red when the last sync failed.
 #[test]
 fn the_sync_dot_reports_freshness() {
-    let dot_colour = |a: &mut App| {
+    let dot_color = |a: &mut App| {
         let buf = frame(a, 160, 24);
         let row = row_text(&buf, 0);
         let col =
@@ -590,13 +590,13 @@ fn the_sync_dot_reports_freshness() {
 
     let mut a = sample_app();
     a.schedule.last_refresh = now_secs() - 5;
-    assert_eq!(dot_colour(&mut a), a.theme.success);
+    assert_eq!(dot_color(&mut a), a.theme.success);
 
     a.schedule.last_refresh = now_secs() - crate::util::secs(a.settings.refresh_secs) * 3;
-    assert_eq!(dot_colour(&mut a), a.theme.pending);
+    assert_eq!(dot_color(&mut a), a.theme.pending);
 
     a.error = Some("gh api graphql failed".into());
-    assert_eq!(dot_colour(&mut a), a.theme.failure);
+    assert_eq!(dot_color(&mut a), a.theme.failure);
 }
 
 /// An accepted filter is shown beside the list it narrows, not in the footer.
@@ -888,7 +888,7 @@ fn the_filter_narrows_as_you_type_and_esc_restores() {
     a.set_view(View::All);
     press(&mut a, "/tokens");
     assert_eq!(a.mode, Mode::Filter);
-    assert_eq!(a.rows.len(), 1, "only the colour-tokens PR matches");
+    assert_eq!(a.rows.len(), 1, "only the color-tokens PR matches");
     // While typing, letters are text, not commands: `q` must not quit.
     press(&mut a, "q");
     assert!(!a.quit && a.filter == "tokensq");

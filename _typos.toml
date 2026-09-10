@@ -1,0 +1,14 @@
+# Spelling, checked by `scripts/task lint`. American English throughout, to
+# match the identifiers (ratatui's `Color`, our `parse_color`) and the Rust
+# ecosystem, so prose and code do not disagree.
+[default]
+locale = "en-us"
+
+[files]
+extend-exclude = [
+  "Cargo.lock",
+  "site/pnpm-lock.yaml",
+  # Generated from source: regenerated, never edited by hand.
+  "*.snap",
+  "proptest-regressions/",
+]

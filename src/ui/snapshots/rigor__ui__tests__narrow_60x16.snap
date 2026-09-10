@@ -6,7 +6,7 @@ expression: "render(&mut a, 60, 16)"
  Ready 1   Mine 2   Review 1   Blocked 1   All 3   Worktrees
 ───────────────────────────────────────────━━━━━────────────
 ▎#4846  ✗ 1/3     ⌂ Give the read path a retry budget
- #4840  ✓ 3     ✔ ⌂ Move the palette onto colour tokens
+ #4840  ✓ 3     ✔ ⌂ Move the palette onto color tokens
  #4801  ◐ 2/3   ⚠   draft · Treat a filtered empty result …
 
 

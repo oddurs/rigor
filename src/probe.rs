@@ -1,4 +1,4 @@
-//! Ask the terminal which colours it is actually drawing with.
+//! Ask the terminal which colors it is actually drawing with.
 //!
 //! OSC 10 and OSC 11 report the default foreground and background. With those,
 //! the selection band and the hairlines can be mixed from the user's real theme
@@ -101,14 +101,14 @@ pub fn parse(buf: &[u8]) -> Probed {
     }
 }
 
-/// The colour in an OSC reply, terminated by BEL or by ST (`ESC \`).
+/// The color in an OSC reply, terminated by BEL or by ST (`ESC \`).
 fn reply(s: &str, prefix: &str) -> Option<Rgb> {
     let rest = &s[s.find(prefix)? + prefix.len()..];
     let end = rest.find(['\x07', '\x1b']).unwrap_or(rest.len());
     parse_rgb(&rest[..end])
 }
 
-/// `rgb:RRRR/GGGG/BBBB`, one to four hex digits per channel (X11 colour spec).
+/// `rgb:RRRR/GGGG/BBBB`, one to four hex digits per channel (X11 color spec).
 fn parse_rgb(spec: &str) -> Option<Rgb> {
     let mut channels = spec.strip_prefix("rgb:")?.split('/');
     let mut next = || -> Option<u8> {
@@ -128,7 +128,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_both_colours_terminated_by_st() {
+    fn reads_both_colors_terminated_by_st() {
         let r =
             parse(b"\x1b]10;rgb:d4d4/d8d8/dede\x1b\\\x1b]11;rgb:1616/1818/1c1c\x1b\\\x1b[?62;22c");
         assert_eq!(r.fg, Some((0xd4, 0xd8, 0xde)));

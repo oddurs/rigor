@@ -148,7 +148,7 @@ fn draw_nav(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(left)), area);
 }
 
-/// A coloured dot that answers "can I trust what I'm looking at?": green when
+/// A colored dot that answers "can I trust what I'm looking at?": green when
 /// fresh, amber once the data is older than two refresh intervals (ten minutes
 /// when auto-refresh is off) or while rigor is holding off to spare the shared
 /// GitHub budget, red when the last sync failed — with when it will try again.

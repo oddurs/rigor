@@ -7,7 +7,7 @@ const FRAME = [
   'rigor  acme/widget  ⎇ chore/release-notes  @octocat',
   ' 1 Ready 1  2 Mine 2  3 Review 1  4 Blocked 1  5 All 3  6 Worktrees 5                                                                 1 removable   sort recent',
   '▌#4846  ✗ 1/3   ◌ ⌂ Give the read path a retry budget                     octocat       3m   │ #4846 Give the read path a retry budget',
-  ' #4840  ✓ 3     ✔ ⌂ Move the palette onto colour tokens                   octocat       2h   │ octocat · 3m ago · +220 −24 · 6 files · 2 comments · → main',
+  ' #4840  ✓ 3     ✔ ⌂ Move the palette onto color tokens                   octocat       2h   │ octocat · 3m ago · +220 −24 · 6 files · 2 comments · → main',
   ' #4801  ◐ 2/3   ⚠   draft · Treat a filtered empty result as unknown      agent-bot     3d   │  review    review required',
   '                                                                                             │  merge     no conflicts',
   '                                                                                             │  labels    parser, backend',
@@ -48,7 +48,7 @@ function kindOf(tok: string): Kind {
 }
 
 /** Split a line into styled runs. A fresh regex per call: a global one carries
- *  `lastIndex` between calls and would silently mis-tokenise every other line. */
+ *  `lastIndex` between calls and would silently split every other line wrongly. */
 function segments(line: string): { text: string; kind: Kind }[] {
   const out: { text: string; kind: Kind }[] = [];
   const re = new RegExp(TOKEN.source, 'g');

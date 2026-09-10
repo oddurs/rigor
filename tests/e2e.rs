@@ -2,7 +2,7 @@
 //! and a throwaway git repository with real worktrees.
 //!
 //! These are the checks that were once run by hand — a stalled `gh`, quitting
-//! mid-call, SIGTERM, the colour probe, lock-free git, focus — turned into tests
+//! mid-call, SIGTERM, the color probe, lock-free git, focus — turned into tests
 //! so they keep holding. The screen is rebuilt with a real terminal emulator
 //! (vt100), so what is asserted is what a user would see.
 #![cfg(unix)]
@@ -178,8 +178,8 @@ struct Term {
 struct Opts<'a> {
     args: &'a [&'a str],
     env: &'a [(&'a str, &'a str)],
-    /// Answer OSC 10/11 like a terminal that reports its colours.
-    colours: bool,
+    /// Answer OSC 10/11 like a terminal that reports its colors.
+    colors: bool,
 }
 
 impl Term {
@@ -237,8 +237,8 @@ impl Term {
         let input: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
         let mut reader = pair.master.try_clone_reader().unwrap();
-        let (screen2, raw2, input2, colours) =
-            (screen.clone(), raw.clone(), input.clone(), opts.colours);
+        let (screen2, raw2, input2, colors) =
+            (screen.clone(), raw.clone(), input.clone(), opts.colors);
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             let mut answered = false;
@@ -250,11 +250,11 @@ impl Term {
                 let mut raw = raw2.lock().unwrap();
                 raw.extend_from_slice(&buf[..n]);
                 // Behave like a terminal: every terminal answers DA1; only some
-                // report their colours.
+                // report their colors.
                 if !answered && raw.windows(3).any(|w| w == b"\x1b[c") {
                     answered = true;
                     let mut reply = Vec::new();
-                    if colours {
+                    if colors {
                         reply.extend_from_slice(
                             b"\x1b]10;rgb:d4d4/d8d8/dede\x1b\\\x1b]11;rgb:1616/1818/1c1c\x1b\\",
                         );
@@ -489,17 +489,17 @@ fn sigterm_exits_cleanly_and_restores_the_terminal() {
     assert!(has(b"\x1b[?1004l"), "turned focus reporting off");
 }
 
-/// The selection band is mixed from the colours the terminal reports; a
+/// The selection band is mixed from the colors the terminal reports; a
 /// terminal that reports nothing gets no band.
 #[test]
-fn the_selection_band_comes_from_the_terminals_own_colours() {
-    let band = |colours: bool| {
+fn the_selection_band_comes_from_the_terminals_own_colors() {
+    let band = |colors: bool| {
         let w = World::new();
         let t = Term::start(
             &w,
             Opts {
                 args: &["-v", "all"],
-                colours,
+                colors,
                 ..Opts::default()
             },
         );
@@ -513,12 +513,12 @@ fn the_selection_band_comes_from_the_terminals_own_colours() {
     };
     assert!(
         matches!(band(true), vt100::Color::Rgb(..)),
-        "no band from reported colours"
+        "no band from reported colors"
     );
     assert_eq!(
         band(false),
         vt100::Color::Default,
-        "a band without reported colours"
+        "a band without reported colors"
     );
 }
 
