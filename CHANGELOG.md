@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The top of the screen is now a top nav and a subnav. The nav carries a
+  `rigor` badge and a `repo › branch` breadcrumb, and sheds the branch, then the
+  user, then the status as the terminal narrows. The subnav's tabs show a title
+  and a count only — key digits no longer sit beside counts — with Ready and
+  Blocked counts coloured when non-zero. A rail beneath underlines the active
+  view and joins the detail pane's divider. Number keys are listed in the footer.
+
 ### Added
 
 - Six pull request views — `Ready`, `Mine`, `Review`, `Blocked`, `All`,
