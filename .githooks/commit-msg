@@ -6,8 +6,9 @@ set -eu
 
 msg_file="$1"
 
-# Strip comments and trailing blank lines before looking at anything.
-body=$(grep -v '^#' "$msg_file" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+# Strip comments before looking at anything; the command substitution drops
+# trailing blank lines.
+body=$(sed -e '/^#/d' "$msg_file")
 subject=$(printf '%s\n' "$body" | head -n 1)
 
 die() {
