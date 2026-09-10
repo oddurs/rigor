@@ -150,11 +150,22 @@ fn draw_nav(f: &mut Frame, area: Rect, app: &App) {
 
 /// A coloured dot that answers "can I trust what I'm looking at?": green when
 /// fresh, amber once the data is older than two refresh intervals (ten minutes
-/// when auto-refresh is off), red when the last sync failed. A spinner while a
-/// sync is in flight.
+/// when auto-refresh is off) or while rigor is holding off to spare the shared
+/// GitHub budget, red when the last sync failed — with when it will try again.
+/// A spinner while a sync is in flight.
 fn sync_status(app: &App) -> Vec<Span<'static>> {
     let t = app.theme;
     let muted = Style::new().fg(t.muted);
+    let now = now_secs();
+    let dot = |c| Span::styled("●", Style::new().fg(c));
+    let until = |at: i64| -> String {
+        if at == i64::MAX {
+            String::new()
+        } else {
+            format!(" in {}", rel_time(now, at.max(now)))
+        }
+    };
+
     if app.loading_prs || app.loading_wts {
         return vec![
             Span::styled(
@@ -164,16 +175,26 @@ fn sync_status(app: &App) -> Vec<Span<'static>> {
             Span::styled(" syncing", muted),
         ];
     }
-    if app.error.is_some() {
+    if let Some(at) = app.paused_until.filter(|at| *at > now) {
         return vec![
-            Span::styled("●", Style::new().fg(t.failure)),
-            Span::styled(" sync failed", muted),
+            dot(t.pending),
+            Span::styled(format!(" rate limited · resumes{}", until(at)), muted),
+        ];
+    }
+    if app.error.is_some() {
+        let retry = if app.next_refresh == i64::MAX {
+            String::new()
+        } else {
+            format!(" · retry{}", until(app.next_refresh))
+        };
+        return vec![
+            dot(t.failure),
+            Span::styled(format!(" sync failed{retry}"), muted),
         ];
     }
     if app.last_refresh == 0 {
         return Vec::new();
     }
-    let now = now_secs();
     let age = now - app.last_refresh;
     let every = app.settings.refresh_secs as i64;
     let stale = if every > 0 {
@@ -182,10 +203,7 @@ fn sync_status(app: &App) -> Vec<Span<'static>> {
         age > 600
     };
     vec![
-        Span::styled(
-            "●",
-            Style::new().fg(if stale { t.pending } else { t.success }),
-        ),
+        dot(if stale { t.pending } else { t.success }),
         Span::styled(format!(" {} ago", rel_time(app.last_refresh, now)), muted),
     ]
 }

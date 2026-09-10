@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A `gh` call that stalled — a connection left half-open across sleep and wake
+  is the usual cause — stopped all further refreshes for good. Every `gh` and
+  `git` call now has a deadline, and a timed-out call's whole process group is
+  killed, so nothing it spawned outlives it.
+- Background `git status` could take `index.lock` and fail an agent's
+  concurrent commit in the same worktree. rigor now runs git with
+  `--no-optional-locks`.
+- Quitting, or receiving SIGTERM or SIGHUP, while a call was in flight could
+  leave that call running. Calls still in flight are killed on the way out, and
+  the terminal is restored on those signals.
+- A panic in a background worker could leave a loading flag set forever. Workers
+  now always report back, and such a panic no longer tears down the screen.
+
 ### Changed
+
+- Worktrees are rescanned only when their git state moved — two `stat` calls per
+  worktree decide it — plus any removable candidate and the selected one, with a
+  full sweep every `worktree_scan_secs` (default 300) to catch unstaged edits.
+  Scans run four at a time at background CPU priority. On a 50-worktree
+  repository this cut CPU over four refreshes from 87s to 13s.
+- Failed refreshes back off exponentially from the failure, capped at fifteen
+  minutes, and the status line says when the next attempt is due. rigor pauses
+  automatic fetches when the shared GitHub budget drops below 5%, leaving it to
+  everything else using `gh`.
+- When the terminal reports focus lost, refreshes stretch fourfold and full
+  worktree sweeps stop; regaining focus catches up at once if the screen went
+  stale.
 
 - The top of the screen is now a top nav and a subnav. The nav carries a
   `rigor` badge and a `repo › branch` breadcrumb, and sheds the branch, then the

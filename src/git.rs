@@ -4,6 +4,9 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+use crate::proc::{self, Priority};
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,12 +14,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::model::{RepoInfo, Worktree, WorktreeStatus};
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .context("running git")?;
+    // `--no-optional-locks`: a plain `git status` may take index.lock to
+    // refresh its stat cache, and with an agent committing in the same
+    // worktree that collision fails the agent's commit. Background readers
+    // are exactly who this flag is for.
+    let out = proc::run(
+        Command::new("git")
+            .arg("--no-optional-locks")
+            .arg("-C")
+            .arg(dir)
+            .args(args),
+        Duration::from_secs(20),
+        Priority::Background,
+    )
+    .context("running git")?;
     if !out.status.success() {
         bail!(
             "git {} failed: {}",
@@ -57,16 +68,20 @@ pub fn discover(start: &Path, repo_override: Option<&str>) -> Result<RepoInfo> {
 /// Prefer `gh`'s own resolution (it honours `remote.origin.gh-resolved`), fall
 /// back to parsing the origin URL so we still work offline-ish.
 fn resolve_slug(root: &Path) -> Result<(String, String)> {
-    if let Ok(out) = Command::new("gh")
-        .arg("repo")
-        .arg("view")
-        .arg("--json")
-        .arg("nameWithOwner")
-        .arg("-q")
-        .arg(".nameWithOwner")
-        .current_dir(root)
-        .output()
-        && out.status.success()
+    if let Ok(out) = proc::run(
+        Command::new("gh")
+            .args([
+                "repo",
+                "view",
+                "--json",
+                "nameWithOwner",
+                "-q",
+                ".nameWithOwner",
+            ])
+            .current_dir(root),
+        Duration::from_secs(20),
+        Priority::Normal,
+    ) && out.status.success()
     {
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if let Some(p) = split_slug(&s) {
@@ -189,32 +204,72 @@ pub fn worktree_status(wt: &Worktree, default_branch: &str) -> WorktreeStatus {
     st
 }
 
-/// Fill in `status` for every worktree, a handful at a time. On a large repo a
-/// single `git status` can take a beat, and there can be fifty worktrees.
-pub fn fill_statuses(wts: &mut [Worktree], default_branch: &str) {
+/// A cheap fingerprint of a worktree's git state: when its HEAD file and index
+/// were last written. Two `stat` calls, no subprocess. Commits, staging,
+/// checkouts and rebases all move one of them, so an unchanged fingerprint
+/// means `git status` has nothing new to say — except about unstaged edits,
+/// which the periodic full scan picks up.
+pub type Signature = (Option<SystemTime>, Option<SystemTime>);
+
+pub fn signature(worktree: &Path) -> Signature {
+    let Some(gitdir) = gitdir(worktree) else {
+        return (None, None);
+    };
+    let mtime = |f: &str| {
+        std::fs::metadata(gitdir.join(f))
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    (mtime("HEAD"), mtime("index"))
+}
+
+/// A linked worktree's `.git` is a file pointing at its private git dir; the
+/// main worktree's is the directory itself.
+fn gitdir(worktree: &Path) -> Option<PathBuf> {
+    let dot = worktree.join(".git");
+    if dot.is_dir() {
+        return Some(dot);
+    }
+    let text = std::fs::read_to_string(&dot).ok()?;
+    let target = PathBuf::from(text.strip_prefix("gitdir:")?.trim());
+    Some(if target.is_absolute() {
+        target
+    } else {
+        worktree.join(target)
+    })
+}
+
+/// Status for the worktrees at `which`, a few at a time and at background
+/// priority. Returns each scanned worktree's path, fingerprint and status; the
+/// fingerprint is taken before the scan, so a change made mid-scan is seen as a
+/// change next time rather than missed.
+pub fn scan(
+    wts: &[Worktree],
+    which: &[usize],
+    default_branch: &str,
+) -> Vec<(PathBuf, Signature, WorktreeStatus)> {
     let next = AtomicUsize::new(0);
-    let slots: Vec<Mutex<Option<WorktreeStatus>>> =
-        (0..wts.len()).map(|_| Mutex::new(None)).collect();
+    let results: Mutex<Vec<(PathBuf, Signature, WorktreeStatus)>> = Mutex::new(Vec::new());
+    // Four at a time: enough to finish promptly, few enough that a scan of a
+    // large repository never saturates the disk while agents are building.
     let workers = std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(4);
+        .map(|n| n.get().min(4))
+        .unwrap_or(2)
+        .min(which.len().max(1));
 
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| {
                 loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= wts.len() {
-                        break;
-                    }
-                    let st = worktree_status(&wts[i], default_branch);
-                    *slots[i].lock().unwrap() = Some(st);
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&i) = which.get(k) else { break };
+                    let w = &wts[i];
+                    let sig = signature(&w.path);
+                    let st = worktree_status(w, default_branch);
+                    results.lock().unwrap().push((w.path.clone(), sig, st));
                 }
             });
         }
     });
-
-    for (w, slot) in wts.iter_mut().zip(slots) {
-        w.status = slot.into_inner().unwrap();
-    }
+    results.into_inner().unwrap()
 }

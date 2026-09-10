@@ -7,6 +7,7 @@ mod git;
 mod github;
 mod model;
 mod probe;
+mod proc;
 mod theme;
 mod ui;
 mod util;
@@ -16,7 +17,8 @@ use clap::Parser;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, poll, read,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event, KeyCode,
+    KeyModifiers, poll, read,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -24,12 +26,10 @@ use ratatui::crossterm::terminal::{
 };
 use std::io::{Stdout, Write, stdout};
 use std::path::PathBuf;
-use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 use app::App;
 use config::View;
-use util::now_secs;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -128,6 +128,7 @@ fn main() -> Result<()> {
     let (mut a, rx) = App::new(repo, settings, theme);
     let result = run(&mut term, &mut a, rx);
     restore(&mut term, mouse)?;
+    proc::kill_all();
     result
 }
 
@@ -137,12 +138,21 @@ fn run(
     rx: std::sync::mpsc::Receiver<app::Msg>,
 ) -> Result<()> {
     let mut input = event::Input::default();
+    let stop = stop_on_signal();
     a.refresh();
 
     loop {
         term.draw(|f| ui::draw(f, a))?;
 
-        if poll(Duration::from_millis(120))? {
+        // Fast while something is loading, so the spinner turns; slower when
+        // idle, where the only thing moving on screen is a clock in seconds.
+        // Input still returns at once either way.
+        let wait = if a.loading_prs || a.loading_wts {
+            120
+        } else {
+            500
+        };
+        if poll(Duration::from_millis(wait))? {
             match read()? {
                 Event::Key(k) => {
                     // Ctrl-C always quits, even mid-filter.
@@ -153,30 +163,39 @@ fn run(
                     }
                 }
                 Event::Mouse(m) => input.mouse(a, m),
-                Event::Resize(_, _) => {}
+                Event::FocusGained => a.set_focus(true),
+                Event::FocusLost => a.set_focus(false),
                 _ => {}
             }
         }
 
-        loop {
-            match rx.try_recv() {
-                Ok(msg) => a.on_msg(msg),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
-            }
+        while let Ok(msg) = rx.try_recv() {
+            a.on_msg(msg);
         }
 
         a.spinner = a.spinner.wrapping_add(1);
+        a.tick();
 
-        let every = a.settings.refresh_secs;
-        if every > 0 && now_secs() - a.last_refresh >= every as i64 {
-            a.refresh();
-        }
-
-        if a.quit {
+        if a.quit || stop.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(());
         }
     }
+}
+
+/// SIGTERM, SIGHUP or an external SIGINT ends the loop the ordinary way, so the
+/// terminal is restored instead of being left in raw mode on the alternate
+/// screen. (Ctrl-C inside rigor arrives as a key, not a signal.)
+fn stop_on_signal() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(unix)]
+    for sig in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGINT,
+    ] {
+        let _ = signal_hook::flag::register(sig, std::sync::Arc::clone(&flag));
+    }
+    flag
 }
 
 fn setup(mouse: bool) -> Result<(Terminal<CrosstermBackend<Stdout>>, probe::Probed)> {
@@ -189,16 +208,31 @@ fn setup(mouse: bool) -> Result<(Terminal<CrosstermBackend<Stdout>>, probe::Prob
     // buffer, so anything already on screen would survive wherever the frame is
     // blank. Clear here rather than with `Terminal::clear`, which first asks the
     // terminal for its cursor position and fails on any host that won't answer.
-    execute!(out, EnterAlternateScreen, Clear(ClearType::All))?;
+    execute!(
+        out,
+        EnterAlternateScreen,
+        Clear(ClearType::All),
+        EnableFocusChange
+    )?;
     if mouse {
         execute!(out, EnableMouseCapture)?;
     }
 
-    // Leave the terminal usable if we panic mid-draw.
+    // Leave the terminal usable if the UI thread panics. Background workers
+    // catch their own panics and report them as errors, so a panic there must
+    // not tear the screen down — or print over it — while rigor keeps running.
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() != Some("main") {
+            return;
+        }
         let mut out = stdout();
-        let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            out,
+            DisableFocusChange,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
         hook(info);
     }));
@@ -206,13 +240,15 @@ fn setup(mouse: bool) -> Result<(Terminal<CrosstermBackend<Stdout>>, probe::Prob
     Ok((Terminal::new(CrosstermBackend::new(out))?, probed))
 }
 
+/// Best effort throughout: after a SIGHUP the terminal may already be gone,
+/// and failing to write to it is not an error worth reporting.
 fn restore(term: &mut Terminal<CrosstermBackend<Stdout>>, mouse: bool) -> Result<()> {
     if mouse {
-        execute!(term.backend_mut(), DisableMouseCapture)?;
+        let _ = execute!(term.backend_mut(), DisableMouseCapture);
     }
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
-    disable_raw_mode()?;
-    term.show_cursor()?;
+    let _ = execute!(term.backend_mut(), DisableFocusChange, LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+    let _ = term.show_cursor();
     Ok(())
 }
 
@@ -245,6 +281,7 @@ fn print_config(repo: &model::RepoInfo, s: &config::Settings) {
     let _ = writeln!(o, "show_drafts     {}", s.show_drafts);
     let _ = writeln!(o, "mouse           {}", s.mouse);
     let _ = writeln!(o, "worktree_status {}", s.worktree_status);
+    let _ = writeln!(o, "worktree_scan_secs {}", s.worktree_scan_secs);
     let _ = writeln!(o, "open_command    {}", s.open_command);
     let _ = writeln!(o, "copy_command    {}", s.copy_command);
     if s.sources.is_empty() {
