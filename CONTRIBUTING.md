@@ -110,6 +110,11 @@ screen is right. `.snap.new` files are gitignored so a half-reviewed change
 cannot be committed. UI tests freeze the clock (`util::freeze_time`) so ages
 and durations render identically on every run.
 
+**Property tests** generate new input every run, so they can find a case no
+earlier run did. proptest records each failing case under
+`proptest-regressions/`; commit those files, so the case is replayed first on
+every future run.
+
 **Fixtures** use neutral data — `acme/widget`, `octocat` — never a real
 repository, branch or person. The repository is public.
 
