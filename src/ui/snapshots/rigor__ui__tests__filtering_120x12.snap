@@ -1,0 +1,16 @@
+---
+source: src/ui/tests.rs
+expression: "render(&mut a, 120, 12)"
+---
+ rigor │ acme/widget  ⎇ chore/release-notes                                                                    @octocat
+ Ready 1   Mine 2   Review 1   Blocked 1   All 3   Worktrees 5                                 ⌫ 1 removable   ↕ recent
+───────────────────────────────────────────━━━━━────────────────────────────────────────────────────────────────────────
+▎#4846  ✗ 1/3     ⌂ Give the read path a retry budget                                                octocat         3m
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ #4846 Give the read path a retry budget
+ octocat · 3m ago · +220 −24 · 6 files · 2 comments
+  review    review required
+ /retry▏  1 of 3     enter keep · esc clear

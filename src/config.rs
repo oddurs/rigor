@@ -350,3 +350,73 @@ worktree_scan_secs = 300
 # sel_bg  = "#2b2d31"
 # border  = "8"        # ANSI bright-black, i.e. whatever your theme calls it
 "##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// A repository's `.rigor.toml` overrides the user config field by field;
+    /// anything neither sets keeps its default.
+    #[test]
+    fn repo_config_overrides_user_config_field_by_field() {
+        let d = tempfile::tempdir().unwrap();
+        let user = write(
+            d.path(),
+            "user.toml",
+            "refresh_secs = 30\nlayout = \"stack\"\n[theme]\naccent = \"cyan\"\nsuccess = \"green\"\n",
+        );
+        write(
+            d.path(),
+            ".rigor.toml",
+            "refresh_secs = 120\n[theme]\naccent = \"#7dd3fc\"\n",
+        );
+        let s = load(d.path(), Some(&user)).unwrap();
+        assert_eq!(s.refresh_secs, 120, "the repo wins");
+        assert_eq!(s.layout, LayoutMode::Stack, "the user value survives");
+        assert_eq!(s.theme.accent.as_deref(), Some("#7dd3fc"));
+        assert_eq!(
+            s.theme.success.as_deref(),
+            Some("green"),
+            "theme merges per slot"
+        );
+        assert_eq!(s.worktree_scan_secs, 300, "untouched fields keep defaults");
+        assert_eq!(s.sources.len(), 2);
+    }
+
+    #[test]
+    fn views_are_validated_and_the_default_view_must_be_on_the_bar() {
+        let d = tempfile::tempdir().unwrap();
+        let ok = write(
+            d.path(),
+            "a.toml",
+            "views = [\"mine\", \"all\", \"mine\"]\ndefault_view = \"ready\"\n",
+        );
+        let s = load(d.path(), Some(&ok)).unwrap();
+        assert_eq!(
+            s.views,
+            vec![View::Mine, View::All],
+            "deduplicated, in order"
+        );
+        assert_eq!(s.default_view, View::Mine, "falls back to the first tab");
+
+        let bad = write(d.path(), "b.toml", "views = [\"mine\", \"nope\"]\n");
+        let err = load(d.path(), Some(&bad)).unwrap_err().to_string();
+        assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn unknown_keys_are_an_error_not_silently_ignored() {
+        let d = tempfile::tempdir().unwrap();
+        let typo = write(d.path(), "c.toml", "refresh_sec = 30\n");
+        assert!(
+            load(d.path(), Some(&typo)).is_err(),
+            "a typo must not be silently ignored"
+        );
+    }
+}

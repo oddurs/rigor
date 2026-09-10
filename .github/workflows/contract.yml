@@ -1,0 +1,29 @@
+name: Contract
+
+# The parser is tested against a recorded response on every change. This checks
+# that the recording still matches GitHub: a schema change would otherwise empty
+# fields silently rather than fail anything.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  github-api:
+    name: github-api
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+
+      - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2.87.10
+        with:
+          tool: cargo-nextest
+
+      - run: scripts/task test:live
+        env:
+          GH_TOKEN: ${{ github.token }}

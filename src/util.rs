@@ -3,7 +3,24 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(test)]
+thread_local! {
+    static FROZEN: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin the clock for the current test thread, so rendered ages and durations
+/// are identical on every run — a snapshot must not depend on which second it
+/// happened to be taken in.
+#[cfg(test)]
+pub fn freeze_time(at: i64) {
+    FROZEN.with(|f| f.set(Some(at)));
+}
+
 pub fn now_secs() -> i64 {
+    #[cfg(test)]
+    if let Some(at) = FROZEN.with(|f| f.get()) {
+        return at;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -67,11 +84,13 @@ pub fn width(s: &str) -> usize {
 
 /// Truncate to `max` display columns, appending `…` when it had to cut.
 pub fn truncate(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
+    // Fit first: zero-width text (a lone combining mark) fits in zero columns
+    // and must come back unchanged, not emptied by the zero-budget case.
     if width(s) <= max {
         return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
     }
     let mut out = String::new();
     let mut w = 0;
@@ -104,4 +123,76 @@ pub fn cell(s: &str, n: usize) -> String {
 pub fn right(s: &str, n: usize) -> String {
     let t = truncate(s, n);
     format!("{}{t}", " ".repeat(n.saturating_sub(width(&t))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Text as it arrives from GitHub: ASCII, accents, CJK and emoji (two
+    /// columns wide), and combining marks (zero columns).
+    fn text() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[a-zA-Z0-9 ._/#-]{0,12}[é漢字🙂\\u{301}]{0,4}[a-z ]{0,12}")
+            .unwrap()
+    }
+
+    proptest! {
+        /// The guarantee every truncated column relies on: exactly `n` columns,
+        /// and the last one blank, whatever went in.
+        #[test]
+        fn a_cell_is_exactly_its_width_and_ends_in_a_gutter(s in text(), n in 1usize..40) {
+            let c = cell(&s, n);
+            prop_assert_eq!(width(&c), n, "{:?} -> {:?}", s, c);
+            prop_assert!(c.ends_with(' '), "{:?} -> {:?}", s, c);
+        }
+
+        #[test]
+        fn truncate_never_exceeds_its_budget(s in text(), n in 0usize..40) {
+            let t = truncate(&s, n);
+            prop_assert!(width(&t) <= n, "{:?} -> {:?}", s, t);
+            if width(&s) <= n {
+                prop_assert_eq!(t, s, "text that fits must be left alone");
+            }
+        }
+
+        #[test]
+        fn pad_and_right_fill_exactly(s in text(), n in 0usize..40) {
+            prop_assert_eq!(width(&pad(&s, n)), n);
+            prop_assert_eq!(width(&right(&s, n)), n);
+        }
+
+        /// Timestamps from GitHub round-trip through the hand-written civil
+        /// date arithmetic, across leap years and centuries.
+        #[test]
+        fn iso8601_round_trips(ts in 0i64..4_102_444_800) {
+            prop_assert_eq!(parse_iso8601(&format_iso8601(ts)), Some(ts));
+        }
+
+        #[test]
+        fn rel_time_never_panics_and_stays_short(a in any::<i32>(), b in any::<i32>()) {
+            prop_assert!(rel_time(a as i64, b as i64).len() <= 8);
+        }
+    }
+
+    /// The inverse of `parse_iso8601`, for the round-trip property only.
+    fn format_iso8601(ts: i64) -> String {
+        let (days, secs) = (ts.div_euclid(86400), ts.rem_euclid(86400));
+        // Howard Hinnant's civil_from_days.
+        let z = days + 719468;
+        let era = z.div_euclid(146097);
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
+    }
 }

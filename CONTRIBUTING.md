@@ -77,6 +77,56 @@ The hooks are deliberately cheap to reason about:
 
 Never use `--no-verify`. If a hook is wrong, fix the hook.
 
+## Testing
+
+`scripts/task test` runs every layer below; `scripts/task check` runs it along
+with formatting, lint and the build. Two tools are required beyond Rust and
+Node: `cargo-nextest` and `shellcheck` (`scripts/setup` checks for both).
+
+| Layer | Where | What it pins |
+|---|---|---|
+| Unit | next to the code (`#[cfg(test)]`) | behaviour of one function or type |
+| Property | `proptest!` blocks | invariants over generated input: column widths, date round-trips, parsers never panicking, untrusted strings never reaching the terminal as control characters |
+| Snapshot | `src/ui/snapshots/` | the rendered screen in every major state |
+| Parser | `src/github.rs` against `tests/fixtures/graphql_page.json` | the GitHub response shape, including the awkward cases |
+| End to end | `tests/e2e.rs` | the real binary in a pseudo-terminal, against a fake `gh` and a throwaway repository with worktrees: timeouts, shutdown, signals, the colour probe, lock-free git, focus |
+| Hooks | `tests/hooks.rs` | `commit-msg`, `pre-commit`, `pre-push` and `scripts/agent`, in throwaway repositories |
+| Site | `site/scripts/check-css.mjs`, run by `build` | every class on the page has a CSS rule |
+| Live contract | `scripts/task test:live`, weekly in CI | the parser still matches GitHub's real API |
+
+Useful commands:
+
+```sh
+cargo nextest run snapshot          # run tests whose name matches
+cargo nextest run --test e2e        # one integration suite
+scripts/task coverage               # line coverage; HTML in target/llvm-cov/html
+scripts/task test:live              # needs gh auth and the network
+```
+
+**Snapshots.** When a change alters the screen, the snapshot test fails and
+leaves a `.snap.new` beside the old one. Review with `cargo insta review` and
+read every diff before accepting it: an accepted snapshot is a claim that the
+screen is right. `.snap.new` files are gitignored so a half-reviewed change
+cannot be committed. UI tests freeze the clock (`util::freeze_time`) so ages
+and durations render identically on every run.
+
+**Property tests** generate new input every run, so they can find a case no
+earlier run did. proptest records each failing case under
+`proptest-regressions/`; commit those files, so the case is replayed first on
+every future run.
+
+**Fixtures** use neutral data — `acme/widget`, `octocat` — never a real
+repository, branch or person. The repository is public.
+
+**Test harnesses strip `GIT_*` from the environment** before running git. The
+pre-push hook runs this suite, and git can hand hooks `GIT_DIR`; inherited,
+it would aim a throwaway test at the real repository.
+
+**Leaks.** nextest flags a test whose child process outlives it. That fails
+the run on Linux. On macOS it is reported but does not fail, because macOS
+cannot create a pipe that is atomically close-on-exec: under a parallel run one
+test can inherit another's output and be blamed for it.
+
 ## Review
 
 Required approvals on `main` are set to **0**, because this is currently a

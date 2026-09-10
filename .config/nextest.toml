@@ -1,0 +1,35 @@
+# Test runner configuration. scripts/task test runs the default profile;
+# CI sets NEXTEST_PROFILE=ci, which also writes JUnit for the job summary.
+
+[profile.default]
+# Report every failure in one run rather than stopping at the first.
+fail-fast = false
+# The end-to-end tests drive the real binary in a pseudo-terminal. If rigor ever
+# hangs, the test must be killed rather than stall the run: flag anything over
+# 30s as slow and terminate it at 90s.
+slow-timeout = { period = "30s", terminate-after = 3 }
+# A leaked child — a process still holding a test's output after the test ends —
+# is reported everywhere, but only fails the run on Linux. macOS cannot create a
+# pipe that is atomically close-on-exec, so under a parallel run one test can
+# inherit another's output pipe and be blamed for it; that was measured here as
+# leaks in 6 of 10 parallel runs and 0 of 4 serial ones. Linux has no such race,
+# so a leak there is real.
+leak-timeout = { period = "500ms", result = "pass" }
+
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "linux")'
+leak-timeout = { period = "500ms", result = "fail" }
+
+[profile.ci]
+fail-fast = false
+slow-timeout = { period = "30s", terminate-after = 3 }
+leak-timeout = { period = "500ms", result = "pass" }
+# A flaky test is a bug to fix, not a result to retry past.
+retries = 0
+
+[[profile.ci.overrides]]
+platform = 'cfg(target_os = "linux")'
+leak-timeout = { period = "500ms", result = "fail" }
+
+[profile.ci.junit]
+path = "junit.xml"

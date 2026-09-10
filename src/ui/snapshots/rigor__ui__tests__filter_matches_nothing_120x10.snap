@@ -1,0 +1,14 @@
+---
+source: src/ui/tests.rs
+expression: "render(&mut a, 120, 10)"
+---
+ rigor │ acme/widget  ⎇ chore/release-notes                                                                    @octocat
+ Ready 1   Mine 2   Review 1   Blocked 1   All 3   Worktrees 5                          /zzz   ⌫ 1 removable   ↕ recent
+───────────────────────────────────────────━━━━━────────────────────────────────────────────────────────────────────────
+  Nothing matches “zzz”.
+  esc clears the filter
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ 1–6 view   / filter   s sort   r refresh                                                               ? help   q quit

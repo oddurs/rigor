@@ -50,7 +50,11 @@ cmd_doctor() {
 
 	say 'checking the development environment'
 
-	command -v git >/dev/null 2>&1 && ok "git $(git --version | awk '{print $3}')" || report 'git is not installed'
+	if command -v git >/dev/null 2>&1; then
+		ok "git $(git --version | awk '{print $3}')"
+	else
+		report 'git is not installed'
+	fi
 	if command -v gh >/dev/null 2>&1; then
 		ok "gh $(gh --version | head -n1 | awk '{print $3}')"
 		if gh auth status >/dev/null 2>&1; then
@@ -66,6 +70,18 @@ cmd_doctor() {
 		ok "cargo $(cargo --version | awk '{print $2}')"
 	else
 		report 'cargo is not on PATH; install rustup from https://rustup.rs'
+	fi
+
+	# Required by scripts/task: test runs under nextest, lint runs shellcheck.
+	if command -v cargo-nextest >/dev/null 2>&1; then
+		ok "cargo-nextest $(cargo-nextest nextest --version 2>/dev/null | awk 'NR==1{print $2}')"
+	else
+		report 'cargo-nextest is missing; brew install cargo-nextest (or cargo install cargo-nextest --locked)'
+	fi
+	if command -v shellcheck >/dev/null 2>&1; then
+		ok "shellcheck $(shellcheck --version | awk '/^version/{print $2}')"
+	else
+		report 'shellcheck is missing; brew install shellcheck (or apt-get install shellcheck)'
 	fi
 
 	hooks=$(git config --get core.hooksPath 2>/dev/null || true)

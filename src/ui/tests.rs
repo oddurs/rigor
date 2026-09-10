@@ -13,7 +13,11 @@ use crate::model::{
 use crate::theme::Theme;
 use crate::util::now_secs;
 
+/// The instant every fixture is built and rendered at. Arbitrary but fixed.
+const NOW: i64 = 1_800_000_000;
+
 fn sample_app() -> App {
+    crate::util::freeze_time(NOW);
     let repo = RepoInfo {
         owner: "acme".into(),
         name: "widget".into(),
@@ -784,19 +788,171 @@ fn worktree_names_keep_a_gutter_and_only_the_selection_is_bold() {
     assert!(!bold(other), "an unselected name is bold");
 }
 
-/// Print a frame for eyeballing: `cargo test -- --nocapture preview`.
+proptest::proptest! {
+    /// SECURITY.md names this as rigor's attack surface: strings from a
+    /// repository or the GitHub API are drawn into a terminal. A title, branch,
+    /// author, label or check name carrying escape sequences must never reach
+    /// the screen as live control characters.
+    #[test]
+    fn untrusted_strings_never_reach_the_terminal_as_control_characters(
+        payload in proptest::string::string_regex(
+            "[a-z ]{0,6}(\\x1b\\[31m|\\x1b\\]8;;https://evil\\x07|\\x07|\\x08|\\r|\\x9b2J|\\u{202e}|\\u{2067}|\\x00)[a-z ]{0,6}"
+        ).unwrap()
+    ) {
+        let mut a = sample_app();
+        a.prs[0].title = format!("t{payload}");
+        a.prs[0].head_ref = format!("b{payload}");
+        a.prs[0].author = format!("u{payload}");
+        a.prs[0].labels = vec![format!("l{payload}")];
+        a.prs[0].checks[0].name = format!("c{payload}");
+        a.set_view(View::All);
+        let buf = frame(&mut a, 160, 24);
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let sym = buf[(x, y)].symbol();
+                // Control characters could drive the terminal; bidi overrides
+                // and isolates could make a title display as something else.
+                let dangerous = |c: char| {
+                    c.is_control()
+                        || ('\u{202a}'..='\u{202e}').contains(&c)
+                        || ('\u{2066}'..='\u{2069}').contains(&c)
+                };
+                proptest::prop_assert!(
+                    !sym.chars().any(dangerous),
+                    "dangerous character {:?} at ({x},{y}) from payload {:?}", sym, payload
+                );
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------ keys
+
+fn press(a: &mut App, input: &mut crate::event::Input, keys: &str) {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for ch in keys.chars() {
+        let code = match ch {
+            '\n' => KeyCode::Enter,
+            '\x1b' => KeyCode::Esc,
+            '\x08' => KeyCode::Backspace,
+            '\t' => KeyCode::Tab,
+            c => KeyCode::Char(c),
+        };
+        input.key(a, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+}
+
+/// The keyboard is the primary interface; its contract is pinned here.
 #[test]
-fn preview() {
+fn keys_move_the_selection_and_switch_views_by_position() {
+    let mut a = sample_app();
+    let mut i = crate::event::Input::default();
+    a.set_view(View::All);
+    press(&mut a, &mut i, "j");
+    assert_eq!(a.selected, 1);
+    press(&mut a, &mut i, "G");
+    assert_eq!(a.selected, a.rows.len() - 1);
+    press(&mut a, &mut i, "k");
+    assert_eq!(a.selected, a.rows.len() - 2);
+    press(&mut a, &mut i, "g");
+    assert_eq!(a.selected, 0);
+
+    // Number keys index the tab bar, whatever it is configured to hold.
+    press(&mut a, &mut i, "6");
+    assert_eq!(a.view, View::Worktrees);
+    press(&mut a, &mut i, "1");
+    assert_eq!(a.view, View::Ready);
+    press(&mut a, &mut i, "\t");
+    assert_eq!(a.view, View::Mine);
+    press(&mut a, &mut i, "9"); // past the last tab: ignored
+    assert_eq!(a.view, View::Mine);
+}
+
+#[test]
+fn the_filter_narrows_as_you_type_and_esc_restores() {
+    let mut a = sample_app();
+    let mut i = crate::event::Input::default();
+    a.set_view(View::All);
+    press(&mut a, &mut i, "/tokens");
+    assert!(a.filter_mode);
+    assert_eq!(a.rows.len(), 1, "only the colour-tokens PR matches");
+    // While typing, letters are text, not commands: `q` must not quit.
+    press(&mut a, &mut i, "q");
+    assert!(!a.quit && a.filter == "tokensq");
+    press(&mut a, &mut i, "\x08\n");
+    assert!(
+        !a.filter_mode && a.filter == "tokens",
+        "enter keeps the filter"
+    );
+    press(&mut a, &mut i, "\x1b");
+    assert!(a.filter.is_empty());
+    assert_eq!(a.rows.len(), 3);
+}
+
+#[test]
+fn sort_drafts_and_help_toggle() {
+    let mut a = sample_app();
+    let mut i = crate::event::Input::default();
+    a.set_view(View::All);
+    press(&mut a, &mut i, "s");
+    assert_eq!(a.sort, Sort::Attention);
+    press(&mut a, &mut i, "s");
+    assert_eq!(a.sort, Sort::Recent);
+
+    let with_drafts = a.rows.len();
+    press(&mut a, &mut i, "d");
+    assert_eq!(a.rows.len(), with_drafts - 1, "the draft is hidden");
+    press(&mut a, &mut i, "d");
+    assert_eq!(a.rows.len(), with_drafts);
+
+    // `q` closes help first; only a second `q` quits.
+    press(&mut a, &mut i, "?");
+    assert!(a.show_help);
+    press(&mut a, &mut i, "j"); // other keys are swallowed while help is open
+    assert_eq!(a.selected, 0);
+    press(&mut a, &mut i, "q");
+    assert!(!a.show_help && !a.quit);
+    press(&mut a, &mut i, "q");
+    assert!(a.quit);
+}
+
+/// Every major state of the screen, pinned. A layout change shows up as a
+/// reviewable diff in `cargo insta review` instead of relying on someone to
+/// notice it by eye. Update deliberately: read the diff before accepting it.
+#[test]
+fn snapshots() {
     let mut a = sample_app();
     a.set_view(View::All);
-    println!(
-        "\n=== 160x24 (side-by-side) ===\n{}",
-        render(&mut a, 160, 24)
-    );
+    insta::assert_snapshot!("all_split_160x24", render(&mut a, 160, 24));
+
     a.settings.layout = LayoutMode::Stack;
-    println!("\n=== 100x24 (stacked) ===\n{}", render(&mut a, 100, 24));
+    insta::assert_snapshot!("all_stacked_100x24", render(&mut a, 100, 24));
+    a.settings.layout = LayoutMode::Auto;
+
     a.set_view(View::Worktrees);
-    println!("\n=== worktrees 120x18 ===\n{}", render(&mut a, 120, 18));
+    insta::assert_snapshot!("worktrees_120x18", render(&mut a, 120, 18));
+
+    a.set_view(View::Mine);
     a.show_help = true;
-    println!("\n=== help 120x28 ===\n{}", render(&mut a, 120, 28));
+    insta::assert_snapshot!("help_120x30", render(&mut a, 120, 30));
+    a.show_help = false;
+
+    a.set_view(View::All);
+    a.filter_mode = true;
+    a.filter = "retry".into();
+    a.rebuild();
+    insta::assert_snapshot!("filtering_120x12", render(&mut a, 120, 12));
+    a.filter_mode = false;
+    a.filter = "zzz".into();
+    a.rebuild();
+    insta::assert_snapshot!("filter_matches_nothing_120x10", render(&mut a, 120, 10));
+    a.filter.clear();
+    a.rebuild();
+
+    a.error = Some("gh api graphql: timed out after 45s".into());
+    a.next_refresh = NOW + 180;
+    insta::assert_snapshot!("sync_failed_120x10", render(&mut a, 120, 10));
+    a.error = None;
+
+    insta::assert_snapshot!("narrow_60x16", render(&mut a, 60, 16));
 }

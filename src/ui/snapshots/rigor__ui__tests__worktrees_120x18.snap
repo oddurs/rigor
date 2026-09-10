@@ -1,0 +1,22 @@
+---
+source: src/ui/tests.rs
+expression: "render(&mut a, 120, 18)"
+---
+ rigor │ acme/widget  ⎇ chore/release-notes                                                                    @octocat
+ Ready 1   Mine 2   Review 1   Blocked 1   All 3   Worktrees 5                                 ⌫ 1 removable   ↕ recent
+───────────────────────────────────────────────────━━━━━━━━━━━──────────────────────────────────────────────────────────
+▎● retry-budget            #4846 ✗ 1/3             retry-budget                                                      3m
+   widget (main)           —                       chore/release-notes                                              15m
+   color-tokens            #4840 ✓ 3               color-tokens                                                      2h
+ ⌫ drop-mono               #4700 merged  removable drop-mono                                                         4d
+ ● row-hover               #4701 merged            row-hover                                                         5d
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ #4846 Give the read path a retry budget
+ octocat · 3m ago · +220 −24 · 6 files · 2 comments
+  review    review required
+  merge     no conflicts  → main
+  labels    parser, backend
+  branch    retry-budget
+ 1–6 view   o open   c checks   y copy   / filter   s sort   r refresh                                  ? help   q quit

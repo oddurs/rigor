@@ -11,18 +11,51 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Process groups of children still running. Each child gets its own group so a
-/// timeout can kill everything it spawned — which also means children no longer
-/// die with the terminal, so rigor has to take them down itself on exit.
-static LIVE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// The children still running, by process group. Each child gets its own group
+/// so a timeout can kill everything it spawned — which also means children no
+/// longer die with the terminal, so rigor has to take them down itself on exit.
+#[derive(Default)]
+struct Registry {
+    live: Mutex<Live>,
+}
 
-/// Kill every child still in flight. Called on the way out, so quitting in the
-/// middle of a stalled fetch leaves nothing running behind.
-pub fn kill_all() {
-    let live = std::mem::take(&mut *LIVE.lock().unwrap_or_else(|e| e.into_inner()));
-    for pgid in live {
-        signal_group(pgid);
+#[derive(Default)]
+struct Live {
+    pgids: Vec<u32>,
+    /// Set by `shutdown`. From then on nothing new may start: a worker thread
+    /// still running during exit would otherwise spawn a child just after the
+    /// sweep, and that child would outlive rigor.
+    closed: bool,
+}
+
+impl Registry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Live> {
+        self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn shutdown(&self) {
+        let pgids = {
+            let mut live = self.lock();
+            live.closed = true;
+            std::mem::take(&mut live.pgids)
+        };
+        for pgid in pgids {
+            signal_group(pgid);
+        }
+    }
+
+    fn forget(&self, pgid: u32) {
+        self.lock().pgids.retain(|p| *p != pgid);
+    }
+}
+
+static REGISTRY: std::sync::LazyLock<Registry> = std::sync::LazyLock::new(Registry::default);
+
+/// Kill every child still in flight and refuse to start any more. Called on the
+/// way out, so quitting — even in the middle of a stalled fetch or a worktree
+/// scan — leaves nothing running behind.
+pub fn shutdown() {
+    REGISTRY.shutdown();
 }
 
 fn signal_group(pgid: u32) {
@@ -32,12 +65,6 @@ fn signal_group(pgid: u32) {
     }
     #[cfg(not(unix))]
     let _ = pgid;
-}
-
-fn forget(pgid: u32) {
-    LIVE.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|p| *p != pgid);
 }
 
 /// How a subprocess should be treated while it runs.
@@ -50,6 +77,18 @@ pub enum Priority {
 }
 
 pub fn run(cmd: &mut Command, timeout: Duration, priority: Priority) -> Result<Output> {
+    run_in(&REGISTRY, cmd, timeout, priority)
+}
+
+fn run_in(
+    reg: &Registry,
+    cmd: &mut Command,
+    timeout: Duration,
+    priority: Priority,
+) -> Result<Output> {
+    if reg.lock().closed {
+        bail!("rigor is shutting down");
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -79,7 +118,18 @@ pub fn run(cmd: &mut Command, timeout: Duration, priority: Priority) -> Result<O
         .spawn()
         .with_context(|| format!("could not run `{program}`"))?;
     let pgid = child.id();
-    LIVE.lock().unwrap_or_else(|e| e.into_inner()).push(pgid);
+    {
+        // Registration and shutdown take the same lock, so a child is either
+        // registered before the sweep (and killed by it) or sees the registry
+        // closed here and kills itself. There is no window between the two.
+        let mut live = reg.lock();
+        if live.closed {
+            drop(live);
+            kill_group(&mut child);
+            bail!("rigor is shutting down");
+        }
+        live.pgids.push(pgid);
+    }
     let mut stdout = child.stdout.take().context("no stdout pipe")?;
     let mut stderr = child.stderr.take().context("no stderr pipe")?;
     // Drain both pipes while waiting, so a chatty child never blocks on a full one.
@@ -100,18 +150,18 @@ pub fn run(cmd: &mut Command, timeout: Duration, priority: Priority) -> Result<O
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(e) => {
-                forget(pgid);
+                reg.forget(pgid);
                 return Err(e.into());
             }
         }
         if Instant::now() >= deadline {
             kill_group(&mut child);
-            forget(pgid);
+            reg.forget(pgid);
             bail!("timed out after {}s", timeout.as_secs().max(1));
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    forget(pgid);
+    reg.forget(pgid);
 
     Ok(Output {
         status,
@@ -160,11 +210,16 @@ mod tests {
         );
     }
 
-    /// Quitting mid-call must not leave the call running.
+    /// Quitting mid-call must not leave the call running, and nothing may
+    /// start once shutdown has begun. A registry of its own, so closing it
+    /// cannot affect other tests running alongside.
     #[test]
-    fn kill_all_ends_calls_still_in_flight() {
-        let h = std::thread::spawn(|| {
-            run(
+    fn shutdown_ends_calls_in_flight_and_refuses_new_ones() {
+        let reg = std::sync::Arc::new(Registry::default());
+        let r2 = reg.clone();
+        let h = std::thread::spawn(move || {
+            run_in(
+                &r2,
                 Command::new("sh").args(["-c", "sleep 30; true"]),
                 Duration::from_secs(60),
                 Priority::Background,
@@ -172,13 +227,21 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(300));
         let start = Instant::now();
-        kill_all();
+        reg.shutdown();
         let res = h.join().unwrap();
         assert!(
             start.elapsed() < Duration::from_secs(3),
-            "call survived kill_all"
+            "call survived shutdown"
         );
         assert!(res.map(|o| !o.status.success()).unwrap_or(true));
+
+        let after = run_in(
+            &reg,
+            &mut Command::new("true"),
+            Duration::from_secs(5),
+            Priority::Normal,
+        );
+        assert!(after.unwrap_err().to_string().contains("shutting down"));
     }
 
     /// The case that matters in practice: the stalled process is a grandchild
