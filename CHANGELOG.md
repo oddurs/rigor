@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   colours (OSC 10/11), with a slim accent bar at its edge. Hairlines are mixed
   the same way. Terminals that do not report their colours keep the bar and a
   bolder line, with no band.
+- A pass over the rest of the interface. The list drops the review glyph for
+  "review required" — the resting state of nearly every PR — keeping only
+  approved, changes requested and conflicts; mutes passing CI counts so failures
+  stand out; right-aligns ages; hides the author in Mine; and shows your
+  position on the rail when the list overflows. The detail pane colours diff
+  counts, puts the base branch on the merge row, makes `checks` a label like the
+  others with its rows aligned under the values, collapses skipped jobs into one
+  line and right-aligns durations. The footer only offers actions that apply to
+  the selection and keeps `? help` and `q quit` pinned right. The filter prompt
+  and error line drop their filled badges, and the filter shows a live match
+  count. The help modal dims what is behind it. Empty views suggest where to go
+  next. Truncated columns always keep a gutter, and detached worktrees show a
+  plain short hash.
 
 ### Added
 

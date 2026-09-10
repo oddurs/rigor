@@ -67,7 +67,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let split = body_layout(app, body);
 
     draw_nav(f, nav, app);
-    draw_subnav(f, subnav, rail, app, split.divider_x);
+    draw_subnav(f, subnav, rail, app, split.divider_x, split.list);
     draw_body(f, split, app);
     draw_footer(f, footer, app);
 
@@ -196,7 +196,14 @@ fn sync_status(app: &App) -> Vec<Span<'static>> {
 /// Tabs carry a title and a count and nothing else. Key numbers used to sit in
 /// front of each title, which put two bare digits side by side (`Ready 2  2
 /// Mine`); the number keys are positional and listed in the footer instead.
-fn draw_subnav(f: &mut Frame, area: Rect, rail: Rect, app: &mut App, divider_x: Option<u16>) {
+fn draw_subnav(
+    f: &mut Frame,
+    area: Rect,
+    rail: Rect,
+    app: &mut App,
+    divider_x: Option<u16>,
+    list: Rect,
+) {
     let t = app.theme;
     let mut spans: Vec<Span> = Vec::new();
     let mut x = area.x;
@@ -274,8 +281,16 @@ fn draw_subnav(f: &mut Frame, area: Rect, rail: Rect, app: &mut App, divider_x: 
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 
+    // When the list is longer than its pane, say where you are in it, at the
+    // right end of the list's stretch of rail.
+    let marker = (app.rows.len() > list.height as usize).then(|| {
+        (
+            divider_x.unwrap_or(rail.right()),
+            format!(" {}/{} ", app.selected + 1, app.rows.len()),
+        )
+    });
     f.render_widget(
-        Paragraph::new(rail_line(rail, underline, divider_x, &t)),
+        Paragraph::new(rail_line(rail, underline, divider_x, marker, &t)),
         rail,
     );
 }
@@ -286,6 +301,7 @@ fn rail_line(
     rail: Rect,
     underline: Option<(u16, u16)>,
     divider_x: Option<u16>,
+    marker: Option<(u16, String)>,
     t: &crate::theme::Theme,
 ) -> Line<'static> {
     let light = Style::new().fg(t.border);
@@ -297,6 +313,19 @@ fn rail_line(
         && dx < rail.right()
     {
         cells[(dx - rail.x) as usize] = ('┬', light);
+    }
+    let under = |cx: u16| underline.is_some_and(|(ux, uw)| cx >= ux && cx < ux + uw);
+    // The marker ends one column short of the junction (or the edge) and never
+    // overwrites the active tab's underline.
+    if let Some((end_x, text)) = marker {
+        let w = text.chars().count() as u16;
+        let start = end_x.saturating_sub(1 + w).max(rail.x);
+        for (i, ch) in text.chars().enumerate() {
+            let cx = start + i as u16;
+            if cx < rail.right() && !under(cx) {
+                cells[(cx - rail.x) as usize] = (ch, Style::new().fg(t.muted));
+            }
+        }
     }
     if let Some((ux, uw)) = underline {
         for cx in ux..(ux + uw).min(rail.right()) {
@@ -370,15 +399,23 @@ fn draw_body(f: &mut Frame, split: BodySplit, app: &mut App) {
     detail::draw(f, detail_area, app);
 }
 
+/// The footer is the command line. It uses no filled badges — the same rule as
+/// the nav — and it only offers actions that would do something right now.
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let t = app.theme;
+    let muted = Style::new().fg(t.muted);
 
     if app.filter_mode {
+        // A live count is the point of typing a filter: see the list narrow.
         let line = Line::from(vec![
-            Span::styled(" filter ", Style::new().fg(t.sel_fg).bg(t.accent)),
-            Span::styled(format!(" {}", app.filter), Style::new().fg(t.fg)),
+            Span::styled(" /", Style::new().fg(t.accent)),
+            Span::styled(app.filter.clone(), Style::new().fg(t.fg)),
             Span::styled("▏", Style::new().fg(t.accent)),
-            Span::styled("   enter accept · esc clear", Style::new().fg(t.muted)),
+            Span::styled(
+                format!("  {} of {}", app.rows.len(), app.count_for(app.view)),
+                muted,
+            ),
+            Span::styled("     enter keep · esc clear", muted),
         ]);
         f.render_widget(Paragraph::new(line), area);
         return;
@@ -386,8 +423,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 
     if let Some(e) = &app.error {
         let line = Line::from(vec![
-            Span::styled(" error ", Style::new().fg(t.sel_fg).bg(t.failure)),
-            Span::styled(format!(" {e}"), Style::new().fg(t.failure)),
+            Span::styled(" ✗ ", Style::new().fg(t.failure)),
+            Span::styled(e.clone(), Style::new().fg(t.failure)),
         ]);
         f.render_widget(Paragraph::new(line), area);
         return;
@@ -401,26 +438,56 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    let key = |k: &str, d: &str| -> Vec<Span<'static>> {
+        vec![
+            Span::styled(k.to_string(), Style::new().fg(t.fg)),
+            Span::styled(format!(" {d}   "), muted),
+        ]
+    };
+
+    let has_pr = app.selected_pr().is_some();
+    let landed = app
+        .selected_worktree()
+        .and_then(|w| w.branch.as_deref())
+        .is_some_and(|b| app.merged_for_branch(b).is_some());
     let views = app.settings.views.len();
     let view_keys = if views > 1 {
         format!("1–{}", views.min(9))
     } else {
         "1".into()
     };
-    let mut spans = vec![Span::raw(" ")];
-    for (k, d) in [
-        (view_keys.as_str(), "view"),
-        ("o", "open"),
-        ("c", "checks"),
-        ("y", "copy"),
-        ("/", "filter"),
-        ("s", "sort"),
-        ("r", "refresh"),
-        ("?", "help"),
-        ("q", "quit"),
-    ] {
-        spans.push(Span::styled(k.to_string(), Style::new().fg(t.accent)));
-        spans.push(Span::styled(format!(" {d}  "), Style::new().fg(t.muted)));
+
+    let mut left: Vec<Vec<Span>> = vec![key(&view_keys, "view")];
+    if has_pr || landed {
+        left.push(key("o", "open"));
     }
+    if has_pr {
+        left.push(key("c", "checks"));
+        left.push(key("y", "copy"));
+    }
+    left.push(key("/", "filter"));
+    left.push(key("s", "sort"));
+    left.push(key("r", "refresh"));
+
+    // Help and quit are pinned right, so they survive any width: they are how
+    // you find everything else.
+    let mut right: Vec<Span> = key("?", "help");
+    right.extend([
+        Span::styled("q".to_string(), Style::new().fg(t.fg)),
+        Span::styled(" quit ".to_string(), muted),
+    ]);
+
+    let width = area.width as usize;
+    let mut spans = vec![Span::raw(" ")];
+    let budget = width.saturating_sub(width_of(&right) + 1);
+    for group in left {
+        if width_of(&spans) + width_of(&group) > budget {
+            break;
+        }
+        spans.extend(group);
+    }
+    let gap = width.saturating_sub(width_of(&spans) + width_of(&right));
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(right);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }

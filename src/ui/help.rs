@@ -36,8 +36,19 @@ const MOUSE: &[(&str, &str)] = &[
 
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let t = app.theme;
+    // Recede everything behind the modal so it reads as a layer on top, not
+    // as more text on the same plane.
+    let buf = f.buffer_mut();
+    for pos in area.positions() {
+        if let Some(c) = buf.cell_mut(pos) {
+            c.modifier.insert(Modifier::DIM);
+        }
+    }
+
     let w = 64u16.min(area.width.saturating_sub(4));
-    let h = (KEYS.len() + MOUSE.len() + 6) as u16;
+    // Rows: every key and mouse binding, a blank line, the "mouse" heading,
+    // and the two borders.
+    let h = (KEYS.len() + MOUSE.len() + 4) as u16;
     let h = h.min(area.height.saturating_sub(2));
     let rect = Rect::new(
         area.x + (area.width.saturating_sub(w)) / 2,
@@ -49,7 +60,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Clear, rect);
     let block = Block::new()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(t.accent))
+        .border_style(Style::new().fg(t.border))
         .title(Span::styled(
             " keys ",
             Style::new().fg(t.accent).add_modifier(Modifier::BOLD),

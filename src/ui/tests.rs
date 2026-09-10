@@ -312,7 +312,7 @@ fn both_layouts_render_the_detail_pane() {
         a.set_view(View::All);
         let out = render(&mut a, w, 30);
         assert!(
-            out.contains("CHECKS"),
+            out.contains("checks    1 passed"),
             "{mode:?} lost the checks section:\n{out}"
         );
         assert!(
@@ -595,6 +595,192 @@ fn an_active_filter_shows_in_the_subnav() {
         !row_text(&buf, 23).contains("retry"),
         "the footer still shows it"
     );
+}
+
+fn footer(buf: &ratatui::buffer::Buffer) -> String {
+    row_text(buf, buf.area.height - 1)
+}
+
+/// Only states that change what you do next earn a glyph in the list. "Review
+/// required" is the resting state of nearly every PR, so it stays blank there.
+#[test]
+fn the_list_marks_only_notable_review_states() {
+    let mut a = sample_app();
+    a.set_view(View::All);
+    let buf = frame(&mut a, 160, 24);
+    let row_of = |n: &str| {
+        (0..24)
+            .map(|y| row_text(&buf, y))
+            .find(|r| r.contains(n))
+            .unwrap()
+    };
+    assert!(
+        !row_of("#4846").contains('◌'),
+        "review-required should be blank"
+    );
+    assert!(row_of("#4840").contains('✔'), "approved keeps its glyph");
+}
+
+/// Skipped jobs are counted, not listed: one line in place of a row each.
+#[test]
+fn skipped_checks_collapse_to_a_single_line() {
+    let mut a = sample_app();
+    let now = now_secs();
+    for name in ["docs render", "design a11y", "worker corpora"] {
+        a.prs[0].checks.push(Check {
+            name: name.into(),
+            state: CheckState::Skipped,
+            url: None,
+            started_at: Some(now - 10),
+            completed_at: Some(now - 10),
+        });
+    }
+    a.set_view(View::All);
+    let buf = frame(&mut a, 160, 30);
+    let text: Vec<String> = (0..30).map(|y| row_text(&buf, y)).collect();
+    assert!(
+        text.iter().any(|r| r.contains("– 3 skipped")),
+        "no collapsed skip line"
+    );
+    assert!(
+        !text.iter().any(|r| r.contains("design a11y")),
+        "a skipped check is listed"
+    );
+}
+
+/// An empty view points somewhere useful, and the detail pane stays out of it.
+#[test]
+fn an_empty_view_points_somewhere_useful() {
+    let mut a = sample_app();
+    a.settings.views = vec![View::Ready, View::Mine, View::Assigned, View::All];
+    a.prs[1].assignees.clear();
+    a.set_view(View::Assigned);
+    let buf = frame(&mut a, 160, 24);
+    let body: Vec<String> = (3..23).map(|y| row_text(&buf, y)).collect();
+    assert!(
+        body.iter().any(|r| r.contains("1 in Ready — press 1")),
+        "{body:#?}"
+    );
+    assert!(
+        !body.iter().any(|r| r.contains("Nothing selected")),
+        "detail repeats the list"
+    );
+    let f = footer(&buf);
+    assert!(
+        !f.contains("checks") && !f.contains("copy"),
+        "offers actions on nothing: {f:?}"
+    );
+}
+
+/// Help and quit are how you find everything else, so they never clip.
+#[test]
+fn the_footer_keeps_help_and_quit_at_any_width() {
+    let mut a = sample_app();
+    for w in [160u16, 90, 60] {
+        let f = footer(&frame(&mut a, w, 24));
+        assert!(
+            f.contains("? help") && f.contains("q quit"),
+            "at {w}: {f:?}"
+        );
+    }
+}
+
+/// Typing a filter shows how far the list has narrowed.
+#[test]
+fn the_filter_prompt_counts_matches() {
+    let mut a = sample_app();
+    a.set_view(View::All);
+    a.filter_mode = true;
+    a.filter = "retry".into();
+    a.rebuild();
+    let f = footer(&frame(&mut a, 160, 24));
+    assert!(f.contains("/retry") && f.contains("1 of 3"), "{f:?}");
+}
+
+/// The help modal sits on a dimmed background, so it reads as a layer.
+#[test]
+fn the_help_modal_dims_what_is_behind_it() {
+    let mut a = sample_app();
+    a.show_help = true;
+    let buf = frame(&mut a, 160, 40);
+    assert!(buf[(0, 0)].modifier.contains(ratatui::style::Modifier::DIM));
+}
+
+/// A list longer than its pane says where you are in it, on the rail.
+#[test]
+fn a_long_list_shows_its_position_on_the_rail() {
+    // The body always keeps at least three rows, so the three fixture PRs can
+    // never overflow it; add enough to spill past a short pane.
+    let mut a = sample_app();
+    let extra: Vec<Pr> = (0..5)
+        .map(|i| {
+            let mut p = a.prs[1].clone();
+            p.number = 5000 + i;
+            p
+        })
+        .collect();
+    a.prs.extend(extra);
+    a.settings.layout = LayoutMode::Split;
+    a.set_view(View::All);
+    a.move_sel(1);
+    let buf = frame(&mut a, 160, 10);
+    let rail = row_text(&buf, 2);
+    assert!(rail.contains("2/8"), "{rail:?}");
+    let marker_end = rail.find("2/8").unwrap() + 3;
+    let junction = rail.find('┬').unwrap();
+    assert!(
+        marker_end < junction,
+        "the marker sits inside the list's stretch of rail"
+    );
+
+    let tall = frame(&mut a, 160, 40);
+    assert!(
+        !row_text(&tall, 2).contains("/8"),
+        "no marker when everything fits"
+    );
+}
+
+/// Worktree names keep a gutter however long they are, and only the selected
+/// one is bold — a column of bold names has no hierarchy left in it.
+#[test]
+fn worktree_names_keep_a_gutter_and_only_the_selection_is_bold() {
+    let mut a = sample_app();
+    let now = now_secs();
+    let mut wts = a.worktrees.clone();
+    wts.push(wt(
+        "/home/dev/src/widget-wt/onboarding-mobile-compression-pass",
+        "onboarding-mobile-compression-pass",
+        false,
+        0,
+        now - 60,
+    ));
+    a.on_msg(crate::app::Msg::Worktrees(Ok(wts)));
+    a.set_view(View::Worktrees);
+    let buf = frame(&mut a, 160, 24);
+
+    let (long_y, _) = *a
+        .hits
+        .rows
+        .iter()
+        .find(|(y, _)| row_text(&buf, *y).contains("onboarding"))
+        .unwrap();
+    // glyph column (3) + name column (24): the last column of the name is blank
+    assert_eq!(
+        buf[(26, long_y)].symbol(),
+        " ",
+        "{:?}",
+        row_text(&buf, long_y)
+    );
+
+    let bold = |y: u16| {
+        buf[(4, y)]
+            .modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    };
+    let (sel_y, _) = a.hits.rows[a.selected];
+    assert!(bold(sel_y), "the selected name should be bold");
+    let other = a.hits.rows.iter().find(|(y, _)| *y != sel_y).unwrap().0;
+    assert!(!bold(other), "an unselected name is bold");
 }
 
 /// Print a frame for eyeballing: `cargo test -- --nocapture preview`.

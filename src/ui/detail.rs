@@ -10,7 +10,7 @@ use ratatui::widgets::Paragraph;
 use crate::app::{App, WtState};
 use crate::model::{CheckState, Mergeable, MergedPr, Pr, Worktree};
 use crate::theme::Theme;
-use crate::util::{dur_short, now_secs, pad, rel_time, truncate};
+use crate::util::{cell, dur_short, now_secs, pad, rel_time, right, truncate};
 
 pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     if area.width < 4 || area.height < 2 {
@@ -38,12 +38,8 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
             let state = app.wt_state(wt);
             wt_detail(&mut lines, wt, merged, state, app.home.as_deref(), now, &t)
         }
-        (None, None) => {
-            lines.push(Line::from(Span::styled(
-                "  Nothing selected.",
-                Style::new().fg(t.muted),
-            )));
-        }
+        // The list pane already explains an empty view; saying it twice is noise.
+        (None, None) => {}
     }
 
     let max_scroll = lines.len().saturating_sub(area.height as usize) as u16;
@@ -65,6 +61,9 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         .collect();
     f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
 }
+
+/// Where values begin: two columns of margin plus a ten-column label.
+const VALUE_COL: usize = 12;
 
 fn field<'a>(k: &'a str, t: &Theme) -> Span<'a> {
     Span::styled(format!("  {}", pad(k, 10)), Style::new().fg(t.muted))
@@ -97,19 +96,25 @@ fn pr_detail(
     }
     lines.push(Line::from(head));
 
-    let meta = format!(
-        " {} · {} ago · +{} −{} · {} file{} · {} comment{} · → {}",
-        pr.author,
-        rel_time(pr.updated_at, now),
-        pr.additions,
-        pr.deletions,
-        pr.changed_files,
-        if pr.changed_files == 1 { "" } else { "s" },
-        pr.comments,
-        if pr.comments == 1 { "" } else { "s" },
-        pr.base_ref,
-    );
-    lines.push(Line::from(Span::styled(meta, Style::new().fg(t.muted))));
+    let muted = Style::new().fg(t.muted);
+    let plural = |n: u32, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {} · {} ago · ", pr.author, rel_time(pr.updated_at, now)),
+            muted,
+        ),
+        Span::styled(format!("+{}", pr.additions), Style::new().fg(t.success)),
+        Span::styled(" ", muted),
+        Span::styled(format!("−{}", pr.deletions), Style::new().fg(t.failure)),
+        Span::styled(
+            format!(
+                " · {} · {}",
+                plural(pr.changed_files, "file"),
+                plural(pr.comments, "comment")
+            ),
+            muted,
+        ),
+    ]));
 
     let (rv_text, rv_color) = match pr.review_decision {
         Some(d) => (
@@ -148,6 +153,7 @@ fn pr_detail(
     lines.push(Line::from(vec![
         field("merge", t),
         Span::styled(m_text, Style::new().fg(m_color)),
+        Span::styled(format!("  → {}", pr.base_ref), Style::new().fg(t.muted)),
     ]));
 
     if !pr.labels.is_empty() {
@@ -204,21 +210,21 @@ fn pr_detail(
 
     let tally = pr.tally();
     if tally.total == 0 {
-        lines.push(Line::from(Span::styled(
-            "  CHECKS   none reported",
-            Style::new().fg(t.muted),
-        )));
+        lines.push(Line::from(vec![
+            field("checks", t),
+            Span::styled("none reported", Style::new().fg(t.muted)),
+        ]));
         return;
     }
 
-    let mut head = vec![Span::styled(
-        "  CHECKS   ",
-        Style::new().fg(t.muted).add_modifier(Modifier::BOLD),
-    )];
-    head.push(Span::styled(
-        format!("{} passed", tally.passed),
-        Style::new().fg(t.success),
-    ));
+    // `checks` is a label like the others, and its tally is the value.
+    let mut head = vec![
+        field("checks", t),
+        Span::styled(
+            format!("{} passed", tally.passed),
+            Style::new().fg(t.success),
+        ),
+    ];
     if tally.failed > 0 {
         head.push(Span::styled(
             format!(" · {} failing", tally.failed),
@@ -231,15 +237,18 @@ fn pr_detail(
             Style::new().fg(t.pending),
         ));
     }
-    if tally.skipped > 0 {
-        head.push(Span::styled(
-            format!(" · {} skipped", tally.skipped),
-            Style::new().fg(t.muted),
-        ));
-    }
     lines.push(Line::from(head));
 
+    // Check rows start in the value column, so the list reads as belonging to
+    // its label. Skipped jobs are in the tally below as one line rather than
+    // one row each: a path-filtered repo skips most of its matrix, and listing
+    // every skip buries the checks that ran.
+    let indent = " ".repeat(VALUE_COL);
+    let name_w = width.saturating_sub(VALUE_COL + 2 + 8).max(10);
     for (i, c) in pr.checks.iter().enumerate() {
+        if matches!(c.state, CheckState::Skipped | CheckState::Neutral) {
+            continue;
+        }
         let color = match c.state {
             CheckState::Success => t.success,
             CheckState::Failure => t.failure,
@@ -247,21 +256,30 @@ fn pr_detail(
             CheckState::Cancelled => t.warn,
             _ => t.muted,
         };
-        // A skipped job reports a zero-length run; printing "0s" is just noise.
         let dur = c
             .elapsed(now)
             .filter(|s| *s > 0)
             .map(dur_short)
             .unwrap_or_default();
-        let name_w = width.saturating_sub(16).max(10);
         check_lines.push((lines.len(), i));
         lines.push(Line::from(vec![
-            Span::styled(format!("  {} ", c.state.glyph()), Style::new().fg(color)),
+            Span::raw(indent.clone()),
+            Span::styled(format!("{} ", c.state.glyph()), Style::new().fg(color)),
             Span::styled(
-                pad(&c.name, name_w),
+                cell(&c.name, name_w),
                 Style::new().fg(if c.state.is_bad() { t.fg } else { t.muted }),
             ),
-            Span::styled(pad(&dur, 8), Style::new().fg(t.muted)),
+            // Durations right-aligned, so they read down as a column of numbers.
+            Span::styled(right(&dur, 7), Style::new().fg(t.muted)),
+        ]));
+    }
+    if tally.skipped > 0 {
+        lines.push(Line::from(vec![
+            Span::raw(indent),
+            Span::styled(
+                format!("– {} skipped", tally.skipped),
+                Style::new().fg(t.muted),
+            ),
         ]));
     }
 }
@@ -291,7 +309,7 @@ fn wt_detail(
 
     let branch = match (&w.branch, w.detached) {
         (Some(b), _) => b.clone(),
-        (None, true) => format!("detached at {}", truncate(&w.head, 10)),
+        (None, true) => format!("detached at {}", super::list::short_sha(&w.head)),
         _ => "unknown".into(),
     };
     lines.push(Line::from(vec![
@@ -320,7 +338,7 @@ fn wt_detail(
     if st.dirty == 0 && st.unpushed == 0 {
         state.push(Span::styled("clean", Style::new().fg(t.success)));
     }
-    if !st.published {
+    if !st.published && !w.detached {
         state.push(Span::styled("  · not on origin", Style::new().fg(t.muted)));
     }
     lines.push(Line::from(state));
