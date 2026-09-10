@@ -20,13 +20,15 @@ case "$subject" in
 "Merge branch"* | "Merge remote-tracking"* | "Revert "*)
 	exit 0
 	;;
+*) ;;
 esac
 
 types='feat|fix|chore|docs|perf|refactor|test|build|ci|style'
 if ! printf '%s' "$subject" | grep -Eq "^($types)(\([a-z0-9._/-]+\))?!?: .+"; then
 	printf 'commit-msg: subject is not a Conventional Commit\n' >&2
 	printf '  expected: <type>(<scope>)!: <subject>\n' >&2
-	printf '  types:    %s\n' "$(printf '%s' "$types" | tr '|' ' ')" >&2
+	type_list=$(printf '%s' "$types" | tr '|' ' ')
+	printf '  types:    %s\n' "$type_list" >&2
 	printf '  got:      %s\n' "$subject" >&2
 	exit 1
 fi
@@ -37,6 +39,7 @@ fi
 
 case "$subject" in
 *.) die 'subject must not end with a period' ;;
+*) ;;
 esac
 
 # Attribution ban, matched over the whole message including trailers. The

@@ -3,25 +3,28 @@
 # branch is pushed before it is green.
 set -eu
 
-cd "$(git rev-parse --show-toplevel)"
+top=$(git rev-parse --show-toplevel)
+cd "$top"
 
-remote_head=$(git symbolic-ref --quiet --short "refs/remotes/${1:-origin}/HEAD" 2>/dev/null || true)
+# No origin/HEAD yet means the default branch is main.
+remote_head=$(git symbolic-ref --quiet --short "refs/remotes/${1:-origin}/HEAD" 2>/dev/null) ||
+	remote_head=''
 default_branch=${remote_head#"${1:-origin}"/}
 [ -n "$default_branch" ] || default_branch=main
-
-zero=$(printf '0%.0s' $(seq 1 40))
 
 # stdin gives one line per ref being pushed: <local ref> <sha> <remote ref> <sha>
 while read -r _local_ref _local_sha remote_ref remote_sha; do
 	[ -n "$remote_ref" ] || continue
 	[ "$remote_ref" = "refs/heads/$default_branch" ] || continue
 
-	# A zero remote sha means the ref does not exist yet, i.e. this is the first
-	# publish of a new repository. That is not advancing the default branch;
-	# there is nothing there to advance. Once it exists, server-side protection
-	# blocks deletion, so this case cannot be manufactured again.
+	# An all-zero remote id means the ref does not exist yet, i.e. this is the
+	# first publish of a new repository. That is not advancing the default
+	# branch; there is nothing there to advance. Once it exists, server-side
+	# protection blocks deletion, so this case cannot be manufactured again.
+	# Any length of zeros: 40 for SHA-1, 64 for SHA-256.
 	case "$remote_sha" in
-	"$zero" | '') continue ;;
+	*[!0]*) ;;
+	*) continue ;;
 	esac
 
 	printf 'pre-push: refusing to push directly to %s\n' "$default_branch" >&2

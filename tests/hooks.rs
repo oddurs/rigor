@@ -13,8 +13,9 @@ mod common;
 
 use common::{isolated, write_exe};
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Output, Stdio};
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -263,6 +264,37 @@ fn pre_push_allows_the_first_publish_of_a_new_repository() {
     )));
     let o = git(&r.work(), &["push", "-q", fresh.to_str().unwrap(), "main"]);
     assert!(ok(&o), "{}", stderr(&o));
+}
+
+/// The same exemption from a SHA-256 repository, where the id of a ref that
+/// does not exist yet is 64 zeros, not 40. Anything else is a real ref.
+#[test]
+fn pre_push_reads_any_length_of_zeros_as_a_missing_ref() {
+    let r = Repo::new().with_hooks(&[]);
+    let push = |remote_sha: &str| {
+        let mut hook = isolated("sh", &r.work())
+            .arg(root().join(".githooks/pre-push"))
+            .arg("origin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let local = "1".repeat(64);
+        let line = format!("refs/heads/main {local} refs/heads/main {remote_sha}\n");
+        hook.stdin
+            .take()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        hook.wait_with_output().unwrap()
+    };
+    for zeros in [40, 64] {
+        let o = push(&"0".repeat(zeros));
+        assert!(ok(&o), "{zeros} zeros: {}", stderr(&o));
+    }
+    let o = push(&"a0".repeat(32));
+    assert!(!ok(&o), "an existing SHA-256 main was advanced");
 }
 
 // ------------------------------------------------------------- scripts/agent

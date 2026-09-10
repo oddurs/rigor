@@ -21,13 +21,22 @@ repo_root() { git rev-parse --show-toplevel 2>/dev/null || die 'not inside a git
 # The primary checkout is the first entry git reports; worktrees follow it.
 primary() { git worktree list --porcelain | sed -n '1s/^worktree //p'; }
 
-repo_name() { basename "$(primary)"; }
+# POSIX sh has no local variables, so helpers use names no caller shares.
+repo_name() {
+	_rn_primary=$(primary)
+	basename "$_rn_primary"
+}
 
-worktree_root() { printf '%s/.worktrees/%s' "$(dirname "$(primary)")" "$(repo_name)"; }
+worktree_root() {
+	_wr_primary=$(primary)
+	_wr_parent=$(dirname "$_wr_primary")
+	_wr_name=$(basename "$_wr_primary")
+	printf '%s/.worktrees/%s' "$_wr_parent" "$_wr_name"
+}
 
 # Resolved, never hardcoded: origin/HEAD, then gh, then main.
 default_branch() {
-	ref=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+	ref=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || ref=''
 	if [ -n "$ref" ]; then
 		printf '%s' "${ref#origin/}"
 		return
@@ -56,14 +65,17 @@ cmd_doctor() {
 	say 'checking the development environment'
 
 	if command -v git >/dev/null 2>&1; then
-		ok "git $(git --version | awk '{print $3}')"
+		version=$(git --version | awk '{print $3}')
+		ok "git $version"
 	else
 		report 'git is not installed'
 	fi
 	if command -v gh >/dev/null 2>&1; then
-		ok "gh $(gh --version | head -n1 | awk '{print $3}')"
+		version=$(gh --version | head -n1 | awk '{print $3}')
+		ok "gh $version"
 		if gh auth status >/dev/null 2>&1; then
-			ok "gh authenticated as $(gh api user -q .login 2>/dev/null || echo unknown)"
+			login=$(gh api user -q .login 2>/dev/null) || login=unknown
+			ok "gh authenticated as $login"
 		else
 			report 'gh is not authenticated; run: gh auth login'
 		fi
@@ -72,30 +84,52 @@ cmd_doctor() {
 	fi
 
 	if command -v cargo >/dev/null 2>&1; then
-		ok "cargo $(cargo --version | awk '{print $2}')"
+		version=$(cargo --version | awk '{print $2}')
+		ok "cargo $version"
 	else
 		report 'cargo is not on PATH; install rustup from https://rustup.rs'
 	fi
 
-	# Required by scripts/task: test runs under nextest, lint runs shellcheck.
+	# Required by scripts/task: test runs under nextest; lint runs shellcheck,
+	# typos and actionlint; audit runs cargo-deny.
 	if command -v cargo-nextest >/dev/null 2>&1; then
-		ok "cargo-nextest $(cargo-nextest nextest --version 2>/dev/null | awk 'NR==1{print $2}')"
+		version=$(cargo-nextest nextest --version 2>/dev/null | awk 'NR==1{print $2}')
+		ok "cargo-nextest $version"
 	else
 		report 'cargo-nextest is missing; brew install cargo-nextest (or cargo install cargo-nextest --locked)'
 	fi
 	if command -v shellcheck >/dev/null 2>&1; then
-		ok "shellcheck $(shellcheck --version | awk '/^version/{print $2}')"
+		version=$(shellcheck --version | awk '/^version/{print $2}')
+		ok "shellcheck $version"
 	else
 		report 'shellcheck is missing; brew install shellcheck (or apt-get install shellcheck)'
 	fi
+	if command -v typos >/dev/null 2>&1; then
+		version=$(typos --version | awk '{print $2}')
+		ok "typos $version"
+	else
+		report 'typos is missing; brew install typos-cli (or cargo install typos-cli --locked)'
+	fi
+	if command -v actionlint >/dev/null 2>&1; then
+		version=$(actionlint --version | head -n1)
+		ok "actionlint $version"
+	else
+		report 'actionlint is missing; brew install actionlint (see github.com/rhysd/actionlint)'
+	fi
+	if command -v cargo-deny >/dev/null 2>&1; then
+		version=$(cargo-deny --version | awk '{print $2}')
+		ok "cargo-deny $version"
+	else
+		report 'cargo-deny is missing; brew install cargo-deny (or cargo install cargo-deny --locked)'
+	fi
 
-	hooks=$(git config --get core.hooksPath 2>/dev/null || true)
+	hooks=$(git config --get core.hooksPath 2>/dev/null) || hooks=''
 	if [ "$hooks" = '.githooks' ]; then
 		ok 'hooks path is .githooks'
 	else
 		say 'setting core.hooksPath to .githooks'
 		git config core.hooksPath .githooks
-		chmod +x .githooks/* 2>/dev/null || true
+		chmod +x .githooks/commit-msg .githooks/pre-commit .githooks/pre-push
 		ok 'hooks path set'
 	fi
 
@@ -197,8 +231,10 @@ cmd_pr() {
 
 	# Only an OPEN pull request means there is nothing to do. `gh pr view`
 	# matches by branch name and will happily return a closed or merged one.
-	if [ "$(gh pr view --json state -q .state 2>/dev/null || echo NONE)" = 'OPEN' ]; then
-		ok "a pull request is already open: $(gh pr view --json url -q .url)"
+	state=$(gh pr view --json state -q .state 2>/dev/null) || state=NONE
+	if [ "$state" = 'OPEN' ]; then
+		url=$(gh pr view --json url -q .url)
+		ok "a pull request is already open: $url"
 		return 0
 	fi
 
@@ -221,15 +257,15 @@ cmd_pr() {
 
 	# One commit: use its subject. Several: derive from the branch, which is
 	# more descriptive than whichever commit happened to be first.
-	if [ "$(git rev-list --count "origin/$base..HEAD")" = '1' ]; then
+	commits=$(git rev-list --count "origin/$base..HEAD")
+	if [ "$commits" = '1' ]; then
 		title=$(git log -1 --format='%s')
 	else
 		# '_-' not '-_': BSD tr reads a leading dash as an option flag.
 		title="${branch%%/*}: $(printf '%s' "${branch#*/}" | tr '_-' '  ')"
 	fi
 	say 'opening the pull request'
-	# shellcheck disable=SC2086
-	gh pr create --base "$base" --head "$branch" --title "$title" --body-file "$body" $draft
+	gh pr create --base "$base" --head "$branch" --title "$title" --body-file "$body" ${draft:+"$draft"}
 	gh pr view --json url -q .url
 }
 
@@ -253,11 +289,13 @@ cmd_done() {
 	[ -n "$dir" ] || die "no worktree is checked out on $branch"
 
 	here=$(pwd -P)
+	main_checkout=$(primary)
 	case "$here" in
 	"$dir" | "$dir"/*)
 		die "run this from the primary checkout, not the worktree being removed:
-    cd $(primary) && scripts/agent done $branch"
+    cd $main_checkout && scripts/agent done $branch"
 		;;
+	*) ;;
 	esac
 
 	state=$(gh pr view "$branch" --json state -q .state 2>/dev/null || echo NONE)
