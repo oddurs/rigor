@@ -84,11 +84,13 @@ pub fn width(s: &str) -> usize {
 
 /// Truncate to `max` display columns, appending `…` when it had to cut.
 pub fn truncate(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
+    // Fit first: zero-width text (a lone combining mark) fits in zero columns
+    // and must come back unchanged, not emptied by the zero-budget case.
     if width(s) <= max {
         return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
     }
     let mut out = String::new();
     let mut w = 0;
