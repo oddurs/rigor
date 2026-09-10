@@ -8,9 +8,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{App, Row, WtState};
+use crate::config::View;
 use crate::model::{CheckState, Mergeable, MergedPr, Pr, Worktree};
 use crate::theme::Theme;
-use crate::util::{now_secs, pad, rel_time, truncate};
+use crate::util::{cell, now_secs, pad, rel_time, right, truncate};
 
 pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     let t = app.theme;
@@ -25,11 +26,28 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         } else {
             app.view.empty_hint().to_string()
         };
-        let p = Paragraph::new(Line::from(Span::styled(
+        let mut lines = vec![Line::from(Span::styled(
             format!("  {msg}"),
             Style::new().fg(t.muted),
-        )));
-        f.render_widget(p, area);
+        ))];
+        // Under a filter the way out is to clear it; pointing at another view
+        // would only lead to the same filter there.
+        if !app.filter.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::new()),
+                Span::styled("esc", Style::new().fg(t.fg)),
+                Span::styled(" clears the filter", Style::new().fg(t.muted)),
+            ]));
+        } else if let Some((view, count, key)) = next_view(app) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {count} in {} — press ", view.title()),
+                    Style::new().fg(t.muted),
+                ),
+                Span::styled(key, Style::new().fg(t.fg)),
+            ]));
+        }
+        f.render_widget(Paragraph::new(lines), area);
         return;
     }
 
@@ -46,7 +64,9 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         let line = match app.rows[i] {
             Row::Pr(pi) => {
                 let pr = &app.prs[pi];
-                pr_line(pr, app.worktree_for(pr), selected, width, now, &t)
+                // In Mine every author is you; give the title the room instead.
+                let authors = app.view != View::Mine;
+                pr_line(pr, app.worktree_for(pr), selected, authors, width, now, &t)
             }
             Row::Wt(wi) => {
                 let w = &app.worktrees[wi];
@@ -90,11 +110,26 @@ fn dim(selected: bool, t: &Theme) -> Color {
     if selected { t.fg } else { t.muted }
 }
 
-/// `▌ #4846  ✗ 2/14  ✔ ⌂  Give the read path a retry budget   octocat   3m`
+/// An empty view is a dead end unless it points somewhere. Suggest the first
+/// view worth visiting — Ready, then Mine, then All — that has something in it.
+fn next_view(app: &App) -> Option<(View, usize, String)> {
+    [View::Ready, View::Mine, View::All]
+        .into_iter()
+        .filter(|v| *v != app.view)
+        .find_map(|v| {
+            let count = app.count_for(v);
+            let pos = app.settings.views.iter().position(|x| *x == v)?;
+            (count > 0 && pos < 9).then(|| (v, count, (pos + 1).to_string()))
+        })
+}
+
+/// `▎#4846  ✗ 1/3   ✔ ⌂ Give the read path a retry budget      octocat     3m`
+#[allow(clippy::too_many_arguments)]
 fn pr_line(
     pr: &Pr,
     wt: Option<&Worktree>,
     selected: bool,
+    authors: bool,
     width: usize,
     now: i64,
     t: &Theme,
@@ -110,8 +145,17 @@ fn pr_line(
         ),
     ];
 
+    // The glyph carries the verdict. A passing count is kept — `✓ 2` on a draft
+    // says the full suite never ran — but muted, so a failure stands out.
     let (ci_text, ci_color) = ci_cell(pr, t);
-    spans.push(Span::styled(pad(&ci_text, 8), base.fg(ci_color)));
+    let (glyph, count) = ci_text.split_once(' ').unwrap_or((ci_text.as_str(), ""));
+    let count_color = if pr.rollup == CheckState::Success {
+        dim(selected, t)
+    } else {
+        ci_color
+    };
+    spans.push(Span::styled(format!("{glyph} "), base.fg(ci_color)));
+    spans.push(Span::styled(pad(count, 6), base.fg(count_color)));
 
     let (rv_glyph, rv_color) = review_cell(pr, t);
     spans.push(Span::styled(format!("{rv_glyph} "), base.fg(rv_color)));
@@ -125,10 +169,10 @@ fn pr_line(
 
     // Fixed columns consumed so far: 1 + 7 + 8 + 2 + 2.
     let left = 20;
-    let show_author = width >= 92;
+    let show_author = authors && width >= 92;
     let show_age = width >= 62;
-    let right = (if show_author { 14 } else { 0 }) + (if show_age { 5 } else { 0 });
-    let title_w = width.saturating_sub(left + right).max(8);
+    let right_w = (if show_author { 14 } else { 0 }) + (if show_age { 5 } else { 0 });
+    let title_w = width.saturating_sub(left + right_w).max(8);
 
     let title = if pr.is_draft {
         format!("draft · {}", pr.title)
@@ -147,11 +191,15 @@ fn pr_line(
     ));
 
     if show_author {
-        spans.push(Span::styled(pad(&pr.author, 14), base.fg(dim(selected, t))));
+        spans.push(Span::styled(
+            cell(&pr.author, 14),
+            base.fg(dim(selected, t)),
+        ));
     }
     if show_age {
+        // Right-aligned: ages read down a column as numbers.
         spans.push(Span::styled(
-            pad(&rel_time(pr.updated_at, now), 5),
+            format!("{} ", right(&rel_time(pr.updated_at, now), 4)),
             base.fg(dim(selected, t)),
         ));
     }
@@ -175,16 +223,13 @@ fn review_cell(pr: &Pr, t: &Theme) -> (&'static str, Color) {
     if pr.mergeable == Mergeable::Conflicting {
         return ("⚠", t.warn);
     }
+    // "Review required" is the resting state of nearly every open PR, so a
+    // glyph for it marks every row and tells you nothing. Only the states that
+    // change what you do next get one; the detail pane still spells it out.
     match pr.review_decision {
-        Some(d) => (
-            d.glyph(),
-            match d {
-                crate::model::ReviewDecision::Approved => t.success,
-                crate::model::ReviewDecision::ChangesRequested => t.failure,
-                crate::model::ReviewDecision::ReviewRequired => t.muted,
-            },
-        ),
-        None => (" ", t.muted),
+        Some(crate::model::ReviewDecision::Approved) => ("✔", t.success),
+        Some(crate::model::ReviewDecision::ChangesRequested) => ("✘", t.failure),
+        _ => (" ", t.muted),
     }
 }
 
@@ -220,10 +265,14 @@ fn wt_line(
     } else {
         w.name()
     };
-    spans.push(Span::styled(
-        pad(&name, 24),
-        base.fg(t.fg).add_modifier(Modifier::BOLD),
-    ));
+    // Bold only on the selected row, as in the PR list: a whole column of bold
+    // names has no hierarchy left in it.
+    let name_style = if selected {
+        base.fg(t.fg).add_modifier(Modifier::BOLD)
+    } else {
+        base.fg(t.fg)
+    };
+    spans.push(Span::styled(cell(&name, 24), name_style));
 
     let (pr_text, pr_color) = match (pr, merged) {
         (Some(p), _) => (
@@ -241,6 +290,8 @@ fn wt_line(
     spans.push(Span::styled(pad(&pr_text, 14), base.fg(pr_color)));
 
     let (drift, drift_color) = match state {
+        // A detached checkout has no branch to be local to or unpushed from.
+        _ if w.detached => (String::new(), t.muted),
         WtState::Removable => ("removable".to_string(), t.success),
         _ if st.unpushed > 0 => (st.drift(), t.warn),
         _ => (st.drift(), t.muted),
@@ -252,12 +303,12 @@ fn wt_line(
 
     let left = 1 + 2 + 24 + 14 + 10;
     let show_age = width >= 70;
-    let right = if show_age { 5 } else { 0 };
-    let rest_w = width.saturating_sub(left + right).max(8);
+    let right_w = if show_age { 5 } else { 0 };
+    let rest_w = width.saturating_sub(left + right_w).max(8);
 
     let rest = match (&w.branch, w.detached) {
         (Some(b), _) => b.clone(),
-        (None, true) => format!("detached at {}", truncate(&w.head, 8)),
+        (None, true) => format!("detached at {}", short_sha(&w.head)),
         _ => w.short_path(home),
     };
     spans.push(Span::styled(
@@ -270,8 +321,16 @@ fn wt_line(
             .last_commit_at
             .map(|ts| rel_time(ts, now))
             .unwrap_or_default();
-        spans.push(Span::styled(pad(&age, 5), base.fg(dim(selected, t))));
+        spans.push(Span::styled(
+            format!("{} ", right(&age, 4)),
+            base.fg(dim(selected, t)),
+        ));
     }
 
     Line::from(spans).style(base)
+}
+
+/// Seven characters, git's own short form — complete, so no ellipsis.
+pub fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
 }

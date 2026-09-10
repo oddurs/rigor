@@ -93,3 +93,15 @@ pub fn pad(s: &str, n: usize) -> String {
     let w = width(&t);
     format!("{t}{}", " ".repeat(n.saturating_sub(w)))
 }
+
+/// A column followed by more text: truncated one short of `n` so it always
+/// keeps a gutter. `pad` alone lets a full-width value run into its neighbour.
+pub fn cell(s: &str, n: usize) -> String {
+    pad(&truncate(s, n.saturating_sub(1)), n)
+}
+
+/// Right-aligned in `n` columns — for numbers read down a column, like ages.
+pub fn right(s: &str, n: usize) -> String {
+    let t = truncate(s, n);
+    format!("{}{t}", " ".repeat(n.saturating_sub(width(&t))))
+}

@@ -91,14 +91,6 @@ impl ReviewDecision {
         }
     }
 
-    pub fn glyph(self) -> &'static str {
-        match self {
-            Self::Approved => "✔",
-            Self::ChangesRequested => "✘",
-            Self::ReviewRequired => "◌",
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Approved => "approved",
