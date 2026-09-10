@@ -80,54 +80,38 @@ fn width_of(spans: &[Span]) -> usize {
     spans.iter().map(|s| crate::util::width(&s.content)).sum()
 }
 
-/// `▌rigor▐  acme/widget › ⎇ main                              @octocat  ⟳ 12s ago`
+/// ` rigor │ acme/widget  ⎇ main                                @octocat   ● 12s ago`
 ///
-/// The wordmark is a badge drawn in reverse video, so it takes its colours from
-/// the terminal's own palette. When the line is too narrow, context is dropped
-/// in order of how little it helps: the branch, then the user, then the status.
+/// No filled badge: hierarchy comes from value and weight. The wordmark takes
+/// the accent, a hairline sets it apart, and the repository is the one bold
+/// thing on the line. When the line is too narrow, context goes in order of
+/// how little it helps — the branch, then the user, then the status.
 fn draw_nav(f: &mut Frame, area: Rect, app: &App) {
     let t = app.theme;
     let muted = Style::new().fg(t.muted);
 
-    let badge = Span::styled(
-        " rigor ",
-        Style::new()
-            .fg(t.accent)
-            .add_modifier(Modifier::REVERSED | Modifier::BOLD),
-    );
-    let repo = Span::styled(
-        app.repo.slug(),
-        Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
-    );
-    let branch = app.repo.current_branch.as_ref().map(|b| {
-        [
-            Span::styled(" › ", Style::new().fg(t.border)),
-            Span::styled(format!("⎇ {b}"), muted),
-        ]
-    });
-
-    let status: Vec<Span> = if app.loading_prs || app.loading_wts {
-        vec![
-            Span::styled(
-                SPINNER[app.spinner % SPINNER.len()],
-                Style::new().fg(t.accent),
-            ),
-            Span::styled(" refreshing", muted),
-        ]
-    } else if app.last_refresh > 0 {
-        vec![Span::styled(
-            format!("⟳ {} ago", rel_time(app.last_refresh, now_secs())),
-            muted,
-        )]
-    } else {
-        Vec::new()
-    };
+    let head = [
+        Span::raw(" "),
+        Span::styled(
+            "rigor",
+            Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" │ ", Style::new().fg(t.border)),
+        Span::styled(
+            app.repo.slug(),
+            Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let branch = app
+        .repo
+        .current_branch
+        .as_ref()
+        .map(|b| [Span::raw("  "), Span::styled(format!("⎇ {b}"), muted)]);
+    let status = sync_status(app);
     let viewer = (!app.viewer.is_empty()).then(|| Span::styled(format!("@{}", app.viewer), muted));
 
-    let width = area.width as usize;
-    let (mut show_branch, mut show_viewer, mut show_status) = (true, true, true);
     let assemble = |sb: bool, sv: bool, ss: bool| -> (Vec<Span<'static>>, Vec<Span<'static>>) {
-        let mut left = vec![badge.clone(), Span::raw("  "), repo.clone()];
+        let mut left: Vec<Span> = head.to_vec();
         if sb && let Some(b) = &branch {
             left.extend(b.iter().cloned());
         }
@@ -137,7 +121,7 @@ fn draw_nav(f: &mut Frame, area: Rect, app: &App) {
         }
         if ss && !status.is_empty() {
             if !right.is_empty() {
-                right.push(Span::raw("  "));
+                right.push(Span::raw("   "));
             }
             right.extend(status.iter().cloned());
         }
@@ -147,17 +131,15 @@ fn draw_nav(f: &mut Frame, area: Rect, app: &App) {
         (left, right)
     };
 
-    let (mut left, mut right) = assemble(show_branch, show_viewer, show_status);
+    let width = area.width as usize;
+    let mut show = [true, true, true];
+    let (mut left, mut right) = assemble(true, true, true);
     for step in 0..3 {
         if width_of(&left) + width_of(&right) < width {
             break;
         }
-        match step {
-            0 => show_branch = false,
-            1 => show_viewer = false,
-            _ => show_status = false,
-        }
-        (left, right) = assemble(show_branch, show_viewer, show_status);
+        show[step] = false;
+        (left, right) = assemble(show[0], show[1], show[2]);
     }
 
     let gap = width.saturating_sub(width_of(&left) + width_of(&right));
@@ -166,8 +148,50 @@ fn draw_nav(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(left)), area);
 }
 
-/// ` Ready 2   Mine 14   Review 0   Blocked 9   All 33   Worktrees 49      sort recent `
-/// `──────────━━━━━━━━━────────────────────────────┬───────────────────────────────────`
+/// A coloured dot that answers "can I trust what I'm looking at?": green when
+/// fresh, amber once the data is older than two refresh intervals (ten minutes
+/// when auto-refresh is off), red when the last sync failed. A spinner while a
+/// sync is in flight.
+fn sync_status(app: &App) -> Vec<Span<'static>> {
+    let t = app.theme;
+    let muted = Style::new().fg(t.muted);
+    if app.loading_prs || app.loading_wts {
+        return vec![
+            Span::styled(
+                SPINNER[app.spinner % SPINNER.len()],
+                Style::new().fg(t.accent),
+            ),
+            Span::styled(" syncing", muted),
+        ];
+    }
+    if app.error.is_some() {
+        return vec![
+            Span::styled("●", Style::new().fg(t.failure)),
+            Span::styled(" sync failed", muted),
+        ];
+    }
+    if app.last_refresh == 0 {
+        return Vec::new();
+    }
+    let now = now_secs();
+    let age = now - app.last_refresh;
+    let every = app.settings.refresh_secs as i64;
+    let stale = if every > 0 {
+        age > every * 2
+    } else {
+        age > 600
+    };
+    vec![
+        Span::styled(
+            "●",
+            Style::new().fg(if stale { t.pending } else { t.success }),
+        ),
+        Span::styled(format!(" {} ago", rel_time(app.last_refresh, now)), muted),
+    ]
+}
+
+/// ` Ready 2   Mine 14   Review 0   Blocked 9   All 33   Worktrees 49        ↕ recent `
+/// `─━━━━━━━──────────────────────────────────────┬────────────────────────────────────`
 ///
 /// Tabs carry a title and a count and nothing else. Key numbers used to sit in
 /// front of each title, which put two bare digits side by side (`Ready 2  2
@@ -181,11 +205,7 @@ fn draw_subnav(f: &mut Frame, area: Rect, rail: Rect, app: &mut App, divider_x: 
     for v in app.settings.views.clone() {
         let count = app.count_for(v);
         let active = v == app.view;
-        let base = if active {
-            Style::new().bg(t.sel_bg)
-        } else {
-            Style::new()
-        };
+        let base = Style::new();
         let title_style = if active {
             base.fg(t.accent).add_modifier(Modifier::BOLD)
         } else {
@@ -216,14 +236,22 @@ fn draw_subnav(f: &mut Frame, area: Rect, rail: Rect, app: &mut App, divider_x: 
             // The hitbox covers the tab and its stretch of rail, so the target
             // is two rows tall.
             app.hits.tabs.push((Rect::new(x, area.y, visible, 2), v));
+            // The underline hugs the label, not the padding around it.
             if active {
-                underline = Some((x, visible));
+                let label = w.saturating_sub(2);
+                underline = Some((x + 1, label.min(visible.saturating_sub(1))));
             }
         }
         x = x.saturating_add(w + 1);
     }
 
     let mut right: Vec<Span> = Vec::new();
+    if !app.filter.is_empty() && !app.filter_mode {
+        right.push(Span::styled(
+            format!("/{}   ", app.filter),
+            Style::new().fg(t.accent),
+        ));
+    }
     let removable = app.removable_count();
     if removable > 0 {
         right.push(Span::styled("⌫ ", Style::new().fg(t.success)));
@@ -232,8 +260,9 @@ fn draw_subnav(f: &mut Frame, area: Rect, rail: Rect, app: &mut App, divider_x: 
             Style::new().fg(t.muted),
         ));
     }
+    right.push(Span::styled("↕ ", Style::new().fg(t.border)));
     right.push(Span::styled(
-        format!("sort {} ", app.sort.label()),
+        format!("{} ", app.sort.label()),
         Style::new().fg(t.muted),
     ));
 
@@ -392,12 +421,6 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     ] {
         spans.push(Span::styled(k.to_string(), Style::new().fg(t.accent)));
         spans.push(Span::styled(format!(" {d}  "), Style::new().fg(t.muted)));
-    }
-    if !app.filter.is_empty() {
-        spans.push(Span::styled(
-            format!("filter: {}", app.filter),
-            Style::new().fg(t.warn),
-        ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }

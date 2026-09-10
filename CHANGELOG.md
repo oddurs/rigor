@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a count only — key digits no longer sit beside counts — with Ready and
   Blocked counts coloured when non-zero. A rail beneath underlines the active
   view and joins the detail pane's divider. Number keys are listed in the footer.
+- The nav drops its filled badge: `rigor` takes the accent beside a hairline,
+  and the repository is the one bold thing on the line. Sync status is a dot —
+  green when fresh, amber when stale, red when the last sync failed.
+- The tab underline hugs the label, and an active filter shows in the subnav
+  instead of the footer.
+- The selected row is a full-width band mixed from the terminal's own reported
+  colours (OSC 10/11), with a slim accent bar at its edge. Hairlines are mixed
+  the same way. Terminals that do not report their colours keep the bar and a
+  bolder line, with no band.
 
 ### Added
 

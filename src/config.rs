@@ -330,9 +330,10 @@ worktree_status = true     # off skips per-worktree git status on very large rep
 # fg      = "inherit"
 # bg      = "inherit"
 
-# The selected row is marked with an accent bar and a brighter, bolder line
-# rather than a coloured band, so it cannot clash with your terminal theme.
-# Set sel_bg (and sel_fg) if you would rather have a band:
-# sel_bg  = "8"        # ANSI bright-black, i.e. whatever your theme calls it
-# sel_fg  = "inherit"
+# The selected row's band and the hairlines are mixed from the colours your
+# terminal reports for itself, so they sit inside your theme. Terminals that
+# do not report them get no band: an accent bar and a bolder line instead.
+# Set either to pin it:
+# sel_bg  = "#2b2d31"
+# border  = "8"        # ANSI bright-black, i.e. whatever your theme calls it
 "##;
