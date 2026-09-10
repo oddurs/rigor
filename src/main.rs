@@ -128,7 +128,7 @@ fn main() -> Result<()> {
     let (mut a, rx) = App::new(repo, settings, theme);
     let result = run(&mut term, &mut a, rx);
     restore(&mut term, mouse)?;
-    proc::kill_all();
+    proc::shutdown();
     result
 }
 
@@ -144,15 +144,11 @@ fn run(
     loop {
         term.draw(|f| ui::draw(f, a))?;
 
-        // Fast while something is loading, so the spinner turns; slower when
-        // idle, where the only thing moving on screen is a clock in seconds.
-        // Input still returns at once either way.
-        let wait = if a.loading_prs || a.loading_wts {
-            120
-        } else {
-            500
-        };
-        if poll(Duration::from_millis(wait))? {
+        // Short enough that a SIGTERM or SIGHUP is honoured well inside the
+        // grace period a terminal or supervisor gives before SIGKILL — which
+        // would orphan any git or gh call still in flight. Idle, this costs
+        // about 0.2% of a core; input returns at once regardless.
+        if poll(Duration::from_millis(100))? {
             match read()? {
                 Event::Key(k) => {
                     // Ctrl-C always quits, even mid-filter.
