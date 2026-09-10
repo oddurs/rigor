@@ -72,8 +72,12 @@ palette down at launch. `NO_COLOR` is honoured.
 
 ## Development
 
-All automation goes through two scripts. Neither one needs you to know it is a
-Rust project.
+Requires a Rust toolchain and Node 22+ with pnpm — the landing page and docs in
+`site/` are a Next.js app styled with StyleX, and `scripts/task` covers both
+stacks.
+
+All automation goes through two scripts. Neither one needs you to know what they
+are written in.
 
 ```sh
 scripts/setup                 # once after cloning: wires git hooks, verifies green
@@ -85,6 +89,21 @@ scripts/agent pr              # check, push, open the pull request
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, and
 [CLAUDE.md](CLAUDE.md) for the contract agents work under.
+
+### The site
+
+`site/` is a single static page — landing and docs — built with Next.js and
+StyleX and exported to plain HTML.
+
+```sh
+cd site
+pnpm install
+pnpm dev      # http://localhost:3000
+pnpm build    # static export into site/out
+```
+
+StyleX compiles through Babel and PostCSS rather than Turbopack, so the `dev`
+and `build` scripts pass `--webpack` explicitly.
 
 ## License
 
