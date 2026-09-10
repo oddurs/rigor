@@ -201,7 +201,8 @@ cmd_pr() {
 	if [ "$(git rev-list --count "origin/$base..HEAD")" = '1' ]; then
 		title=$(git log -1 --format='%s')
 	else
-		title="${branch%%/*}: $(printf '%s' "${branch#*/}" | tr '-_' '  ')"
+		# '_-' not '-_': BSD tr reads a leading dash as an option flag.
+		title="${branch%%/*}: $(printf '%s' "${branch#*/}" | tr '_-' '  ')"
 	fi
 	say 'opening the pull request'
 	# shellcheck disable=SC2086
