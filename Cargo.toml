@@ -9,7 +9,18 @@ license = "MIT"
 readme = "README.md"
 keywords = ["tui", "github", "pull-request", "ci", "worktree"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["/.github", "/.githooks", "/scripts"]
+# What `cargo package` ships: the program, plus what its unit tests read. The
+# integration tests drive scripts/ and .githooks/ and stay in the repository.
+include = [
+  "/src",
+  "/tests/fixtures",
+  "/proptest-regressions",
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/README.md",
+  "/LICENSE",
+  "/CHANGELOG.md",
+]
 
 [dependencies]
 anyhow = "1.0.104"
