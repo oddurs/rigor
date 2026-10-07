@@ -1,6 +1,7 @@
 //! Rendering. Every frame also records the screen regions it drew into
 //! (`app.hits`) so the mouse handler can turn a click back into a row.
 
+mod confirm;
 mod detail;
 mod help;
 mod list;
@@ -15,6 +16,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{App, DraftPr, Hits, Mode};
 use crate::config::{LayoutMode, View};
+use crate::drafts;
 use crate::util::{cols, now_secs, rel_time, secs};
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -53,11 +55,17 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     // Three rows of chrome: a top nav (who and where), a subnav (the views),
     // and a rail that underlines the active view and separates chrome from
     // content.
-    let [nav, subnav, rail, body, footer] = Layout::vertical([
+    // What went wrong with a post gets rows of its own above the footer, for
+    // as long as it stands: whatever mode the footer is in, it is not hidden.
+    let failure = app.post_error.as_ref().map_or_else(Vec::new, |e| {
+        crate::util::wrap(e, usize::from(area.width).saturating_sub(4).max(10))
+    });
+    let [nav, subnav, rail, body, alert, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(3),
+        Constraint::Length(cols(failure.len().min(3))),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -65,15 +73,37 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     // Laid out before the chrome is drawn so the rail knows where the detail
     // pane's divider will meet it.
     let split = body_layout(app, body);
+    confirm::settle(area, app);
 
     draw_nav(f, nav, app);
     draw_subnav(f, subnav, rail, app, split.divider_x, split.list);
     draw_body(f, split, app);
+    draw_failure(f, alert, &failure, app);
     draw_footer(f, footer, app);
 
     if app.mode == Mode::Help {
         help::draw(f, area, app);
     }
+    if app.armed.is_some() {
+        confirm::draw(f, area, app);
+    }
+}
+
+/// Why the last attempt to post sent nothing, or what is not known about it.
+fn draw_failure(f: &mut Frame<'_>, area: Rect, message: &[String], app: &App) {
+    let style = Style::new().fg(app.theme.failure);
+    let lines: Vec<Line<'_>> = message
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let mark = if i == 0 { " ✗ " } else { "   " };
+            Line::from(vec![
+                Span::styled(mark, style),
+                Span::styled(l.clone(), style),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn width_of(spans: &[Span<'_>]) -> usize {
@@ -435,11 +465,67 @@ fn draw_body(f: &mut Frame<'_>, split: BodySplit, app: &mut App) {
     detail::draw(f, detail_area, app);
 }
 
+/// What the footer says in place of its keys when something needs answering
+/// or went wrong. A question about sending something public outranks
+/// everything else the line could say, and stays until it is answered.
+fn footer_alert(app: &App) -> Option<Line<'static>> {
+    let t = app.theme;
+    if let Some(armed) = &app.armed {
+        // The list has not seen an unverified draft's pull request, and the
+        // prompt must not read as if it had.
+        let caveat = if armed.state == drafts::State::Unverified {
+            " not fetched here, so GitHub is asked for its head first."
+        } else {
+            ""
+        };
+        // Nothing is posted unread, or from a window that cannot show it:
+        // until all of it has been on screen, `Y` is not offered.
+        let unread = armed.unread();
+        let keys = if armed.cramped {
+            " the window is too small to show it: enlarge it to post; esc cancels".to_string()
+        } else if unread > 0 {
+            let rows = if unread == 1 { "row" } else { "rows" };
+            format!(" {unread} {rows} still to read (j / k), then Y posts; esc cancels")
+        } else {
+            " Y to post, esc to cancel".to_string()
+        };
+        return Some(Line::from(vec![
+            Span::styled(
+                format!(" post {} to #{}?", armed.draft.describe(), armed.number),
+                Style::new().fg(t.pending).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{caveat}{keys}"), Style::new().fg(t.muted)),
+        ]));
+    }
+    let e = app.error.as_ref()?;
+    Some(Line::from(vec![
+        Span::styled(" ✗ ", Style::new().fg(t.failure)),
+        Span::styled(e.clone(), Style::new().fg(t.failure)),
+    ]))
+}
+
+/// Quit was asked for with a post in flight, and is waiting on it.
+fn quitting_line(app: &App) -> Option<Line<'static>> {
+    let posting = app.posting.as_ref().filter(|_| app.quitting)?;
+    Some(Line::from(Span::styled(
+        format!(
+            " finishing the post to #{} before quitting…",
+            posting.number
+        ),
+        Style::new().fg(app.theme.pending),
+    )))
+}
+
 /// The footer is the command line. It uses no filled badges — the same rule as
 /// the nav — and it only offers actions that would do something right now.
 fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
     let t = app.theme;
     let muted = Style::new().fg(t.muted);
+
+    if let Some(line) = quitting_line(app) {
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
 
     if app.mode == Mode::Filter {
         // A live count is the point of typing a filter: see the list narrow.
@@ -457,11 +543,7 @@ fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    if let Some(e) = &app.error {
-        let line = Line::from(vec![
-            Span::styled(" ✗ ", Style::new().fg(t.failure)),
-            Span::styled(e.clone(), Style::new().fg(t.failure)),
-        ]);
+    if let Some(line) = footer_alert(app) {
         f.render_widget(Paragraph::new(line), area);
         return;
     }
@@ -500,6 +582,20 @@ fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let mut left: Vec<Vec<Span<'_>>> = vec![key(&view_keys, "view")];
+    if let Some(entry) = app.selected_draft() {
+        let state = app.draft_state(entry);
+        if matches!(state, drafts::State::Ready | drafts::State::Unverified) {
+            left.push(key("a", "post"));
+        }
+        left.push(key("e", "edit"));
+        match state {
+            drafts::State::Skipped => left.push(key("x", "unskip")),
+            drafts::State::Posted | drafts::State::Invalid => {}
+            drafts::State::Ready | drafts::State::Stale | drafts::State::Unverified => {
+                left.push(key("x", "skip"));
+            }
+        }
+    }
     if has_pr || has_merged || draft_merged {
         left.push(key("o", "open"));
     }

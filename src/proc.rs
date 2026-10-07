@@ -6,7 +6,7 @@
 //! stalled call is killed, reported, and the next refresh goes ahead.
 
 use anyhow::{Context, Result, bail};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -83,21 +83,37 @@ pub enum Priority {
 }
 
 pub fn run(cmd: &mut Command, timeout: Duration, priority: Priority) -> Result<Output> {
-    run_in(&REGISTRY, cmd, timeout, priority)
+    run_in(&REGISTRY, cmd, None, timeout, priority)
+}
+
+/// Like `run`, with `input` written to the child's stdin, which is then
+/// closed.
+pub fn run_with_input(
+    cmd: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+    priority: Priority,
+) -> Result<Output> {
+    run_in(&REGISTRY, cmd, Some(input), timeout, priority)
 }
 
 fn run_in(
     reg: &Registry,
     cmd: &mut Command,
+    input: Option<&[u8]>,
     timeout: Duration,
     priority: Priority,
 ) -> Result<Output> {
     if reg.lock().closed {
         bail!("rigor is shutting down");
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
 
     #[cfg(unix)]
     {
@@ -140,6 +156,14 @@ fn run_in(
     }
     let mut stdout = child.stdout.take().context("no stdout pipe")?;
     let mut stderr = child.stderr.take().context("no stderr pipe")?;
+    // Fed from a thread of its own, as the output is drained: a child that
+    // stops reading must run into the deadline, not block rigor on a full
+    // pipe. The pipe closes when the thread is done with it.
+    if let (Some(mut stdin), Some(bytes)) = (child.stdin.take(), input.map(<[u8]>::to_vec)) {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+    }
     // Drain both pipes while waiting, so a chatty child never blocks on a full one.
     let out = std::thread::spawn(move || {
         let mut v = Vec::new();
@@ -201,6 +225,34 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stderr), "oops\n");
     }
 
+    /// `cat` only exits once its stdin is closed, so getting the bytes back at
+    /// all shows both halves: the input arrived, and the pipe was shut.
+    #[test]
+    fn input_reaches_the_child_and_its_stdin_is_closed() {
+        let out = run_with_input(
+            &mut Command::new("cat"),
+            b"{\"event\":\"APPROVE\"}",
+            Duration::from_secs(5),
+            Priority::Normal,
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"{\"event\":\"APPROVE\"}");
+    }
+
+    /// Without input a child still gets no stdin at all: it must not sit
+    /// waiting on rigor's terminal.
+    #[test]
+    fn without_input_a_child_reads_nothing() {
+        let out = run(
+            &mut Command::new("cat"),
+            Duration::from_secs(5),
+            Priority::Normal,
+        )
+        .unwrap();
+        assert!(out.status.success() && out.stdout.is_empty());
+    }
+
     #[test]
     fn a_stalled_command_is_killed_at_the_deadline() {
         let start = Instant::now();
@@ -229,6 +281,7 @@ mod tests {
             run_in(
                 &r2,
                 Command::new("sh").args(["-c", "sleep 30; true"]),
+                None,
                 Duration::from_secs(60),
                 Priority::Background,
             )
@@ -246,6 +299,7 @@ mod tests {
         let after = run_in(
             &reg,
             &mut Command::new("true"),
+            None,
             Duration::from_secs(5),
             Priority::Normal,
         );

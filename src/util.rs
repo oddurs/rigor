@@ -6,6 +6,7 @@ use unicode_width::UnicodeWidthStr;
 #[cfg(test)]
 thread_local! {
     static FROZEN: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    static FROZEN_MILLIS: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Pin the clock for the current test thread, so rendered ages and durations
@@ -25,6 +26,27 @@ pub fn secs(n: u64) -> i64 {
 /// A count or width as a terminal coordinate, saturating at the largest one.
 pub fn cols(n: usize) -> u16 {
     u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+/// Milliseconds on a clock that only runs forwards, for telling how far
+/// apart two things in this process happened. Not a time of day.
+pub fn now_millis() -> i64 {
+    #[cfg(test)]
+    if let Some(at) = FROZEN_MILLIS.with(std::cell::Cell::get) {
+        return at;
+    }
+    i64::try_from(START.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Where `now_millis` counts from: the first time anyone asked.
+static START: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// Pin `now_millis` for the current test thread, so a test can put two
+/// keypresses a known distance apart without sleeping.
+#[cfg(test)]
+pub fn freeze_millis(at: i64) {
+    FROZEN_MILLIS.with(|f| f.set(Some(at)));
 }
 
 pub fn now_secs() -> i64 {
@@ -122,6 +144,27 @@ const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+/// The inverse of `parse_iso8601`: an epoch second as RFC 3339 in UTC.
+pub fn format_iso8601(ts: i64) -> String {
+    let (days, secs) = (ts.div_euclid(86400), ts.rem_euclid(86400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
 }
 
 /// Compact age: `12s`, `4m`, `3h`, `2d`, `5w`.
@@ -344,26 +387,5 @@ mod tests {
         fn rel_time_never_panics_and_stays_short(a in any::<i32>(), b in any::<i32>()) {
             prop_assert!(rel_time(i64::from(a), i64::from(b)).len() <= 8);
         }
-    }
-
-    /// The inverse of `parse_iso8601`, for the round-trip property only.
-    fn format_iso8601(ts: i64) -> String {
-        let (days, secs) = (ts.div_euclid(86400), ts.rem_euclid(86400));
-        // Howard Hinnant's civil_from_days.
-        let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z - era * 146_097;
-        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let y = yoe + era * 400 + i64::from(m <= 2);
-        format!(
-            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-            secs / 3600,
-            (secs % 3600) / 60,
-            secs % 60
-        )
     }
 }

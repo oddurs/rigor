@@ -25,4 +25,4 @@ expression: "render(&mut a, 160, 24)"
                                                                                              │
                                                                                              │
                                                                                              │
- 1–7 view   o open   c checks   y copy   / filter   s sort   r refresh                                                                          ? help   q quit
+ 1–7 view   a post   e edit   x skip   o open   c checks   y copy   / filter   s sort   r refresh                                               ? help   q quit

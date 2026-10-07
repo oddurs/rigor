@@ -1,0 +1,24 @@
+---
+source: src/ui/tests.rs
+expression: "render(&mut o.a, 120, 20)"
+---
+ rigor │ acme/widget  ⎇ chore/release-notes                                                                    @octocat
+ Ready 1   Mine 2 ┌ this is what will be posted ─────────────────────────────────────────────────────┐rafted   ↕ recent
+──────────────────│ #4840 Move the palette onto color tokens                                         │──────────────────
+ #4846  approve   │                                                                                  │    +220 −24   3m
+▎#4840  approve +1│  verdict   approve                                                               │    +220 −24   2h
+ #4801  ✓ posted  │  body      Paragraph 1 of the review.                                            │    +220 −24   3d
+ #4700  stale     │            Paragraph 2 of the review.                                            │               4d
+ #4701  skipped   │            Paragraph 3 of the review.                                            │               5d
+ #4980  invalid   │            Paragraph 4 of the review.                                            │
+ #4990  unverified│            Paragraph 5 of the review.                                            │
+                  │            Paragraph 6 of the review.                                            │
+──────────────────│            Paragraph 7 of the review.                                            │──────────────────
+ #4840 Move the pa│            Paragraph 8 of the review.                                            │
+ octocat · 2h ago │            Paragraph 9 of the review.                                            │
+  picked    PRIVAT│            Paragraph 10 of the review.                                           │
+  verdict   approv│            Paragraph 11 of the review.                                           │
+  body      Paragr│            Paragraph 12 of the review.                                           │
+            Paragr│            Paragraph 13 of the review.                                           │
+            Paragr└ 29 rows still to read · j / k ───────────────────────────────────────────────────┘ ↓ more below · J
+ post approve with 1 inline comment to #4840? 29 rows still to read (j / k), then Y posts; esc cancels

@@ -19,15 +19,16 @@ use clap::Parser;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event, KeyCode,
-    KeyModifiers, poll, read,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyModifiers, poll, read,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use std::ffi::OsString;
 use std::io::{Stdout, Write, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use app::App;
@@ -133,10 +134,45 @@ fn main() -> Result<()> {
     };
     let (mut a, rx) = App::new(repo, settings, theme);
     a.drafts_dir = drafts::dir(|key| std::env::var_os(key));
-    let result = run(&mut term, &mut a, &rx);
+    a.remote = std::sync::Arc::new(github::Gh {
+        owner: a.repo.owner.clone(),
+        name: a.repo.name.clone(),
+    });
+    // The loop's result goes straight through `leave`, however it ended, so
+    // that a post in flight is let finish before `proc::shutdown` would kill
+    // `gh` in the middle of one.
+    let ended = run(&mut term, &mut a, &rx);
+    let limit = github::gh_timeout() + QUIT_MARGIN;
+    let (result, said) = a.leave(ended, &rx, limit, |a| {
+        let _ = term.draw(|f| ui::draw(f, a));
+    });
+    if said.is_some() {
+        discard_typed_ahead();
+    }
     restore(&mut term, mouse);
     proc::shutdown();
+    // The screen that would have said how the post went is gone, so say it
+    // where it can still be read. If that cannot be written either, the file
+    // already has been.
+    if let Some(said) = said {
+        let _ = writeln!(std::io::stderr(), "rigor: {said}");
+    }
     result
+}
+
+/// How much longer than one call to GitHub the way out will wait for a post
+/// in flight, all told.
+const QUIT_MARGIN: Duration = Duration::from_secs(5);
+
+/// Keys struck while rigor waited on its way out were for rigor, not for the
+/// shell it is about to hand the terminal back to. Dropped unread.
+fn discard_typed_ahead() {
+    #[cfg(unix)]
+    // SAFETY: tcflush(3) takes a file descriptor and a constant, touches no
+    // memory, and only discards input not yet read.
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
 }
 
 fn parse_view(name: &str) -> Result<View, String> {
@@ -170,10 +206,15 @@ fn run(
                     }
                 }
                 Event::Mouse(m) => input.mouse(a, m),
+                Event::Paste(text) => event::paste(a, &text),
                 Event::FocusGained => a.set_focus(true),
                 Event::FocusLost => a.set_focus(false),
-                _ => {}
+                Event::Resize(..) => {}
             }
+        }
+
+        if let Some(path) = a.edit_request.take() {
+            edit(term, a, &path)?;
         }
 
         while let Ok(msg) = rx.try_recv() {
@@ -215,11 +256,14 @@ fn setup(mouse: bool) -> Result<(Terminal<CrosstermBackend<Stdout>>, probe::Prob
     // buffer, so anything already on screen would survive wherever the frame is
     // blank. Clear here rather than with `Terminal::clear`, which first asks the
     // terminal for its cursor position and fails on any host that won't answer.
+    // Bracketed paste, so that pasted text arrives as a paste and not as a
+    // run of keypresses that could ask to post and then confirm.
     execute!(
         out,
         EnterAlternateScreen,
         Clear(ClearType::All),
-        EnableFocusChange
+        EnableFocusChange,
+        EnableBracketedPaste
     )?;
     if mouse {
         execute!(out, EnableMouseCapture)?;
@@ -236,6 +280,7 @@ fn setup(mouse: bool) -> Result<(Terminal<CrosstermBackend<Stdout>>, probe::Prob
         let mut out = stdout();
         let _ = execute!(
             out,
+            DisableBracketedPaste,
             DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
@@ -253,9 +298,77 @@ fn restore(term: &mut Terminal<CrosstermBackend<Stdout>>, mouse: bool) {
     if mouse {
         let _ = execute!(term.backend_mut(), DisableMouseCapture);
     }
-    let _ = execute!(term.backend_mut(), DisableFocusChange, LeaveAlternateScreen);
+    let _ = execute!(
+        term.backend_mut(),
+        DisableBracketedPaste,
+        DisableFocusChange,
+        LeaveAlternateScreen
+    );
     let _ = disable_raw_mode();
     let _ = term.show_cursor();
+}
+
+/// Take the terminal back after `restore`, for the editor's return.
+fn resume(term: &mut Terminal<CrosstermBackend<Stdout>>, mouse: bool) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        term.backend_mut(),
+        EnterAlternateScreen,
+        Clear(ClearType::All),
+        EnableFocusChange,
+        EnableBracketedPaste
+    )?;
+    if mouse {
+        execute!(term.backend_mut(), EnableMouseCapture)?;
+    }
+    term.hide_cursor()?;
+    // The editor drew over every cell, and ratatui repaints only what changed
+    // since its own last frame. `resize` starts it from a blank one — and,
+    // unlike `Terminal::clear`, without asking the terminal for its cursor.
+    let size = term.size()?;
+    term.resize(size.into())?;
+    Ok(())
+}
+
+/// `e` on a draft: hand the terminal to the user's editor for that one file,
+/// take it back, and read the file again — whatever it now says.
+fn edit(term: &mut Terminal<CrosstermBackend<Stdout>>, a: &mut App, path: &Path) -> Result<()> {
+    let mouse = a.settings.mouse;
+    let command = editor(|key| std::env::var_os(key));
+    restore(term, mouse);
+    let ran = run_editor(&command, path);
+    resume(term, mouse)?;
+    match ran {
+        Ok(status) if status.success() => {}
+        Ok(status) => a.note(format!("`{command}` ended with {status}")),
+        Err(e) => a.note(format!("could not run `{command}`: {e}")),
+    }
+    a.reload_drafts();
+    Ok(())
+}
+
+/// `$VISUAL`, else `$EDITOR`, else `vi`. A variable set to nothing counts as
+/// unset.
+fn editor(env: impl Fn(&str) -> Option<OsString>) -> String {
+    ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(env)
+        .map(|v| v.to_string_lossy().trim().to_string())
+        .find(|v| !v.is_empty())
+        .unwrap_or_else(|| "vi".into())
+}
+
+/// Split into words like `open_command`, with the file as the last argument.
+/// The editor gets the terminal itself: rigor has stepped out of the way.
+fn run_editor(command: &str, path: &Path) -> std::io::Result<std::process::ExitStatus> {
+    let mut parts = command.split_whitespace();
+    let bin = parts
+        .next()
+        .ok_or_else(|| std::io::Error::other("the command is empty"))?;
+    std::process::Command::new(bin)
+        .args(parts)
+        .arg(path)
+        .status()
 }
 
 fn init_config() -> Result<()> {
@@ -329,5 +442,20 @@ mod tests {
         }
         assert!(parse_view("nope").unwrap_err().contains("worktrees"));
         assert_eq!(parse_view("Ready"), Ok(View::Ready));
+    }
+
+    #[test]
+    fn the_editor_is_visual_then_editor_then_vi() {
+        let pick = |vars: &[(&str, &str)]| {
+            editor(|key| {
+                vars.iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| OsString::from(v))
+            })
+        };
+        assert_eq!(pick(&[("VISUAL", "hx"), ("EDITOR", "nano")]), "hx");
+        assert_eq!(pick(&[("EDITOR", "nano -w")]), "nano -w");
+        assert_eq!(pick(&[("VISUAL", " "), ("EDITOR", "nano")]), "nano");
+        assert_eq!(pick(&[]), "vi");
     }
 }

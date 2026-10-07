@@ -16,7 +16,9 @@ mergeable right now, and knowing which of your local worktrees still matter.
 `rigor` answers both in one screen, and stays out of the way of the merge button.
 
 It reads everything through the `gh` CLI, so it inherits your existing
-authentication and never asks for a token.
+authentication and never asks for a token. The one thing it ever sends to
+GitHub is a [review draft](#review-drafts) you chose to post, and only on a
+confirmed keypress.
 
 ## Install
 
@@ -51,8 +53,9 @@ repository's pull requests: add `drafts` to `views`, or run `rigor -v drafts`.
 
 Keys: `o`/`Enter` opens the selected pull request in the browser, `c` its checks
 page, `y` copies the URL, `/` filters, `s` toggles between recency and
-merge-readiness ordering, `d` shows or hides drafts, `r` refreshes, `?` lists
-everything.
+merge-readiness ordering, `d` shows or hides draft pull requests, `r` refreshes,
+`?` lists everything. In the `Drafts` view, `a` asks to post the selected review
+draft and `Y` (capital) then posts it, `e` edits it and `x` skips it.
 
 CI shows as a rolled-up glyph with counts in each row (`✓ 19`, `✗ 1/19`,
 `◐ 15/19`); selecting a pull request expands every check run with its state and
@@ -103,8 +106,9 @@ inline comments ride along — or the one word for why it cannot be sent:
 | State | Meaning |
 |---|---|
 | `stale` | The pull request has moved on from the commit the draft was written against |
-| `unverified` | The pull request is not among those `rigor` fetched, so its head is not known |
+| `unverified` | The pull request is not among those `rigor` fetched, so its head is not known until you post, when GitHub is asked |
 | `invalid` | The file is not a draft `rigor` understands; the detail pane says why |
+| `maybe sent` | The review was sent and no answer came back; `a` asks GitHub before sending anything again |
 | `✓ posted`, `skipped` | Already decided |
 
 Selecting a draft shows it in the detail pane, with `note` marked as private.
@@ -116,6 +120,95 @@ Every field is required and, as in the config file, an unknown key, value or
 `version` is an error, not silently ignored. Timestamps are RFC 3339, with `Z`
 or a numeric offset. Only a regular file of at most 256 KB is read; a symbolic
 link, or anything else under a draft's name, is listed as `invalid`.
+
+### Posting a draft
+
+Posting is public and under your name, so it takes two different keys, and the
+second asks GitHub before it sends anything.
+
+`a` only asks. It opens an overlay showing exactly what would be posted, and
+nothing else: the pull request's number and title, the verdict, the body, and
+each inline comment at its `path:line`. Nothing in it is cut short — a long
+path wraps — and the private `note` and `picked` are not in it, because they
+are not sent. The footer names the action:
+
+```
+post approve to #101? Y to post, esc to cancel
+```
+
+Capital `Y` goes ahead, under three conditions:
+
+- **It answers a question you have had time to see.** A `Y` in the first
+  400 ms after the overlay appears is ignored, so keys typed ahead are not an
+  answer. Pasted text never asks and never answers. And the key that asks is
+  not the key that answers: a second `a`, or an `a` held down, only takes the
+  overlay down again. Nor is the answer a letter an ordinary word contains:
+  lowercase `y` takes the overlay down like any other key, so "today" typed
+  into the wrong window asks and then takes it back.
+- **You have been shown all of it.** A draft longer than the overlay scrolls
+  inside it with `j` / `k`, and `Y` is turned away until every row of it has
+  been on screen; jumping to the end does not count for the rows in between.
+  In a window too small to show it without cutting something, the overlay asks
+  for a larger one and nothing is posted.
+- **It is still the question you were asked.** `esc` or any other key takes
+  the overlay down and does nothing else; so does a refresh that changes the
+  draft or its pull request, and thirty seconds without an answer or a scroll.
+  The question follows the draft's file, not its row, so a draft arriving
+  above it cannot slide another one under the key.
+
+Going ahead is a few reads, then at most one write:
+
+1. **The pull request, as it is right now.** One closed without being merged
+   takes no review. One that has moved on from the commit the draft was
+   written against takes none either, and its row turns `stale`. A merged one
+   still at that commit is fine.
+2. **Its reviews.** If this same review is already there from you — the same
+   verdict, commit and body, and the same inline comments, which are read back
+   to make sure — then it was sent: a post that timed out, or that you quit in
+   the middle of, landed after all. The draft is marked `posted` and nothing
+   goes out. If you have submitted some other review since the draft was
+   written, or have one started in the browser and not submitted, nothing goes
+   out and the draft stays as it is: skip it, or finish in the browser. No key
+   sends it anyway.
+3. **Only then, the review**: the verdict, the body and the inline comments,
+   pinned to that commit, in one `gh api` call.
+
+If any read fails, nothing is sent. The list only decides what is offered: the
+window in which a pull request can move under a draft is the moment between
+those reads and the write, not the refresh interval. That is also why an
+`unverified` draft can be posted — the prompt says the list has not seen its
+pull request, and the first read checks it. `stale`, `invalid`, skipped and
+already posted drafts are never offered; `a` says why.
+
+What happens next depends on GitHub's answer:
+
+- **Accepted** — GitHub answers with the review it created: this verdict, on
+  this commit, under your name. Nothing less counts; `gh` exiting cleanly is
+  not evidence. The file's `status` becomes `posted` and `posted_at` is set.
+  Those are the only two fields `rigor` ever writes, and it replaces the file
+  in one step rather than writing over it. If the file was changed while the
+  review was on its way, what was sent is what is recorded, and you are told.
+- **Declined** — an approval it will not take, a comment on a line outside the
+  diff. GitHub's own message is shown, and stays until `esc` or the next
+  attempt. The file is left exactly as it was; edit the draft and it can be
+  sent.
+- **No answer** — a timeout, a dropped connection, an answer that is not the
+  review. The review may or may not be there, and `rigor` says so rather than
+  calling it a failure; the row reads `maybe sent`. Ask again with `a` and the
+  reads above settle it before anything is sent a second time.
+
+One attempt runs at a time. While it does, `e` and `x` leave that draft alone,
+and a second `rigor` on the same repository finds a lock beside the draft and
+stands back. However `rigor` is leaving — `q`, a signal, a terminal that went
+away — it waits for the answer and records it first, up to one call's timeout
+and a few seconds more; past that it goes, and says the outcome is not known.
+
+`e` opens the draft's file in `$VISUAL`, else `$EDITOR`, else `vi`, and reads
+it again when the editor exits. `x` skips a draft, or brings a skipped one
+back.
+
+This is the one thing `rigor` sends to GitHub. It still never merges anything,
+and never touches your git repository.
 
 ## Configuration
 

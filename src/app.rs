@@ -2,10 +2,11 @@
 //! clicks do to it.
 
 use ratatui::layout::Rect;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::config::{Settings, View};
@@ -17,12 +18,129 @@ use crate::model::{
 };
 use crate::schedule::{self, Schedule};
 use crate::theme::Theme;
-use crate::util::now_secs;
+use crate::util::{format_iso8601, now_millis, now_secs};
 
 pub enum Msg {
     Prs(Result<github::Fetched, String>),
     Worktrees(Result<Vec<Worktree>, String>),
     Statuses(Result<Vec<git::Scanned>, String>),
+    /// How the attempt in `App::posting` ended.
+    Posted(Result<drafts::Outcome, String>),
+}
+
+/// The remote an `App` starts with: none. Every call fails, so nothing is
+/// ever sent until `main` wires in `gh`.
+struct Unwired;
+
+impl drafts::Remote for Unwired {
+    fn pull(&self, _: u64) -> Result<drafts::Live, String> {
+        Err("GitHub is not wired up".into())
+    }
+    fn reviews(&self, _: u64, _: usize) -> Result<Vec<drafts::Review>, String> {
+        Err("GitHub is not wired up".into())
+    }
+    fn comments(&self, _: u64, _: usize) -> Result<Vec<drafts::Placed>, String> {
+        Err("GitHub is not wired up".into())
+    }
+    fn post(&self, _: u64, _: &str) -> Result<drafts::Review, drafts::PostFailure> {
+        Err(drafts::PostFailure::Declined(
+            "GitHub is not wired up".into(),
+        ))
+    }
+    fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(1)
+    }
+}
+
+/// The answer to the question counts only once the question has been on
+/// screen this long. Keys typed ahead, or struck in the same breath as the
+/// `a` that asked, are not an answer to something nobody has yet read.
+pub const ANSWER_FLOOR_MS: i64 = 400;
+
+/// A question nobody answers or reads withdraws itself after this long, so
+/// that a `Y` typed much later is not about it.
+pub const ARMED_FOR_MS: i64 = 30_000;
+
+/// A post waiting to be confirmed: a question on screen, and the overlay that
+/// shows what it is about.
+///
+/// It names its draft by file, and holds the draft as it was parsed when the
+/// question went up. That one value is what the overlay is drawn from and
+/// what the request is built from, so what was read is what is sent. Once the
+/// selected draft stops being that file with that text in that state, the
+/// question on screen is no longer the one a keypress would be answering, and
+/// it is withdrawn.
+///
+/// The question is asked with `a` and answered with `Y`: a different key, so
+/// that neither holding `a` down nor striking it twice can be the answer, and
+/// a capital, so that no ordinary word typed into the wrong window is.
+#[derive(Debug, Clone)]
+pub struct Armed {
+    pub path: PathBuf,
+    pub number: u64,
+    raw: String,
+    pub draft: drafts::Draft,
+    /// `Ready`, or `Unverified` for a pull request the last fetch did not
+    /// include. The prompt says which.
+    pub state: drafts::State,
+    /// When the question went up or was last read, on `now_millis`'s clock,
+    /// which stops while the machine sleeps —
+    at: i64,
+    /// — and on the wall clock, which does not: a question asked before the
+    /// lid closed is gone when it opens.
+    at_wall: i64,
+    /// When the overlay was first on screen. `None` until a frame has drawn
+    /// it; the floor is counted from here, not from the key that asked.
+    pub drawn_at: Option<i64>,
+    /// How far down the overlay is scrolled. Clamped as it is drawn.
+    pub scroll: u16,
+    /// Which rows of the overlay have been on screen since it opened, at the
+    /// width they were last laid out for. Nothing is posted until every one
+    /// has: reaching the end is not the same as having passed the middle.
+    pub seen: Vec<bool>,
+    /// The width `seen` was laid out for. At another width the rows are
+    /// other rows, and what was read of these says nothing about those.
+    pub seen_width: u16,
+    /// The window is too small for the overlay to show its rows whole.
+    /// Nothing is posted from a window that cannot show it.
+    pub cramped: bool,
+    /// A `Y` was turned away for either reason, so the overlay says it louder.
+    pub nudged: bool,
+}
+
+impl Armed {
+    /// How many rows of what would be posted have not been on screen yet.
+    pub fn unread(&self) -> usize {
+        self.seen.iter().filter(|seen| !**seen).count()
+    }
+
+    /// Whether all of it has been shown: the overlay has been drawn, in a
+    /// window large enough, and no row is still unread.
+    pub fn shown(&self) -> bool {
+        self.drawn_at.is_some() && !self.cramped && self.unread() == 0
+    }
+
+    /// Note that the question is being read: it has that much longer.
+    fn read_on(&mut self) {
+        self.at = now_millis();
+        self.at_wall = now_secs();
+    }
+
+    fn expired(&self) -> bool {
+        let wall = now_secs() - self.at_wall;
+        now_millis() - self.at >= ARMED_FOR_MS || wall >= ARMED_FOR_MS / 1000
+    }
+}
+
+/// An attempt in flight: which draft, and exactly what was read from it when
+/// it was confirmed. The file may change before the answer comes back; this
+/// is what the answer is about.
+#[derive(Debug, Clone)]
+pub struct Posting {
+    pub number: u64,
+    pub path: PathBuf,
+    raw: String,
+    draft: drafts::Draft,
 }
 
 /// Run `work` off the UI thread and always answer. A panic inside becomes an
@@ -84,9 +202,9 @@ pub enum DraftPr<'a> {
     Unknown,
 }
 
-impl DraftPr<'_> {
+impl<'a> DraftPr<'a> {
     /// The pull request's head commit, when the fetch carried one.
-    pub const fn head(&self) -> Option<&str> {
+    pub const fn head(&self) -> Option<&'a str> {
         match self {
             Self::Open(p) => Some(p.head_oid.as_str()),
             Self::Merged(m) => Some(m.head_oid.as_str()),
@@ -193,6 +311,30 @@ pub struct App {
     /// without it reads none, so a test never picks up the developer's own.
     pub drafts_dir: Option<PathBuf>,
     pub drafts: Vec<drafts::Entry>,
+    pub armed: Option<Armed>,
+    /// The attempt to post that is in flight. One at a time.
+    pub posting: Option<Posting>,
+    /// Drafts whose review was sent and never answered for, by file. Whether
+    /// they are on GitHub is not known, and their row says so until an
+    /// attempt gets far enough to find out.
+    unsettled: HashSet<PathBuf>,
+    /// Quit was asked for while a post was in flight. It is being let finish.
+    pub quitting: bool,
+    /// Head commits GitHub reported at the moment of a post, for pull
+    /// requests whose draft turned out to be behind. Newer than the last
+    /// fetch, so it wins until the next fetch covers the pull request.
+    live_heads: HashMap<u64, String>,
+    /// Why the last attempt to post sent nothing, or what is not known about
+    /// it. It stays until `esc` or the next attempt: a keypress made for some
+    /// other reason must not sweep it away unread. Kept apart from `error`,
+    /// which is the sync's and is cleared by the next good fetch.
+    pub post_error: Option<String>,
+    /// GitHub, as posting needs it. Inert until `main` wires in `gh`, so an
+    /// `App` built in a test cannot reach GitHub.
+    pub remote: Arc<dyn drafts::Remote>,
+    /// A draft file the user asked to edit. The event loop owns the terminal,
+    /// so it is the one to run the editor.
+    pub edit_request: Option<PathBuf>,
     pub view: View,
     pub sort: Sort,
     pub rows: Vec<Row>,
@@ -233,6 +375,14 @@ impl App {
             merged_by_branch: HashMap::new(),
             drafts_dir: None,
             drafts: Vec::new(),
+            armed: None,
+            posting: None,
+            unsettled: HashSet::new(),
+            quitting: false,
+            live_heads: HashMap::new(),
+            post_error: None,
+            remote: Arc::new(Unwired),
+            edit_request: None,
             sort: Sort::Recent,
             rows: Vec::new(),
             selected: 0,
@@ -265,6 +415,10 @@ impl App {
 
     /// Called every turn of the event loop. Starts whatever is due; never waits.
     pub fn tick(&mut self) {
+        if self.armed.as_ref().is_some_and(Armed::expired) {
+            self.armed = None;
+            self.note("the question timed out; nothing was posted");
+        }
         let now = now_secs();
         if !self.in_flight.prs && self.schedule.refresh_due(now) {
             self.refresh_prs();
@@ -333,6 +487,11 @@ impl App {
                     .map(|(i, m)| (m.head_ref.clone(), i))
                     .collect();
                 self.merged = f.merged;
+                // What this fetch covers it knows better than an older read.
+                self.live_heads.retain(|n, _| {
+                    !self.prs.iter().any(|p| p.number == *n)
+                        && !self.merged.iter().any(|m| m.number == *n)
+                });
                 self.rebuild();
             }
             Msg::Prs(Err(e)) => {
@@ -402,6 +561,141 @@ impl App {
                 self.in_flight.scan = false;
                 self.error = Some(e);
             }
+            Msg::Posted(result) => self.posted(result),
+        }
+    }
+
+    /// The attempt in `posting` came back. The draft's file changes only when
+    /// its review is on GitHub — sent just now, or found already there; every
+    /// refusal leaves it exactly as it was.
+    fn posted(&mut self, result: Result<drafts::Outcome, String>) {
+        use drafts::Outcome;
+        let Some(sent) = self.posting.take() else {
+            return;
+        };
+        let number = sent.number;
+        // What is recorded as posted is what was sent, not whatever the file
+        // has come to say while the answer was on its way.
+        let record = |at: String| {
+            let at = if at.is_empty() {
+                format_iso8601(now_secs())
+            } else {
+                at
+            };
+            drafts::record_posted(&sent.path, &sent.raw, &sent.draft, at)
+        };
+        let kept = |changed: bool| {
+            if changed {
+                "; the file changed while posting, and what was sent was kept"
+            } else {
+                ""
+            }
+        };
+        // An attempt that read the reviews knows whether an earlier,
+        // unanswered post landed. One that stopped short of them does not.
+        let mut settles = true;
+        let (done, failure) = match result {
+            Ok(Outcome::Sent) => match record(String::new()) {
+                Ok(changed) => (Some(format!("posted to #{number}{}", kept(changed))), None),
+                // The review is on GitHub whatever the file says. The next
+                // attempt will find it there and send nothing.
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "the review was posted to #{number}, but its draft file could not be updated: {e}"
+                    )),
+                ),
+            },
+            Ok(Outcome::AlreadySent(at)) => match record(at) {
+                Ok(changed) => (
+                    Some(format!(
+                        "#{number} already has this review from you; marked posted, nothing sent{}",
+                        kept(changed)
+                    )),
+                    None,
+                ),
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "#{number} already has this review from you, but its draft file could not be updated: {e}"
+                    )),
+                ),
+            },
+            Ok(Outcome::Unknown(e)) => {
+                settles = false;
+                self.unsettled.insert(sent.path.clone());
+                (
+                    None,
+                    Some(format!(
+                        "#{number}: the review was sent, and whether it was posted is not known ({e}). a asks again, and GitHub is checked before anything is sent"
+                    )),
+                )
+            }
+            Ok(Outcome::Refused(why)) => {
+                let (message, reached_the_reviews) = self.refusal(number, why);
+                settles = reached_the_reviews;
+                (None, Some(message))
+            }
+            Err(e) => {
+                settles = false;
+                (None, Some(format!("posting to #{number} failed: {e}")))
+            }
+        };
+        if settles {
+            self.unsettled.remove(&sent.path);
+        }
+        if let Some(done) = done {
+            self.note(done);
+        }
+        self.post_error = failure;
+        self.reload_drafts();
+    }
+
+    /// Why nothing was sent, for the screen, and whether the attempt got as
+    /// far as reading the reviews — which is what it takes to know if an
+    /// earlier, unanswered post landed.
+    fn refusal(&mut self, number: u64, why: drafts::Refusal) -> (String, bool) {
+        use drafts::Refusal;
+        match why {
+            Refusal::Closed => (
+                format!("nothing posted: #{number} was closed without being merged"),
+                false,
+            ),
+            Refusal::Moved(head) => {
+                let short = head.get(..7).unwrap_or(&head).to_string();
+                self.live_heads.insert(number, head);
+                (
+                    format!(
+                        "nothing posted: #{number} has moved on to {short} since this draft was written"
+                    ),
+                    false,
+                )
+            }
+            Refusal::ReviewedSince => (
+                format!(
+                    "nothing posted: you have reviewed #{number} since this draft was written; x skips it, or review in the browser"
+                ),
+                true,
+            ),
+            Refusal::Pending => (
+                format!(
+                    "nothing posted: you have a review of #{number} started and not submitted; submit or discard it in the browser first"
+                ),
+                true,
+            ),
+            Refusal::NoViewer => (
+                "nothing posted: your GitHub login is not known yet; r refreshes".to_string(),
+                false,
+            ),
+            Refusal::Unchecked(e) => (
+                format!("nothing posted: could not check #{number} on GitHub: {e}"),
+                false,
+            ),
+            Refusal::Busy => (
+                format!("nothing posted: another rigor window is posting #{number}"),
+                false,
+            ),
+            Refusal::Rejected(e) => (format!("posting to #{number} failed: {e}"), true),
         }
     }
 
@@ -520,8 +814,18 @@ impl App {
             .map_or(DraftPr::Unknown, DraftPr::Merged)
     }
 
+    /// The pull request's head commit as far as rigor knows: what GitHub said
+    /// at the last attempt to post, else what the last fetch carried.
+    pub fn draft_head(&self, entry: &drafts::Entry) -> Option<&str> {
+        entry
+            .number
+            .and_then(|n| self.live_heads.get(&n))
+            .map(String::as_str)
+            .or_else(|| self.draft_pr(entry).head())
+    }
+
     pub fn draft_state(&self, entry: &drafts::Entry) -> drafts::State {
-        drafts::state(&entry.draft, self.draft_pr(entry).head())
+        drafts::state(&entry.draft, self.draft_head(entry))
     }
 
     /// Drafts still waiting on a decision: neither posted nor skipped.
@@ -541,6 +845,247 @@ impl App {
             Row::Draft(i) => self.drafts.get(i),
             Row::Pr(_) | Row::Wt(_) => None,
         }
+    }
+
+    /// `a` with no question up. Posting is public and under the user's name,
+    /// so this only asks: it opens the overlay showing exactly what would be
+    /// sent. Sending takes a different key, `Y` (`confirm`).
+    pub fn post_key(&mut self) {
+        use drafts::State;
+        let Some(entry) = self.selected_draft().cloned() else {
+            return;
+        };
+        let label = entry.label();
+        let state = self.draft_state(&entry);
+        // An unverified draft may be asked about too: the list cannot vouch
+        // for its pull request's head, but the check before sending can.
+        let (Some(number), Ok(draft), State::Ready | State::Unverified) =
+            (entry.number, entry.draft, state)
+        else {
+            let why = match state {
+                State::Posted => "is already posted",
+                State::Skipped => "is skipped; x brings it back",
+                State::Stale => {
+                    "is stale: the pull request has moved on since this draft was written"
+                }
+                State::Invalid | State::Ready | State::Unverified => {
+                    "is invalid and cannot be posted; e opens it in your editor"
+                }
+            };
+            self.note(format!("{label} {why}"));
+            return;
+        };
+        if self.posting.is_some() {
+            self.note("a review is already being posted");
+            return;
+        }
+        self.armed = Some(Armed {
+            path: entry.path,
+            number,
+            raw: entry.raw,
+            draft,
+            state,
+            at: now_millis(),
+            at_wall: now_secs(),
+            drawn_at: None,
+            scroll: 0,
+            seen: Vec::new(),
+            seen_width: 0,
+            cramped: false,
+            nudged: false,
+        });
+    }
+
+    /// Scroll the overlay. It does not withdraw the question, and it gives it
+    /// longer: reading what would be sent is the point of asking.
+    pub fn scroll_confirm(&mut self, delta: i32) {
+        if let Some(armed) = &mut self.armed {
+            let to = i32::from(armed.scroll).saturating_add(delta).max(0);
+            armed.scroll = u16::try_from(to).unwrap_or(u16::MAX);
+            armed.read_on();
+        }
+    }
+
+    /// `Y`, with the question up. Goes ahead only once all of what would be
+    /// sent has been on screen, in a window that can show it, for long enough
+    /// to have been seen — and then only if GitHub, asked there and then,
+    /// still agrees (`drafts::deliver`).
+    pub fn confirm(&mut self) {
+        let Some(armed) = &mut self.armed else {
+            return;
+        };
+        // Too soon after the overlay first drew — or before it has drawn at
+        // all — to be an answer to it. Not a reason to take it down either.
+        if armed
+            .drawn_at
+            .is_none_or(|drawn| now_millis() - drawn < ANSWER_FLOOR_MS)
+        {
+            return;
+        }
+        if !armed.shown() {
+            armed.nudged = true;
+            return;
+        }
+        let Some(armed) = self.armed.take() else {
+            return;
+        };
+
+        // The file is the draft. If it changed after the question went up,
+        // what was shown is no longer what it says. Read the way the list
+        // reads it: only ever a regular file of ordinary size.
+        let on_disk = drafts::read_text(&armed.path).ok();
+        if on_disk.as_deref() != Some(armed.raw.as_str()) {
+            self.reload_drafts();
+            self.note(format!(
+                "#{} changed on disk; nothing was posted",
+                armed.number
+            ));
+            return;
+        }
+        let number = armed.number;
+        self.post_error = None;
+        self.note(format!("checking #{number} on GitHub, then posting…"));
+        let (remote, viewer) = (Arc::clone(&self.remote), self.viewer.clone());
+        let (path, draft) = (armed.path.clone(), armed.draft.clone());
+        self.posting = Some(Posting {
+            number,
+            path: armed.path,
+            raw: armed.raw,
+            draft: armed.draft,
+        });
+        spawn_reply(self.tx.clone(), Msg::Posted, move || {
+            Ok(drafts::deliver_exclusively(
+                remote.as_ref(),
+                &viewer,
+                number,
+                &path,
+                &draft,
+            ))
+        });
+    }
+
+    /// The one way out of the event loop. `ended` is how the loop ended, and
+    /// is handed back untouched; whatever it is — a key, a signal, an error
+    /// from a terminal that went away — a post in flight is let finish first
+    /// (`finish_post`). Taking the loop's own result is the point: there is
+    /// no ending the loop this is not called for.
+    ///
+    /// `show` draws the screen once, to say what is being waited for. It is
+    /// only used when the loop ended in good order: otherwise the terminal
+    /// may be what failed, and nothing here may depend on it.
+    pub fn leave<E>(
+        &mut self,
+        ended: Result<(), E>,
+        replies: &Receiver<Msg>,
+        limit: std::time::Duration,
+        show: impl FnOnce(&mut Self),
+    ) -> (Result<(), E>, Option<String>) {
+        if self.posting.is_none() {
+            return (ended, None);
+        }
+        self.quitting = true;
+        if ended.is_ok() {
+            show(self);
+        }
+        let said = self.finish_post(replies, limit);
+        (ended, said)
+    }
+
+    /// Rigor is on its way out with an attempt in flight. Let it finish:
+    /// `gh` cut off mid-request leaves it unknown whether the review landed,
+    /// with nobody left to find out. The answer is taken from `replies` and
+    /// recorded as it would be at any other time.
+    ///
+    /// The wait is bounded by `limit`, once, for the whole of what is left —
+    /// not by each call's own deadline one after another. It reads nothing
+    /// from the terminal, which may be gone. Returns what to tell the user;
+    /// `None` when nothing was in flight.
+    pub fn finish_post(
+        &mut self,
+        replies: &Receiver<Msg>,
+        limit: std::time::Duration,
+    ) -> Option<String> {
+        let number = self.posting.as_ref()?.number;
+        self.quitting = true;
+        let deadline = std::time::Instant::now() + limit;
+        while self.posting.is_some() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match replies.recv_timeout(left) {
+                Ok(msg) => self.on_msg(msg),
+                Err(_) => break,
+            }
+        }
+        if let Some(unfinished) = self.posting.take() {
+            // Out of time. What is known is that it was started: say that,
+            // and leave the file saying what is true of it, a draft.
+            self.unsettled.insert(unfinished.path);
+            return Some(format!(
+                "the post to #{number} did not finish in {}s. It may or may not be posted; open rigor and press a on it, and GitHub is asked before anything is sent again",
+                limit.as_secs()
+            ));
+        }
+        self.post_error
+            .clone()
+            .or_else(|| self.notice.as_ref().map(|(text, _)| text.clone()))
+    }
+
+    /// Whether `entry` is the draft an attempt is in flight for.
+    pub fn is_posting(&self, entry: &drafts::Entry) -> bool {
+        self.posting.as_ref().is_some_and(|p| p.path == entry.path)
+    }
+
+    /// Whether `entry`'s review was sent and never answered for.
+    pub fn is_unsettled(&self, entry: &drafts::Entry) -> bool {
+        self.unsettled.contains(&entry.path)
+    }
+
+    /// `x`: set a draft aside, or bring a skipped one back.
+    pub fn skip_key(&mut self) {
+        let Some(entry) = self.selected_draft().cloned() else {
+            return;
+        };
+        let label = entry.label();
+        // The answer on its way is about the file as it was. It is left
+        // alone until the answer is in.
+        if self.is_posting(&entry) {
+            self.note(format!(
+                "{label} is being posted; x waits until that is done"
+            ));
+            return;
+        }
+        let Ok(draft) = &entry.draft else {
+            self.note(format!("{label} is invalid; e opens it in your editor"));
+            return;
+        };
+        let to = match draft.status {
+            drafts::Status::Drafted => drafts::Status::Skipped,
+            drafts::Status::Skipped => drafts::Status::Drafted,
+            drafts::Status::Posted => {
+                self.note(format!("{label} is already posted"));
+                return;
+            }
+        };
+        match drafts::set_status(&entry.path, &self.repo.slug(), to, None) {
+            Ok(()) if to == drafts::Status::Skipped => self.note(format!("skipped {label}")),
+            Ok(()) => self.note(format!("{label} is a draft again")),
+            Err(e) => self.note(format!("could not update {label}: {e}")),
+        }
+        self.reload_drafts();
+    }
+
+    /// `e`: ask for the selected draft's file to be opened in an editor.
+    pub fn edit_key(&mut self) {
+        let Some(entry) = self.selected_draft() else {
+            return;
+        };
+        if self.is_posting(entry) {
+            let label = entry.label();
+            self.note(format!(
+                "{label} is being posted; e waits until that is done"
+            ));
+            return;
+        }
+        self.edit_request = Some(entry.path.clone());
     }
 
     fn draft_matches(&self, i: usize, q: &str) -> bool {
@@ -647,13 +1192,25 @@ impl App {
                 self.detail_scroll = 0;
             }
             self.selected = same.unwrap_or(was).min(last);
-            return;
+        } else {
+            self.selected = keep
+                .and_then(|k| self.rows.iter().position(|r| *r == k))
+                .unwrap_or(0)
+                .min(last);
+            self.detail_scroll = 0;
         }
-        self.selected = keep
-            .and_then(|k| self.rows.iter().position(|r| *r == k))
-            .unwrap_or(0)
-            .min(last);
-        self.detail_scroll = 0;
+
+        // A question is only as good as the draft it names. If the selection
+        // is no longer on that file, or the file no longer reads the same,
+        // or the draft can no longer be posted as it could, it is withdrawn.
+        if let Some(armed) = &self.armed {
+            let still = self.selected_draft().is_some_and(|e| {
+                e.path == armed.path && e.raw == armed.raw && self.draft_state(e) == armed.state
+            });
+            if !still {
+                self.armed = None;
+            }
+        }
     }
 
     fn pr_matches(&self, i: usize, q: &str) -> bool {

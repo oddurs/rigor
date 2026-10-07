@@ -87,9 +87,19 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
             Row::Wt(wi) => wt_line(&app.desk(&app.worktrees[wi]), selected, &ctx),
             Row::Draft(di) => {
                 let entry = &app.drafts[di];
+                // The one being sent says so, in place of its verdict; so
+                // does one that was sent and never answered for, which is
+                // not simply a draft any more.
+                let in_flight = if app.is_posting(entry) {
+                    Some("posting…")
+                } else if app.is_unsettled(entry) {
+                    Some("maybe sent")
+                } else {
+                    None
+                };
                 draft_line(
                     entry,
-                    app.draft_state(entry),
+                    (app.draft_state(entry), in_flight),
                     app.draft_pr(entry),
                     selected,
                     &ctx,
@@ -346,7 +356,7 @@ fn wt_line(desk: &Desk<'_>, selected: bool, ctx: &RowCtx<'_>) -> Line<'static> {
 /// same fetch as every other view.
 fn draft_line(
     entry: &Entry,
-    state: State,
+    (state, in_flight): (State, Option<&'static str>),
     pr: DraftPr<'_>,
     selected: bool,
     ctx: &RowCtx<'_>,
@@ -358,7 +368,13 @@ fn draft_line(
     let decided = matches!(state, State::Posted | State::Skipped);
     let quiet = dim(selected, t);
 
-    let (state_text, state_color) = draft_state_cell(entry, state, t);
+    // Only a draft that could still be sent has anything in flight to say.
+    let (state_text, state_color) = match in_flight {
+        Some(label) if matches!(state, State::Ready | State::Unverified) => {
+            (label.to_string(), t.pending)
+        }
+        _ => draft_state_cell(entry, state, t),
+    };
     let mut spans = vec![
         Span::styled(if selected { "▎" } else { " " }, base.fg(t.accent)),
         Span::styled(

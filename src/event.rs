@@ -7,6 +7,7 @@ use ratatui::crossterm::event::{
 use std::time::{Duration, Instant};
 
 use crate::app::{App, Mode, Sort};
+use crate::config::View;
 
 /// Two clicks on the same row inside this window count as a double-click,
 /// which crossterm does not report on its own.
@@ -18,10 +19,63 @@ pub fn key(app: &mut App, k: KeyEvent) {
     if k.kind == KeyEventKind::Release {
         return;
     }
+    // Quit is waiting on a post in flight. Nothing else is taken up.
+    if app.quitting {
+        return;
+    }
+    // A question on screen is modal: it is answered, read, or withdrawn.
+    if app.armed.is_some() {
+        confirm_key(app, k);
+        return;
+    }
     match app.mode {
         Mode::Filter => filter_key(app, k),
         Mode::Help => help_key(app, k.code),
         Mode::Browse => browse_key(app, k),
+    }
+}
+
+/// Keys while the overlay asks whether to post. `Y` answers yes. The
+/// movement keys read what would be sent and leave the question up. Anything
+/// else withdraws it and does nothing more: a key pressed to get out of a
+/// question about posting should not also act on the list behind it.
+///
+/// The answer is a capital: shift and `y` together. Lowercase `y` is one of
+/// the keys that withdraw, so that a word with "ay" in it, typed into this
+/// window by mistake however slowly, asks and then takes the question back.
+///
+/// The withdrawing keys include `a`, the key that asked. A key held down repeats once the
+/// keyboard's own delay has passed, and no pause demanded between two `a`s
+/// can tell that from a second press; so a second `a` is never the answer,
+/// and a held one only opens the question and closes it again.
+fn confirm_key(app: &mut App, k: KeyEvent) {
+    let chord = k
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    match k.code {
+        // With or without SHIFT reported: terminals differ, and the capital
+        // is what says it. Never as a Ctrl or Alt chord.
+        KeyCode::Char('Y') if !chord => app.confirm(),
+        KeyCode::Char('j') | KeyCode::Down if !chord => app.scroll_confirm(1),
+        KeyCode::Char('k') | KeyCode::Up if !chord => app.scroll_confirm(-1),
+        KeyCode::PageDown => app.scroll_confirm(10),
+        KeyCode::PageUp => app.scroll_confirm(-10),
+        KeyCode::Char('G') | KeyCode::End => app.scroll_confirm(i32::from(u16::MAX)),
+        KeyCode::Char('g') | KeyCode::Home => app.scroll_confirm(-i32::from(u16::MAX)),
+        _ => app.armed = None,
+    }
+}
+
+/// Pasted text, which a terminal with bracketed paste hands over whole. It is
+/// never a keypress: a paste that happens to contain `ay` must not ask to
+/// post, let alone confirm. While a filter is being typed it is text for the
+/// filter; anywhere else it is nothing, except that a question on screen was
+/// not answered by it and is withdrawn.
+pub fn paste(app: &mut App, text: &str) {
+    app.armed = None;
+    if app.mode == Mode::Filter && !app.quitting {
+        app.filter.extend(text.chars().filter(|c| !c.is_control()));
+        app.rebuild();
     }
 }
 
@@ -61,10 +115,22 @@ const fn help_key(app: &mut App, code: KeyCode) {
 
 fn browse_key(app: &mut App, k: KeyEvent) {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    // The draft keys act only in the Drafts view, and never on a chord:
+    // Ctrl-A must not post a review.
+    let drafts = app.view == View::Drafts
+        && !k
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
     match k.code {
         KeyCode::Char('c') if ctrl => app.quit = true,
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('?') => app.mode = Mode::Help,
+        KeyCode::Char('a') if drafts => app.post_key(),
+        KeyCode::Char('e') if drafts => app.edit_key(),
+        KeyCode::Char('x') if drafts => app.skip_key(),
+        // One thing per Esc. What went wrong with a post is dismissed first,
+        // and only by this: it must be read, not typed past.
+        KeyCode::Esc if app.post_error.is_some() => app.post_error = None,
         KeyCode::Esc => {
             if !app.filter.is_empty() {
                 app.filter.clear();
@@ -120,7 +186,7 @@ fn browse_key(app: &mut App, k: KeyEvent) {
             } else {
                 "hidden"
             };
-            app.note(format!("drafts {state}"));
+            app.note(format!("draft PRs {state}"));
             app.rebuild();
         }
         _ => {}
@@ -136,6 +202,21 @@ pub struct Input {
 impl Input {
     pub fn mouse(&mut self, app: &mut App, m: MouseEvent) {
         let (x, y) = (m.column, m.row);
+        if app.quitting {
+            return;
+        }
+        // The overlay is modal for the mouse as for keys: the wheel reads
+        // what would be sent, a click withdraws the question, and merely
+        // moving the pointer does nothing.
+        if app.armed.is_some() {
+            match m.kind {
+                MouseEventKind::ScrollDown => app.scroll_confirm(2),
+                MouseEventKind::ScrollUp => app.scroll_confirm(-2),
+                MouseEventKind::Down(_) => app.armed = None,
+                _ => {}
+            }
+            return;
+        }
         // Help is modal, as it is for keys: a click closes it, and nothing
         // reaches the dashboard underneath.
         if app.mode == Mode::Help {
