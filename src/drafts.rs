@@ -260,17 +260,59 @@ pub enum PostFailure {
     NoAnswer(String),
 }
 
+/// An inline comment as GitHub lists it on a pull request: which review it
+/// belongs to, and where it sits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placed {
+    /// `None` for a comment that belongs to no review.
+    pub review: Option<u64>,
+    /// `None` for a comment that is not on one line of one side: a comment
+    /// on a whole file, or on a range of lines. A draft cannot say either, so
+    /// a review carrying one is never the draft.
+    pub at: Option<Comment>,
+}
+
+/// How many entries a full page of a list holds. A shorter page is the last.
+pub const PAGE: usize = 100;
+
+/// More pages than this and a read is abandoned rather than decided on part
+/// of the list.
+const MAX_PAGES: usize = 30;
+
 /// What posting needs from GitHub, for one repository. `main` wires in `gh`;
 /// a test hands over a recorder, so nothing built in a test can reach GitHub.
+///
+/// Lists come a page at a time, each page its own call, so that whatever
+/// stands between the caller and GitHub sees every call there is.
 pub trait Remote: Send + Sync {
     fn pull(&self, number: u64) -> Result<Live, String>;
-    /// Every review on the pull request, all pages.
-    fn reviews(&self, number: u64) -> Result<Vec<Review>, String>;
-    /// The inline comments of one review, all pages.
-    fn review_comments(&self, number: u64, review: u64) -> Result<Vec<Comment>, String>;
-    fn post(&self, number: u64, body: &str) -> Result<(), PostFailure>;
+    /// One page, counted from 1, of the reviews on a pull request.
+    fn reviews(&self, number: u64, page: usize) -> Result<Vec<Review>, String>;
+    /// One page of every inline comment on a pull request, whichever review
+    /// each belongs to.
+    fn comments(&self, number: u64, page: usize) -> Result<Vec<Placed>, String>;
+    /// Send the review. `Ok` carries what GitHub says it created, which is
+    /// the only evidence that it created anything.
+    fn post(&self, number: u64, body: &str) -> Result<Review, PostFailure>;
     /// How long any one of these calls may take.
     fn timeout(&self) -> Duration;
+}
+
+/// Every page of a list.
+fn every_page<T>(page: impl Fn(usize) -> Result<Vec<T>, String>) -> Result<Vec<T>, String> {
+    let mut all = Vec::new();
+    for n in 1..=MAX_PAGES {
+        let mut batch = page(n)?;
+        let last = batch.len() < PAGE;
+        all.append(&mut batch);
+        if last {
+            return Ok(all);
+        }
+    }
+    Err(format!(
+        "more than {} entries; not all of them were read",
+        PAGE * MAX_PAGES
+    ))
 }
 
 /// Why nothing was sent.
@@ -360,9 +402,23 @@ fn check_reviews(
             && r.commit.eq_ignore_ascii_case(&d.head_sha)
             && r.body.trim() == d.body.trim()
     };
+    // Read once, and only if some review looks the same: GitHub lists a
+    // pull request's inline comments together, each naming its review.
+    let mut inline: Option<Vec<Placed>> = None;
     for candidate in mine.iter().filter(looks_the_same) {
-        let theirs = remote.review_comments(number, candidate.id)?;
-        if comment_set(&theirs) == comment_set(&d.comments) {
+        let all = match &inline {
+            Some(all) => all,
+            None => inline.insert(every_page(|page| remote.comments(number, page))?),
+        };
+        // Every comment of the review has to be one a draft could have
+        // made: on a line, on a side. One that is not makes it another
+        // review, whatever the rest says.
+        let theirs: Option<Vec<Comment>> = all
+            .iter()
+            .filter(|c| c.review == Some(candidate.id))
+            .map(|c| c.at.clone())
+            .collect();
+        if theirs.is_some_and(|theirs| comment_set(&theirs) == comment_set(&d.comments)) {
             return Ok(Some(Outcome::AlreadySent(
                 candidate.submitted_at.clone().unwrap_or_default(),
             )));
@@ -387,6 +443,16 @@ fn check_reviews(
     Ok(None)
 }
 
+/// Whether what GitHub answered a post with is this review, created. `gh`
+/// exiting cleanly is not that: a request redirected and followed as a read
+/// exits cleanly too, with something else in hand. Only a review of this
+/// kind, on this commit, by the viewer, says the draft was posted.
+fn is_this_review(created: &Review, d: &Draft, viewer: &str) -> bool {
+    created.state == d.verdict.submitted_as()
+        && created.commit.eq_ignore_ascii_case(&d.head_sha)
+        && created.author.eq_ignore_ascii_case(viewer)
+}
+
 /// Post `d` to pull request `number`, if GitHub's own account of the pull
 /// request, read here and now, still allows it. Reads, then at most one
 /// write; a read that fails sends nothing.
@@ -405,8 +471,7 @@ pub fn deliver(remote: &dyn Remote, viewer: &str, number: u64, d: &Draft) -> Out
     if let Err(why) = check_pull(d, &live) {
         return Outcome::Refused(why);
     }
-    let settled = remote
-        .reviews(number)
+    let settled = every_page(|page| remote.reviews(number, page))
         .and_then(|reviews| check_reviews(remote, number, d, viewer, &reviews));
     match settled {
         Ok(Some(outcome)) => return outcome,
@@ -422,7 +487,8 @@ pub fn deliver(remote: &dyn Remote, viewer: &str, number: u64, d: &Draft) -> Out
         }
     };
     match remote.post(number, &body) {
-        Ok(()) => Outcome::Sent,
+        Ok(created) if is_this_review(&created, d, viewer) => Outcome::Sent,
+        Ok(_) => Outcome::Unknown("GitHub answered, but not with this review".to_string()),
         Err(PostFailure::Declined(e)) => Outcome::Refused(Refusal::Rejected(e)),
         Err(PostFailure::NoAnswer(e)) => Outcome::Unknown(e),
     }
@@ -438,6 +504,9 @@ const LOCK_MARGIN: Duration = Duration::from_secs(15);
 /// attempt is over.
 struct Lock {
     path: PathBuf,
+    /// What this rigor wrote into the file: its own mark, so that it only
+    /// ever removes a lock that is still its own.
+    token: String,
 }
 
 impl Lock {
@@ -450,11 +519,22 @@ impl Lock {
         draft.with_file_name(format!(".{name}.lock"))
     }
 
+    /// A mark no other process will write: this process, and a number drawn
+    /// from the standard library's own per-instance random hash keys.
+    fn new_token() -> String {
+        use std::hash::{BuildHasher, Hasher};
+        let random = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        format!("{}-{random:016x}", std::process::id())
+    }
+
     /// `None` when another rigor holds it. A lock not touched for longer
     /// than a call can last, plus a margin, was left by one that died, and
     /// is replaced.
     fn take(draft: &Path, call: Duration) -> std::io::Result<Option<Self>> {
         let path = Self::beside(draft);
+        let token = Self::new_token();
         for _ in 0..2 {
             let made = std::fs::OpenOptions::new()
                 .write(true)
@@ -462,8 +542,8 @@ impl Lock {
                 .open(&path);
             match made {
                 Ok(mut file) => {
-                    let _ = writeln!(file, "{}", std::process::id());
-                    return Ok(Some(Self { path }));
+                    file.write_all(token.as_bytes())?;
+                    return Ok(Some(Self { path, token }));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let age = std::fs::metadata(&path)
@@ -483,9 +563,18 @@ impl Lock {
         Ok(None)
     }
 
+    /// Whether the file is still the one this rigor made. It stops being so
+    /// when another rigor judges it stale and takes it over.
+    fn is_ours(&self) -> bool {
+        std::fs::read_to_string(&self.path).is_ok_and(|held| held == self.token)
+    }
+
     /// Say the owner is still alive. Called before every call to GitHub, so
     /// the lock's age is the age of the call in flight, not of the attempt.
     fn touch(&self) {
+        if !self.is_ours() {
+            return;
+        }
         if let Ok(file) = std::fs::File::options().write(true).open(&self.path) {
             let _ = file.set_modified(std::time::SystemTime::now());
         }
@@ -493,12 +582,17 @@ impl Lock {
 }
 
 impl Drop for Lock {
+    /// Remove the lock, if it is still this rigor's. One taken over by
+    /// another rigor is that one's now, and removing it would let a third in.
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if self.is_ours() {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
-/// A remote that keeps a lock fresh for as long as it is being used.
+/// A remote that keeps a lock fresh for as long as it is being used: before
+/// every call it passes on, a page of a list included.
 struct Held<'a> {
     remote: &'a dyn Remote,
     lock: &'a Lock,
@@ -509,15 +603,15 @@ impl Remote for Held<'_> {
         self.lock.touch();
         self.remote.pull(number)
     }
-    fn reviews(&self, number: u64) -> Result<Vec<Review>, String> {
+    fn reviews(&self, number: u64, page: usize) -> Result<Vec<Review>, String> {
         self.lock.touch();
-        self.remote.reviews(number)
+        self.remote.reviews(number, page)
     }
-    fn review_comments(&self, number: u64, review: u64) -> Result<Vec<Comment>, String> {
+    fn comments(&self, number: u64, page: usize) -> Result<Vec<Placed>, String> {
         self.lock.touch();
-        self.remote.review_comments(number, review)
+        self.remote.comments(number, page)
     }
-    fn post(&self, number: u64, body: &str) -> Result<(), PostFailure> {
+    fn post(&self, number: u64, body: &str) -> Result<Review, PostFailure> {
         self.lock.touch();
         self.remote.post(number, body)
     }
@@ -595,7 +689,7 @@ const MAX_BYTES: u64 = 256 * 1024;
 /// A draft's text, if the path is an ordinary file of ordinary size. Judged
 /// before it is opened: a link is not followed to wherever it points, and a
 /// pipe or a device left under a draft's name would never finish being read.
-fn read_text(path: &Path) -> Result<String, String> {
+pub fn read_text(path: &Path) -> Result<String, String> {
     let unreadable = |e: std::io::Error| format!("could not be read: {e}");
     let meta = std::fs::symlink_metadata(path).map_err(unreadable)?;
     if meta.file_type().is_symlink() {
@@ -1070,8 +1164,12 @@ pub mod tests {
     struct Github {
         pull: Result<Live, String>,
         reviews: Result<Vec<Review>, String>,
-        comments: Result<Vec<Comment>, String>,
-        post: Result<(), PostFailure>,
+        /// The inline comments of review 7, the one `review` makes. `None`
+        /// stands for a comment with no line: one on a whole file.
+        comments: Result<Vec<Option<Comment>>, String>,
+        /// `Ok(None)` answers a post as GitHub would: with the review the
+        /// request describes, by `octocat`.
+        post: Result<Option<Review>, PostFailure>,
         calls: std::sync::Mutex<Vec<&'static str>>,
     }
 
@@ -1080,20 +1178,50 @@ pub mod tests {
             self.calls.lock().unwrap().push("pull");
             self.pull.clone()
         }
-        fn reviews(&self, _: u64) -> Result<Vec<Review>, String> {
+        fn reviews(&self, _: u64, page: usize) -> Result<Vec<Review>, String> {
             self.calls.lock().unwrap().push("reviews");
-            self.reviews.clone()
+            let all = self.reviews.clone()?;
+            Ok(all.chunks(PAGE).nth(page - 1).unwrap_or_default().to_vec())
         }
-        fn review_comments(&self, _: u64, _: u64) -> Result<Vec<Comment>, String> {
+        fn comments(&self, _: u64, page: usize) -> Result<Vec<Placed>, String> {
             self.calls.lock().unwrap().push("comments");
-            self.comments.clone()
+            let all: Vec<Placed> = self
+                .comments
+                .clone()?
+                .into_iter()
+                .map(|at| Placed {
+                    review: Some(7),
+                    at,
+                })
+                .collect();
+            Ok(all.chunks(PAGE).nth(page - 1).unwrap_or_default().to_vec())
         }
-        fn post(&self, _: u64, _: &str) -> Result<(), PostFailure> {
+        fn post(&self, _: u64, body: &str) -> Result<Review, PostFailure> {
             self.calls.lock().unwrap().push("post");
-            self.post.clone()
+            Ok(self
+                .post
+                .clone()?
+                .unwrap_or_else(|| created_by("octocat", body)))
         }
         fn timeout(&self) -> Duration {
             Duration::from_secs(45)
+        }
+    }
+
+    /// What GitHub answers a post with: the review the request asked for,
+    /// under `author`'s name.
+    pub fn created_by(author: &str, request: &str) -> Review {
+        let asked: Value = serde_json::from_str(request).unwrap();
+        Review {
+            id: 91,
+            author: author.into(),
+            state: match asked["event"].as_str().unwrap() {
+                "APPROVE" => "APPROVED".into(),
+                _ => "COMMENTED".into(),
+            },
+            commit: asked["commit_id"].as_str().unwrap().into(),
+            body: asked["body"].as_str().unwrap().into(),
+            submitted_at: Some("2027-01-15T08:00:00Z".into()),
         }
     }
 
@@ -1143,8 +1271,8 @@ pub mod tests {
         viewer: &'static str,
         pull: Result<Live, String>,
         reviews: Result<Vec<Review>, String>,
-        comments: Result<Vec<Comment>, String>,
-        post: Result<(), PostFailure>,
+        comments: Result<Vec<Option<Comment>>, String>,
+        post: Result<Option<Review>, PostFailure>,
         want: Outcome,
         calls: &'static [&'static str],
     }
@@ -1156,8 +1284,8 @@ pub mod tests {
                 viewer: "octocat",
                 pull: Ok(open_at(HEAD)),
                 reviews: Ok(Vec::new()),
-                comments: Ok(vec![its_comment()]),
-                post: Ok(()),
+                comments: Ok(vec![Some(its_comment())]),
+                post: Ok(None),
                 want: Outcome::Sent,
                 calls: &["pull", "reviews", "post"],
             }
@@ -1268,10 +1396,57 @@ pub mod tests {
     }
 
     /// A write that GitHub answers with a no is a no. One that gets no
-    /// answer at all is not: the review may be there.
+    /// answer at all is not: the review may be there. And one that is
+    /// answered with anything but this review, created, is not a yes: `gh`
+    /// exits cleanly on whatever a redirect leads it to.
     #[test]
-    fn only_an_answer_from_github_says_the_review_was_not_posted() {
+    fn only_this_review_in_the_answer_says_it_was_posted() {
+        let draft = parse(&sample().to_string(), "acme/widget", 101).unwrap();
+        let asked = payload(&draft).unwrap();
+        let answered = |edit: fn(&mut Review)| {
+            let mut r = created_by("octocat", &asked);
+            edit(&mut r);
+            Ok(Some(r))
+        };
+        let unknown = || Outcome::Unknown("GitHub answered, but not with this review".into());
         live_through([
+            Moment {
+                name: "the review, created",
+                post: answered(|_| {}),
+                ..Moment::default()
+            },
+            Moment {
+                name: "created, the login and the commit spelled in another case",
+                post: answered(|r| {
+                    r.author = "Octocat".into();
+                    r.commit = r.commit.to_uppercase();
+                }),
+                ..Moment::default()
+            },
+            Moment {
+                name: "a review of another kind",
+                post: answered(|r| r.state = "COMMENTED".into()),
+                want: unknown(),
+                ..Moment::default()
+            },
+            Moment {
+                name: "a review still pending",
+                post: answered(|r| r.state = "PENDING".into()),
+                want: unknown(),
+                ..Moment::default()
+            },
+            Moment {
+                name: "a review on another commit",
+                post: answered(|r| r.commit = MOVED.into()),
+                want: unknown(),
+                ..Moment::default()
+            },
+            Moment {
+                name: "somebody else's review",
+                post: answered(|r| r.author = "hubot".into()),
+                want: unknown(),
+                ..Moment::default()
+            },
             Moment {
                 name: "GitHub declines the review",
                 post: Err(PostFailure::Declined(
@@ -1287,6 +1462,56 @@ pub mod tests {
                 ..Moment::default()
             },
         ]);
+    }
+
+    /// Lists are read to their end. The review that matters may be on the
+    /// last page, and so may the comment that tells it apart.
+    #[test]
+    fn reviews_and_comments_are_read_page_by_page_to_the_end() {
+        let draft = parse(&sample().to_string(), "acme/widget", 101).unwrap();
+        let noise = |n: usize| -> Vec<Review> { (0..n).map(|_| review("hubot", AFTER)).collect() };
+        let mut reviews = noise(PAGE + PAGE / 2);
+        reviews.push(review("octocat", AFTER));
+        let mut comments: Vec<Option<Comment>> = (0..PAGE)
+            .map(|i| {
+                Some(Comment {
+                    line: 1000 + i as u64,
+                    ..its_comment()
+                })
+            })
+            .collect();
+        comments.push(Some(its_comment()));
+        let github = Github {
+            pull: Ok(open_at(HEAD)),
+            reviews: Ok(reviews),
+            comments: Ok(comments),
+            post: Ok(None),
+            calls: std::sync::Mutex::default(),
+        };
+        // 101 comments on review 7, where the draft has one: not the same.
+        assert_eq!(
+            deliver(&github, "octocat", 101, &draft),
+            Outcome::Refused(Refusal::ReviewedSince)
+        );
+        assert_eq!(
+            *github.calls.lock().unwrap(),
+            ["pull", "reviews", "reviews", "comments", "comments"],
+            "two pages of each"
+        );
+
+        // A list that never ends is given up on, not decided on a part of.
+        let endless = Github {
+            pull: Ok(open_at(HEAD)),
+            reviews: Ok(noise(PAGE * (MAX_PAGES + 1))),
+            comments: Ok(Vec::new()),
+            post: Ok(None),
+            calls: std::sync::Mutex::default(),
+        };
+        let Outcome::Refused(Refusal::Unchecked(why)) = deliver(&endless, "octocat", 101, &draft)
+        else {
+            panic!("a list read in part was decided on");
+        };
+        assert!(why.contains("not all of them were read"), "{why}");
     }
 
     /// The very same review is on the pull request already: it was sent,
@@ -1323,10 +1548,10 @@ pub mod tests {
                     body: "Reads well.\n".into(),
                     ..review("Octocat", AFTER)
                 }]),
-                comments: Ok(vec![Comment {
+                comments: Ok(vec![Some(Comment {
                     body: " Worth a test.\n".into(),
                     ..its_comment()
-                }]),
+                })]),
                 want: already(AFTER),
                 calls: read_only,
                 ..Moment::default()
@@ -1363,7 +1588,7 @@ pub mod tests {
         let but = |edit: fn(&mut Comment)| {
             let mut c = its_comment();
             edit(&mut c);
-            Ok(vec![c])
+            Ok(vec![Some(c)])
         };
         live_through([
             Moment {
@@ -1409,7 +1634,23 @@ pub mod tests {
             Moment {
                 name: "one comment more than the draft has",
                 reviews: Ok(vec![review("octocat", AFTER)]),
-                comments: Ok(vec![its_comment(), its_comment()]),
+                comments: Ok(vec![Some(its_comment()), Some(its_comment())]),
+                want: reviewed.clone(),
+                calls: compared,
+                ..Moment::default()
+            },
+            Moment {
+                name: "a comment on the whole file, which no draft can make",
+                reviews: Ok(vec![review("octocat", AFTER)]),
+                comments: Ok(vec![Some(its_comment()), None]),
+                want: reviewed.clone(),
+                calls: compared,
+                ..Moment::default()
+            },
+            Moment {
+                name: "only a comment on the whole file: not an error, not the same",
+                reviews: Ok(vec![review("octocat", AFTER)]),
+                comments: Ok(vec![None]),
                 want: reviewed,
                 calls: compared,
                 ..Moment::default()
@@ -1557,8 +1798,8 @@ pub mod tests {
         let github = |comments: Vec<Comment>| Github {
             pull: Ok(open_at(HEAD)),
             reviews: Ok(vec![reply.clone()]),
-            comments: Ok(comments),
-            post: Ok(()),
+            comments: Ok(comments.into_iter().map(Some).collect()),
+            post: Ok(None),
             calls: std::sync::Mutex::default(),
         };
 
@@ -1593,6 +1834,65 @@ pub mod tests {
         );
     }
 
+    /// GitHub lists a pull request's inline comments together. Only those of
+    /// the review in question are that review's: a comment somebody else made
+    /// neither spoils a match nor supplies one.
+    #[test]
+    fn only_the_reviews_own_comments_are_compared() {
+        struct Mixed {
+            /// Which review the draft's own comment is listed under.
+            under: u64,
+        }
+        impl Remote for Mixed {
+            fn pull(&self, _: u64) -> Result<Live, String> {
+                Ok(open_at(HEAD))
+            }
+            fn reviews(&self, _: u64, _: usize) -> Result<Vec<Review>, String> {
+                Ok(vec![review("octocat", AFTER)])
+            }
+            fn comments(&self, _: u64, _: usize) -> Result<Vec<Placed>, String> {
+                let elsewhere = Comment {
+                    path: "src/y.rs".into(),
+                    ..its_comment()
+                };
+                Ok(vec![
+                    Placed {
+                        review: Some(8),
+                        at: Some(elsewhere),
+                    },
+                    Placed {
+                        review: Some(self.under),
+                        at: Some(its_comment()),
+                    },
+                    Placed {
+                        review: None,
+                        at: None,
+                    },
+                ])
+            }
+            fn post(&self, _: u64, body: &str) -> Result<Review, PostFailure> {
+                Ok(created_by("octocat", body))
+            }
+            fn timeout(&self) -> Duration {
+                Duration::from_secs(45)
+            }
+        }
+        let draft = parse(&sample().to_string(), "acme/widget", 101).unwrap();
+        // `review` makes review 7. Its one comment is the draft's.
+        assert_eq!(
+            deliver(&Mixed { under: 7 }, "octocat", 101, &draft),
+            Outcome::AlreadySent(AFTER.into()),
+            "another review's comment spoiled the match"
+        );
+        // The draft's comment is on the pull request, but under another
+        // review: review 7 has none, and is not the draft.
+        assert_eq!(
+            deliver(&Mixed { under: 9 }, "octocat", 101, &draft),
+            Outcome::Refused(Refusal::ReviewedSince),
+            "another review's comment supplied the match"
+        );
+    }
+
     /// Two windows on one repository must not both post a draft: each could
     /// read GitHub, find nothing there yet, and send. The lock beside the
     /// draft lets one of them through.
@@ -1606,7 +1906,7 @@ pub mod tests {
             pull: Ok(open_at(HEAD)),
             reviews: Ok(Vec::new()),
             comments: Ok(Vec::new()),
-            post: Ok(()),
+            post: Ok(None),
             calls: std::sync::Mutex::default(),
         };
 
@@ -1643,10 +1943,11 @@ pub mod tests {
         );
     }
 
-    /// The lock is held for the whole attempt and kept fresh through it, so a
-    /// second window arriving at any point finds it.
+    /// The lock is held for the whole attempt and kept fresh through it —
+    /// before every call, each page of a list among them — so a second
+    /// window arriving at any point finds it.
     #[test]
-    fn the_lock_is_held_through_every_call_and_let_go_after() {
+    fn the_lock_is_kept_fresh_before_every_call_and_let_go_after() {
         struct Watching {
             lock: PathBuf,
             seen: std::sync::Mutex<Vec<bool>>,
@@ -1674,17 +1975,29 @@ pub mod tests {
                 self.look();
                 Ok(open_at(HEAD))
             }
-            fn reviews(&self, _: u64) -> Result<Vec<Review>, String> {
+            // Two pages of reviews, the second ending in one that looks the
+            // same; two pages of comments.
+            fn reviews(&self, _: u64, page: usize) -> Result<Vec<Review>, String> {
                 self.look();
-                Ok(vec![review("octocat", BEFORE)])
+                Ok(match page {
+                    1 => vec![review("hubot", AFTER); PAGE],
+                    _ => vec![review("octocat", BEFORE)],
+                })
             }
-            fn review_comments(&self, _: u64, _: u64) -> Result<Vec<Comment>, String> {
+            fn comments(&self, _: u64, page: usize) -> Result<Vec<Placed>, String> {
                 self.look();
-                Ok(Vec::new())
+                let other = Placed {
+                    review: Some(8),
+                    at: None,
+                };
+                Ok(match page {
+                    1 => vec![other; PAGE],
+                    _ => Vec::new(),
+                })
             }
-            fn post(&self, _: u64, _: &str) -> Result<(), PostFailure> {
+            fn post(&self, _: u64, body: &str) -> Result<Review, PostFailure> {
                 self.look();
-                Ok(())
+                Ok(created_by("octocat", body))
             }
             fn timeout(&self) -> Duration {
                 Duration::from_secs(45)
@@ -1703,10 +2016,49 @@ pub mod tests {
         );
         assert_eq!(
             *gh.seen.lock().unwrap(),
-            [true, true, true, true],
-            "held and fresh at the pull, the reviews, the comments and the post"
+            [true; 6],
+            "fresh at the pull, both pages of reviews, both of comments, and the post"
         );
         assert!(!gh.lock.exists());
+    }
+
+    /// A rigor that stalls long enough has its lock taken for dead and
+    /// replaced. When it comes back, the lock beside the draft is another
+    /// rigor's: it must not freshen it, and must not remove it on its way out.
+    #[test]
+    fn a_lock_taken_over_is_no_longer_ours_to_touch_or_remove() {
+        let d = tempfile::tempdir().unwrap();
+        let path = write(d.path(), "101.json", &sample().to_string());
+        let call = Duration::from_secs(45);
+
+        let first = Lock::take(&path, call).unwrap().expect("the first rigor");
+        let beside = Lock::beside(&path);
+        // It stalls, and its lock goes stale.
+        let long_ago = std::time::SystemTime::now() - (call + LOCK_MARGIN * 2);
+        let age = |at| {
+            let file = std::fs::File::options().write(true).open(&beside).unwrap();
+            file.set_modified(at).unwrap();
+        };
+        age(long_ago);
+        let second = Lock::take(&path, call).unwrap().expect("the second rigor");
+        assert_ne!(first.token, second.token, "two rigors, one mark");
+        assert!(second.is_ours() && !first.is_ours());
+
+        // The first wakes up and carries on: its touch is not the second's.
+        age(long_ago);
+        first.touch();
+        let still_old = std::fs::metadata(&beside)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap();
+        assert!(still_old > call, "it freshened a lock that is not its own");
+
+        drop(first);
+        assert!(beside.exists(), "it removed the other rigor's lock");
+        drop(second);
+        assert!(!beside.exists(), "a rigor's own lock is removed");
     }
 
     #[test]

@@ -20,5 +20,5 @@ expression: "render(&mut o.a, 120, 20)"
   verdict   approv│            Paragraph 40 of the review.                                           │
   body      Paragr│  comment   src/last.rs:9                                                         │
             Paragr│            THE-LAST-LINE                                                         │
-            Paragr└ this is all of it · a posts · esc cancels ───────────────────────────────────────┘ ↓ more below · J
- post approve with 1 inline comment to #4840? a again to confirm, esc to cancel
+            Paragr└ 13 rows still to read · j / k ───────────────────────────────────────────────────┘ ↓ more below · J
+ post approve with 1 inline comment to #4840? 13 rows still to read (j / k), then y posts; esc cancels

@@ -1772,9 +1772,11 @@ struct FakeGitHub {
     /// written against.
     pulls: Mutex<std::collections::HashMap<u64, Result<Live, String>>>,
     reviews: Mutex<Result<Vec<Review>, String>>,
-    /// The inline comments of whichever review is asked about.
+    /// The inline comments of review 77, the one `review_by_viewer` makes.
     comments: Mutex<Result<Vec<Comment>, String>>,
-    post: Mutex<Result<(), PostFailure>>,
+    /// `Ok(None)` answers a post as GitHub would: with the review the request
+    /// describes, by the viewer.
+    post: Mutex<Result<Option<Review>, PostFailure>>,
     /// Run when a post arrives, before it is answered.
     on_post: Mutex<Option<OnPost>>,
 }
@@ -1794,7 +1796,7 @@ impl FakeGitHub {
         *self.comments.lock().unwrap() = comments;
     }
 
-    fn post_answers(&self, answer: Result<(), PostFailure>) {
+    fn post_answers(&self, answer: Result<Option<Review>, PostFailure>) {
         *self.post.lock().unwrap() = answer;
     }
 
@@ -1821,20 +1823,30 @@ impl Remote for FakeGitHub {
             .unwrap_or_else(|| Ok(live(true, false, crate::drafts::tests::HEAD)))
     }
 
-    fn reviews(&self, number: u64) -> Result<Vec<Review>, String> {
+    // Every list here fits on its first page.
+    fn reviews(&self, number: u64, page: usize) -> Result<Vec<Review>, String> {
+        assert_eq!(page, 1, "a second page of a short list was asked for");
         self.calls.lock().unwrap().push(format!("reviews {number}"));
         self.reviews.lock().unwrap().clone()
     }
 
-    fn review_comments(&self, number: u64, review: u64) -> Result<Vec<Comment>, String> {
+    fn comments(&self, number: u64, page: usize) -> Result<Vec<crate::drafts::Placed>, String> {
+        assert_eq!(page, 1, "a second page of a short list was asked for");
         self.calls
             .lock()
             .unwrap()
-            .push(format!("comments {number} {review}"));
-        self.comments.lock().unwrap().clone()
+            .push(format!("comments {number}"));
+        let of_77 = self.comments.lock().unwrap().clone()?;
+        Ok(of_77
+            .into_iter()
+            .map(|at| crate::drafts::Placed {
+                review: Some(77),
+                at: Some(at),
+            })
+            .collect())
     }
 
-    fn post(&self, number: u64, body: &str) -> Result<(), PostFailure> {
+    fn post(&self, number: u64, body: &str) -> Result<Review, PostFailure> {
         self.calls
             .lock()
             .unwrap()
@@ -1842,7 +1854,8 @@ impl Remote for FakeGitHub {
         if let Some(f) = self.on_post.lock().unwrap().as_ref() {
             f(self);
         }
-        self.post.lock().unwrap().clone()
+        let answer = self.post.lock().unwrap().clone()?;
+        Ok(answer.unwrap_or_else(|| crate::drafts::tests::created_by("octocat", body)))
     }
 
     fn timeout(&self) -> std::time::Duration {
@@ -1910,10 +1923,14 @@ impl Outbox {
             pulls: Mutex::default(),
             reviews: Mutex::new(Ok(Vec::new())),
             comments: Mutex::new(Ok(Vec::new())),
-            post: Mutex::new(Ok(())),
+            post: Mutex::new(Ok(None)),
             on_post: Mutex::new(None),
         });
         a.remote = Arc::clone(&gh) as Arc<dyn Remote>;
+        // Nothing here opens a browser or touches the clipboard, whatever
+        // key a test presses.
+        a.settings.open_command = "true".into();
+        a.settings.copy_command = "true".into();
         crate::util::freeze_millis(0);
         Self {
             a,
@@ -1953,10 +1970,10 @@ impl Outbox {
         render(&mut self.a, 160, 40);
     }
 
-    /// A second `a`, a deliberate while after the first.
+    /// `y`, a deliberate while after the question was drawn.
     fn answer(&mut self) {
         self.wait(1_000);
-        press(&mut self.a, "a");
+        press(&mut self.a, "y");
     }
 
     /// Ask, answer, and take the reply, as the event loop would deliver it.
@@ -2028,7 +2045,7 @@ fn request_4840() -> String {
 /// pull request is and what has been said on it, then sends the review once,
 /// and only then is the file marked posted.
 #[test]
-fn one_a_asks_and_a_second_a_checks_then_posts_exactly_the_review() {
+fn a_asks_and_y_checks_then_posts_exactly_the_review() {
     let mut o = Outbox::new();
     let before = o.json(4840);
 
@@ -2040,9 +2057,7 @@ fn one_a_asks_and_a_second_a_checks_then_posts_exactly_the_review() {
     );
     let prompt = footer(&frame(&mut o.a, 160, 40));
     assert!(
-        prompt.contains(
-            "post comment with 2 inline comments to #4840? a again to confirm, esc to cancel"
-        ),
+        prompt.contains("post comment with 2 inline comments to #4840? y to post, esc to cancel"),
         "{prompt:?}"
     );
     assert_eq!(o.file(4840), serde_json::to_string_pretty(&before).unwrap());
@@ -2088,104 +2103,152 @@ fn the_prompt_outranks_a_sync_error() {
     o.ask(4846);
     let line = footer(&frame(&mut o.a, 160, 40));
     assert!(
-        line.contains("post approve to #4846? a again to confirm") && !line.contains("timed out"),
+        line.contains("post approve to #4846? y to post") && !line.contains("timed out"),
         "{line:?}"
     );
 }
 
 // ------------------------------------------------- the two presses, in time
 
-/// A key held down repeats, and a worn switch sends one press as several.
-/// Neither is a decision. The `a` that confirms has to come after a pause
-/// with no `a` at all in it — and every `a` that arrives, whatever its kind,
-/// starts that pause again.
+/// A key held down repeats once the keyboard's own delay has passed — two
+/// fifths of a second on one machine, most of a second on another — and then
+/// every few hundredths. Nothing about the gap between two `a`s can tell
+/// that first repeat from a second, deliberate press. So `a` is never the
+/// answer: held for as long as you like, it opens the question and closes it
+/// again, and posts nothing.
 #[test]
-fn a_held_or_repeated_a_never_confirms() {
-    use crate::app::A_QUIET_MS;
-    use ratatui::crossterm::event::KeyEventKind::{Press, Release, Repeat};
+fn a_held_a_never_posts() {
+    use ratatui::crossterm::event::KeyEventKind::{Press, Repeat};
+    for first_repeat in [400, 500, 700] {
+        // Terminals that report a repeat as one, and those that send it as
+        // another press.
+        for kind in [Press, Repeat] {
+            let mut o = Outbox::new();
+            select_draft(&mut o.a, 4840);
+            o.wait(1_000);
+            press(&mut o.a, "a");
+            render(&mut o.a, 160, 40);
+            assert!(o.a.armed.is_some());
 
-    // Held: the terminal repeats it every 30 ms, for ten seconds.
-    for kind in [Press, Repeat] {
-        let mut o = Outbox::new();
-        o.ask(4840);
-        for _ in 0..333 {
-            o.wait(30);
-            key_of(&mut o.a, 'a', kind);
-            assert!(o.a.posting.is_none(), "a held key confirmed ({kind:?})");
-            assert!(o.a.armed.is_some(), "and the question stays up");
+            o.wait(first_repeat);
+            for _ in 0..80 {
+                key_of(&mut o.a, 'a', kind);
+                render(&mut o.a, 160, 40);
+                assert!(
+                    o.a.posting.is_none(),
+                    "a held a posted ({kind:?}, first repeat after {first_repeat} ms)"
+                );
+                o.wait(30);
+            }
+            assert!(o.calls().is_empty(), "{:?}", o.calls());
         }
-        assert!(o.calls().is_empty());
-
-        // Let go, and press again on purpose.
-        o.wait(A_QUIET_MS);
-        key_of(&mut o.a, 'a', Press);
-        assert!(o.a.posting.is_some(), "a deliberate a after a pause");
     }
-
-    // A bounce: the arming press arrives twice, a few milliseconds apart.
-    let mut o = Outbox::new();
-    select_draft(&mut o.a, 4840);
-    o.wait(1_000);
-    press(&mut o.a, "a");
-    render(&mut o.a, 160, 40);
-    o.wait(8);
-    press(&mut o.a, "a");
-    assert!(o.a.posting.is_none() && o.a.armed.is_some());
-
-    // One millisecond short of the pause is short of it.
-    o.wait(A_QUIET_MS - 1);
-    press(&mut o.a, "a");
-    assert!(o.a.posting.is_none(), "399 ms is not a pause");
-
-    // The release of a key counts as an `a` too: letting go and jabbing it
-    // again at once is still one gesture.
-    o.wait(A_QUIET_MS);
-    key_of(&mut o.a, 'a', Release);
-    o.wait(50);
-    press(&mut o.a, "a");
-    assert!(
-        o.a.posting.is_none(),
-        "an a right after a release confirmed"
-    );
-    assert!(o.calls().is_empty(), "{:?}", o.calls());
 }
 
-/// Pasted text is not typing. Without bracketed paste it arrives as keys, all
-/// at once, and the second `a` comes too soon to count. With it, it arrives
-/// as a paste, which neither asks nor answers.
+/// The key that asks is not the key that answers. A second `a`, however
+/// deliberate, takes the question down and does nothing else.
 #[test]
-fn pasted_text_never_asks_or_confirms() {
-    // As keys, in the same instant.
+fn a_then_a_cancels() {
+    let mut o = Outbox::new();
+    o.ask(4840);
+    o.wait(5_000);
+    press(&mut o.a, "a");
+    assert!(o.a.armed.is_none(), "a second a left the question up");
+    assert!(o.a.posting.is_none() && o.calls().is_empty());
+}
+
+/// `y` answers — once the question has been on screen long enough to have
+/// been seen. The wait is counted from when the overlay was first drawn, not
+/// from the key that asked for it: a repaint that stalls does not use it up.
+#[test]
+fn an_immediate_y_is_ignored_and_a_later_one_posts() {
+    use crate::app::ANSWER_FLOOR_MS;
     let mut o = Outbox::new();
     select_draft(&mut o.a, 4840);
     o.wait(1_000);
-    press(&mut o.a, "aa");
-    render(&mut o.a, 160, 40);
-    press(&mut o.a, "aaaa");
-    assert!(o.a.posting.is_none(), "pasted keys confirmed");
+    press(&mut o.a, "a");
 
+    // The frame is slow to come. However long ago the `a` was, nothing has
+    // been shown, so nothing can be answered.
+    o.wait(5_000);
+    press(&mut o.a, "y");
+    assert!(o.a.posting.is_none(), "answered before it was drawn");
+    assert!(o.a.armed.is_some(), "and the question is not taken down");
+
+    render(&mut o.a, 160, 40);
+    press(&mut o.a, "y");
+    assert!(o.a.posting.is_none(), "answered in the instant it appeared");
+    o.wait(ANSWER_FLOOR_MS - 1);
+    render(&mut o.a, 160, 40);
+    press(&mut o.a, "y");
+    assert!(o.a.posting.is_none(), "one millisecond short is short");
+    assert!(o.a.armed.is_some() && o.calls().is_empty());
+
+    o.wait(1);
+    press(&mut o.a, "y");
+    assert!(o.a.posting.is_some(), "a y after the pause is the answer");
+    o.settle();
+    assert_eq!(o.posts(), 1);
+}
+
+/// Keys typed ahead arrive together. `ay` in one breath asks, and the `y` is
+/// not an answer to a question that has only just appeared.
+#[test]
+fn typed_ahead_ay_does_not_post() {
+    // Handed over before any frame is drawn.
+    let mut o = Outbox::new();
+    select_draft(&mut o.a, 4840);
+    o.wait(1_000);
+    press(&mut o.a, "ay");
+    assert!(o.a.posting.is_none());
+
+    // And as the event loop takes them: one key, one frame, the next key.
+    let mut o = Outbox::new();
+    select_draft(&mut o.a, 4840);
+    o.wait(1_000);
+    press(&mut o.a, "a");
+    render(&mut o.a, 160, 40);
+    press(&mut o.a, "y");
+    render(&mut o.a, 160, 40);
+    press(&mut o.a, "yyy");
+    assert!(o.a.posting.is_none() && o.a.armed.is_some());
+    assert!(o.calls().is_empty(), "{:?}", o.calls());
+}
+/// Pasted text is not typing. With bracketed paste it arrives as a paste,
+/// which neither asks nor answers; without, it arrives as keys all at once,
+/// and its `y` comes before the question has been on screen at all.
+#[test]
+fn pasted_text_never_asks_or_confirms() {
     // As a paste, with nothing asked: nothing is asked by it.
     let mut o = Outbox::new();
     select_draft(&mut o.a, 4840);
-    crate::event::paste(&mut o.a, "aa");
+    crate::event::paste(&mut o.a, "ay");
     assert!(o.a.armed.is_none() && o.a.posting.is_none());
 
     // As a paste, with the question up and long enough ago to answer: it is
     // not an answer, and the question does not survive it.
     o.ask(4840);
     o.wait(5_000);
-    crate::event::paste(&mut o.a, "a");
+    crate::event::paste(&mut o.a, "y");
     assert!(o.a.armed.is_none() && o.a.posting.is_none());
+
+    // As keys, in the same instant.
+    o.wait(1_000);
+    press(&mut o.a, "ay");
+    render(&mut o.a, 160, 40);
+    press(&mut o.a, "y");
+    assert!(o.a.posting.is_none(), "pasted keys posted");
     assert!(o.calls().is_empty(), "{:?}", o.calls());
 
     // Where text is wanted, a paste is still text.
-    press(&mut o.a, "/");
+    press(&mut o.a, "\x1b/");
     crate::event::paste(&mut o.a, "pal\x1bette");
     assert_eq!(o.a.filter, "palette");
 }
-
-/// A question nobody answers goes away on its own, so that an `a` typed
-/// long after is a first `a` again and not the second.
+/// A question nobody answers or reads goes away on its own, so that a `y`
+/// typed long after is not about it. Reading it — scrolling — gives it
+/// longer. And it goes by the wall clock too: a question asked before the
+/// lid closed, when the other clock stops, is gone when it opens.
 #[test]
 fn the_question_expires() {
     use crate::app::ARMED_FOR_MS;
@@ -2198,18 +2261,41 @@ fn the_question_expires() {
     o.a.tick();
     assert!(o.a.armed.is_none(), "it outlived its time");
 
-    // The next `a` asks; it does not send.
+    // A `y` now is not an answer to anything.
     o.wait(60_000);
-    press(&mut o.a, "a");
-    assert!(o.a.armed.is_some() && o.a.posting.is_none());
-    assert!(o.calls().is_empty());
-}
+    press(&mut o.a, "y");
+    assert!(o.a.posting.is_none() && o.calls().is_empty());
 
+    // Reading starts the thirty seconds again.
+    o.ask(4840);
+    o.wait(ARMED_FOR_MS - 5_000);
+    press(&mut o.a, "j");
+    o.wait(ARMED_FOR_MS - 5_000);
+    o.a.tick();
+    assert!(o.a.armed.is_some(), "it expired while it was being read");
+    o.wait(5_000);
+    o.a.tick();
+    assert!(o.a.armed.is_none());
+
+    // Asleep: the clock the floor is counted on has not moved at all, and
+    // half a minute has gone by on the wall.
+    o.ask(4840);
+    crate::util::freeze_time(NOW + 29);
+    o.a.tick();
+    assert!(o.a.armed.is_some());
+    crate::util::freeze_time(NOW + 30);
+    o.a.tick();
+    assert!(
+        o.a.armed.is_none(),
+        "it was still up after the machine woke"
+    );
+    crate::util::freeze_time(NOW);
+}
 // ------------------------------------------------------------- the overlay
 
-fn overlay_text(o: &Outbox) -> Vec<String> {
+fn overlay_lines(o: &Outbox, width: usize) -> Vec<String> {
     let armed = o.a.armed.as_ref().expect("no question is up");
-    super::confirm::lines("#1 Title", &armed.draft, &o.a.theme, 80)
+    super::confirm::lines("#1 Title", &armed.draft, &o.a.theme, width)
         .iter()
         .map(|l| {
             l.spans
@@ -2240,7 +2326,7 @@ fn the_overlay_shows_what_will_be_posted_and_nothing_else() {
     o.a.reload_drafts();
     o.ask(4840);
 
-    let lines = overlay_text(&o);
+    let lines = overlay_lines(&o, 80);
     assert_eq!(
         lines,
         [
@@ -2262,12 +2348,77 @@ fn the_overlay_shows_what_will_be_posted_and_nothing_else() {
         "{screen}"
     );
     assert!(screen.contains("this is what will be posted"), "{screen}");
+    assert!(screen.contains("y posts · esc cancels"), "{screen}");
 
     // An approval with no words says there are none, rather than nothing.
     o.a.armed = None;
     o.ask(4846);
-    let lines = overlay_text(&o);
+    let lines = overlay_lines(&o, 80);
     assert_eq!(lines[2..], ["  verdict   approve", "  body      no text"]);
+}
+
+/// Nothing in the overlay is cut short. A path too long for the line wraps,
+/// so the file name and the line number — the parts that say where a comment
+/// will land — are always there to be read. So does a long word in a body.
+#[test]
+fn the_overlay_wraps_what_does_not_fit_and_cuts_nothing() {
+    let path = "crates/engine/src/storage/backends/filesystem/layout/segments/\
+                compaction/strategy/tiered/planner/the_file_that_matters.rs";
+    let word = "x".repeat(150);
+    let mut o = Outbox::new();
+    let text = draft_json(4840, |v| {
+        v["body"] = format!("See {word} above.").into();
+        v["comments"] = serde_json::json!([
+            { "path": path, "line": 1234, "side": "LEFT", "body": "This one." }
+        ]);
+    });
+    std::fs::write(o.path(4840), text).unwrap();
+    o.a.reload_drafts();
+    o.ask(4840);
+
+    for width in [82, 60, 40] {
+        let lines = overlay_lines(&o, width);
+        for l in &lines {
+            assert!(crate::util::width(l) <= width, "{width}: too wide: {l:?}");
+            assert!(!l.contains('…'), "{width}: cut short: {l:?}");
+        }
+        // Put back together, every character of where it lands is there.
+        let values: String = lines
+            .iter()
+            .map(|l| l.chars().skip(12).collect::<String>())
+            .collect();
+        assert!(
+            values.contains(&format!("{path}:1234 (LEFT)")),
+            "{width}: {lines:#?}"
+        );
+        assert!(values.contains(&word), "{width}: {lines:#?}");
+    }
+
+    // On the screen too, and all of it counts as rows to be read.
+    let screen = render(&mut o.a, 100, 40);
+    assert!(
+        screen.contains("the_file_that_matters.rs:1234 (LEFT)"),
+        "{screen}"
+    );
+    assert!(
+        !screen
+            .lines()
+            .filter(|l| l.contains('│'))
+            .any(|l| l.contains('…')),
+        "{screen}"
+    );
+}
+
+/// Where a comment lands is broken between directories where it can be, and
+/// inside a name only when the name alone is longer than the line.
+#[test]
+fn a_long_path_breaks_after_a_slash_where_it_can() {
+    let wrapped = super::confirm::wrap_place("a/bb/ccc/dddd.rs:12", 6);
+    assert_eq!(wrapped, ["a/bb/", "ccc/", "dddd.r", "s:12"]);
+    assert_eq!(
+        super::confirm::wrap_place("src/x.rs:84", 40),
+        ["src/x.rs:84"]
+    );
 }
 
 /// A draft of forty paragraphs and a comment after them, which no overlay
@@ -2288,10 +2439,10 @@ fn long_draft(o: &mut Outbox) {
 }
 
 /// Nothing is posted unread. A draft longer than the overlay scrolls inside
-/// it, the scrolling leaves the question up, and `a` is turned away until
-/// the last of it has been on screen.
+/// it, the scrolling leaves the question up, and `y` is turned away until
+/// every row of it has been on screen — which jumping to the end is not.
 #[test]
-fn nothing_is_confirmed_before_its_end_has_been_shown() {
+fn nothing_is_posted_until_every_row_has_been_on_screen() {
     let mut o = Outbox::new();
     long_draft(&mut o);
     select_draft(&mut o.a, 4840);
@@ -2302,51 +2453,120 @@ fn nothing_is_confirmed_before_its_end_has_been_shown() {
         screen.contains("Paragraph 1 ") && !screen.contains("THE-LAST-LINE"),
         "{screen}"
     );
-    assert!(screen.contains("more below · j"), "{screen}");
+    let unread = o.a.armed.as_ref().unwrap().unread();
+    assert!(unread > 0);
+    assert!(
+        screen.contains(&format!("{unread} rows still to read")),
+        "{screen}"
+    );
     let prompt = footer(&frame(&mut o.a, 120, 20));
     assert!(
-        prompt.contains("j scrolls to the end, then a confirms") && !prompt.contains("a again"),
+        prompt.contains("rows still to read") && !prompt.contains("y to post"),
         "{prompt:?}"
     );
 
-    // However deliberate, `a` does not send what has not been shown.
+    // However deliberate, `y` does not send what has not been shown.
     o.answer();
     assert!(o.a.posting.is_none(), "an unread draft was posted");
     assert!(o.a.armed.is_some(), "and the question is still there");
 
-    // Reading on does not take the question down.
-    for _ in 0..10 {
-        press(&mut o.a, "j");
-        render(&mut o.a, 120, 20);
-    }
-    assert!(o.a.armed.is_some(), "scrolling withdrew the question");
-    o.answer();
-    assert!(o.a.posting.is_none(), "ten lines down is not the end");
-
-    // The wheel reads too. Then to the end.
-    mouse(
-        &mut o.a,
-        ratatui::crossterm::event::MouseEventKind::ScrollDown,
-        60,
-        10,
-    );
-    assert!(o.a.armed.is_some(), "the wheel withdrew the question");
+    // Straight to the end: the last row has been shown, the middle has not.
     press(&mut o.a, "G");
     let screen = render(&mut o.a, 120, 20);
     assert!(screen.contains("THE-LAST-LINE"), "{screen}");
+    let skipped = o.a.armed.as_ref().unwrap().unread();
+    assert!(
+        skipped > 0 && skipped < unread,
+        "the end was taken for the whole: {skipped} of {unread}"
+    );
+    assert!(
+        screen.contains(&format!("{skipped} rows still to read")),
+        "{screen}"
+    );
+    o.answer();
+    assert!(o.a.posting.is_none(), "posted with the middle never shown");
+
+    // Reading on, by key and by wheel, does not take the question down.
+    press(&mut o.a, "g");
+    for _ in 0..60 {
+        press(&mut o.a, "j");
+        render(&mut o.a, 120, 20);
+        if o.a.armed.as_ref().unwrap().unread() == 0 {
+            break;
+        }
+    }
+    mouse(
+        &mut o.a,
+        ratatui::crossterm::event::MouseEventKind::ScrollUp,
+        60,
+        10,
+    );
+    assert!(o.a.armed.is_some(), "reading withdrew the question");
+    let screen = render(&mut o.a, 120, 20);
+    assert_eq!(o.a.armed.as_ref().unwrap().unread(), 0);
     assert!(screen.contains("this is all of it"), "{screen}");
     assert!(
-        footer(&frame(&mut o.a, 120, 20)).contains("a again to confirm"),
-        "the footer still withholds a"
+        footer(&frame(&mut o.a, 120, 20)).contains("y to post"),
+        "the footer still withholds y"
     );
 
-    // Having seen the end is enough; scrolling back up does not undo it.
+    // Laid out afresh for another width, they are other rows, and what was
+    // read of the old ones does not count for them.
+    render(&mut o.a, 60, 20);
+    assert!(o.a.armed.as_ref().unwrap().unread() > 0);
+    o.answer();
+    assert!(o.a.posting.is_none(), "posted from a layout never read");
+
     press(&mut o.a, "g");
-    render(&mut o.a, 120, 20);
+    for _ in 0..200 {
+        render(&mut o.a, 60, 20);
+        if o.a.armed.as_ref().unwrap().unread() == 0 {
+            break;
+        }
+        press(&mut o.a, "j");
+    }
     o.answer();
     assert!(o.a.posting.is_some());
     o.settle();
     assert_eq!(o.posts(), 1);
+}
+
+/// A window too small to show what would be posted without cutting it is a
+/// window nothing is posted from. It says so, and says what to do.
+#[test]
+fn nothing_is_posted_from_a_window_too_small_to_show_it() {
+    for (w, h) in [(34u16, 20u16), (120, 7)] {
+        let mut o = Outbox::new();
+        select_draft(&mut o.a, 4840);
+        o.wait(1_000);
+        press(&mut o.a, "a");
+        let screen = render(&mut o.a, w, h);
+        assert!(screen.contains("enlarge the window"), "{w}x{h}:\n{screen}");
+        assert!(
+            !screen.contains("this is what will be posted"),
+            "{w}x{h}: it drew what it could not show whole:\n{screen}"
+        );
+        o.answer();
+        render(&mut o.a, w, h);
+        assert!(o.a.posting.is_none(), "{w}x{h}: posted unseen");
+        assert!(o.a.armed.is_some());
+
+        // Enlarged, it is shown, read, and can be answered.
+        let screen = render(&mut o.a, 160, 40);
+        assert!(screen.contains("this is what will be posted"), "{screen}");
+        o.answer();
+        assert!(o.a.posting.is_some(), "{w}x{h}");
+        o.settle();
+    }
+    // The footer of a wide but short window has room to say why.
+    let mut o = Outbox::new();
+    select_draft(&mut o.a, 4840);
+    press(&mut o.a, "a");
+    let prompt = footer(&frame(&mut o.a, 160, 7));
+    assert!(
+        prompt.contains("the window is too small to show it: enlarge it to post"),
+        "{prompt:?}"
+    );
 }
 
 #[test]
@@ -2363,7 +2583,6 @@ fn confirmation_overlay_snapshots() {
     press(&mut o.a, "G");
     insta::assert_snapshot!("confirm_overlay_long_end_120x20", render(&mut o.a, 120, 20));
 }
-
 // --------------------------------------------------- withdrawing a question
 
 /// The question answers to `a`, and reads with the movement keys. Anything
@@ -2376,7 +2595,7 @@ fn any_other_key_withdraws_the_question_and_does_nothing_else() {
     let before = o.file(4840);
 
     for other in [
-        "\x1b", "?", "s", "e", "x", "q", "o", "/", "\n", "r", "d", "1", "\t",
+        "\x1b", "a", "?", "s", "e", "x", "q", "o", "c", "/", "\n", "r", "d", "1", "\t",
     ] {
         o.ask(4840);
         assert!(o.a.armed.is_some(), "before {other:?}");
@@ -2565,7 +2784,7 @@ fn a_refusal_from_github_is_shown_and_the_draft_stays_postable() {
     let fixed = draft_json(4840, |v| v["comments"] = serde_json::json!([]));
     std::fs::write(o.path(4840), fixed).unwrap();
     o.a.reload_drafts();
-    o.gh.post_answers(Ok(()));
+    o.gh.post_answers(Ok(None));
     o.ask(4840);
     o.answer();
     assert!(
@@ -2751,7 +2970,7 @@ fn a_post_that_got_no_answer_is_unknown_and_is_found_not_sent_again() {
 
     assert_eq!(
         o.failure(),
-        "#4840: the review was sent and no answer came back (gh api: timed out after 45s). It may or may not be posted; a again asks GitHub before sending anything"
+        "#4840: the review was sent, and whether it was posted is not known (gh api: timed out after 45s). a asks again, and GitHub is checked before anything is sent"
     );
     assert!(
         !o.failure().contains("failed"),
@@ -2768,7 +2987,7 @@ fn a_post_that_got_no_answer_is_unknown_and_is_found_not_sent_again() {
     assert_eq!(o.posts(), 1, "posted twice: {:?}", o.calls());
     assert_eq!(
         o.calls()[3..],
-        ["pull 4840", "reviews 4840", "comments 4840 77"],
+        ["pull 4840", "reviews 4840", "comments 4840"],
         "the second attempt read, and did not write"
     );
     let after = o.json(4840);
@@ -2818,7 +3037,7 @@ fn a_post_that_got_no_answer_and_did_not_land_is_sent_on_the_next_try() {
     );
 
     o.gh.reviews_are(Ok(Vec::new()));
-    o.gh.post_answers(Ok(()));
+    o.gh.post_answers(Ok(None));
     o.confirm(4840);
     assert_eq!(o.posts(), 2);
     assert!(draft_row(&mut o.a, 4840).contains(" ✓ posted "));
@@ -2914,7 +3133,7 @@ fn a_review_already_on_github_marks_the_draft_posted_and_sends_nothing() {
     let before = o.json(4840);
     o.confirm(4840);
 
-    assert_eq!(o.calls(), ["pull 4840", "reviews 4840", "comments 4840 77"]);
+    assert_eq!(o.calls(), ["pull 4840", "reviews 4840", "comments 4840"]);
     let mut want = before;
     want["status"] = "posted".into();
     want["posted_at"] = POSTED_NOW.into();
@@ -3072,7 +3291,7 @@ fn an_unverified_draft_is_checked_on_github_and_then_posted() {
     let prompt = footer(&frame(&mut o.a, 160, 40));
     assert!(
         prompt.contains(
-            "post approve with 1 inline comment to #4990? not fetched here, so GitHub is asked for its head first. a again to confirm, esc to cancel"
+            "post approve with 1 inline comment to #4990? not fetched here, so GitHub is asked for its head first. y to post, esc to cancel"
         ),
         "{prompt:?}"
     );
@@ -3107,9 +3326,10 @@ fn a_fetch_that_verifies_the_draft_withdraws_the_unverified_prompt() {
     assert!(o.calls().is_empty());
 }
 
-/// `a` posts only from the Drafts view, and never as a chord.
+/// `a` asks only from the Drafts view, and neither it nor `y` does anything
+/// as a chord.
 #[test]
-fn a_does_nothing_outside_the_drafts_view_or_with_ctrl() {
+fn a_and_y_do_nothing_outside_the_drafts_view_or_as_a_chord() {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let mut o = Outbox::new();
     o.a.set_view(View::All);
@@ -3124,15 +3344,15 @@ fn a_does_nothing_outside_the_drafts_view_or_with_ctrl() {
         crate::event::key(&mut o.a, KeyEvent::new(KeyCode::Char('a'), modifier));
         assert!(
             o.a.armed.is_none() && o.a.posting.is_none(),
-            "{modifier:?} asked"
+            "{modifier:?}-a asked"
         );
         // Nor does a chord answer a question that is up: it takes it down.
         o.ask(4840);
         o.wait(1_000);
-        crate::event::key(&mut o.a, KeyEvent::new(KeyCode::Char('a'), modifier));
+        crate::event::key(&mut o.a, KeyEvent::new(KeyCode::Char('y'), modifier));
         assert!(
             o.a.armed.is_none() && o.a.posting.is_none(),
-            "{modifier:?} answered"
+            "{modifier:?}-y answered"
         );
     }
     assert!(o.calls().is_empty());
@@ -3246,7 +3466,7 @@ fn a_file_with_no_number_is_never_shown_as_posting() {
     let row = |a: &mut App| {
         render(a, 160, 24)
             .lines()
-            .find(|l| l.starts_with(" notes…"))
+            .find(|l| l.starts_with(" notes.json "))
             .map(String::from)
             .expect("no row for the misnamed file")
     };
@@ -3270,4 +3490,180 @@ fn a_file_with_no_number_is_never_shown_as_posting() {
     );
     release.send(()).unwrap();
     o.settle();
+}
+
+/// GitHub answered the post, and `gh` exited cleanly — but what came back is
+/// not this review. That is what a request redirected and followed as a read
+/// looks like. It is not recorded as posted on that evidence.
+#[test]
+fn an_answer_that_is_not_this_review_is_not_recorded_as_posted() {
+    let mut o = Outbox::new();
+    let before = o.file(4840);
+    // Somebody else's review, of another kind, on another commit.
+    o.gh.post_answers(Ok(Some(Review {
+        id: 5,
+        author: "hubot".into(),
+        state: "APPROVED".into(),
+        commit: MOVED.into(),
+        body: String::new(),
+        submitted_at: Some(POSTED_NOW.into()),
+    })));
+    o.confirm(4840);
+    assert_eq!(o.posts(), 1);
+    assert_eq!(
+        o.file(4840),
+        before,
+        "marked posted on gh's exit status alone"
+    );
+    assert!(
+        o.failure().contains(
+            "whether it was posted is not known (GitHub answered, but not with this review)"
+        ),
+        "{}",
+        o.failure()
+    );
+    assert!(draft_row(&mut o.a, 4840).contains(" maybe sent "));
+}
+
+/// The draft is read again when the answer comes, and read the way the list
+/// reads it: only ever as a regular file. A link swapped in under the
+/// question, even to a file that says the same, is not the draft that was
+/// shown.
+#[cfg(unix)]
+#[test]
+fn a_draft_swapped_for_a_link_after_the_question_is_not_posted() {
+    let mut o = Outbox::new();
+    o.ask(4840);
+    let elsewhere = o.dir.path().join("elsewhere.json");
+    std::fs::rename(o.path(4840), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, o.path(4840)).unwrap();
+    assert_eq!(o.file(4840), std::fs::read_to_string(&elsewhere).unwrap());
+
+    o.answer();
+    assert!(
+        o.a.posting.is_none() && o.calls().is_empty(),
+        "{:?}",
+        o.calls()
+    );
+    assert!(o.note().contains("#4840 changed on disk"), "{}", o.note());
+}
+
+// ------------------------------------------------------------- on the way out
+
+/// Rigor on its way out lets a post in flight finish, and records it, without
+/// reading anything from a terminal that may be gone.
+#[test]
+fn leaving_waits_for_the_post_in_flight_and_records_it() {
+    let mut o = Outbox::new();
+    assert_eq!(
+        o.a.finish_post(&o.replies, std::time::Duration::from_secs(5)),
+        None,
+        "nothing in flight, nothing to wait for"
+    );
+
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = Mutex::new(gate);
+    o.gh.on_post(move |_| {
+        let _ = gate.lock().unwrap().recv();
+    });
+    o.ask(4840);
+    o.answer();
+    assert!(o.a.posting.is_some());
+
+    // GitHub answers a moment after rigor is asked to go.
+    let later = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        release.send(()).unwrap();
+    });
+    let said =
+        o.a.finish_post(&o.replies, std::time::Duration::from_secs(10));
+    later.join().unwrap();
+    assert_eq!(said.as_deref(), Some("posted to #4840"));
+    assert_eq!(o.json(4840)["status"], "posted");
+    assert!(o.a.posting.is_none() && o.a.quitting);
+}
+
+/// The wait has one limit, for the whole of what is left. Past it rigor goes
+/// anyway — and says the outcome is not known, rather than that it failed,
+/// and leaves the file saying what is true of it.
+#[test]
+fn leaving_gives_up_after_its_limit_and_says_the_outcome_is_unknown() {
+    let mut o = Outbox::new();
+    let before = o.file(4840);
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = Mutex::new(gate);
+    o.gh.on_post(move |_| {
+        let _ = gate.lock().unwrap().recv();
+    });
+    o.ask(4840);
+    o.answer();
+
+    let started = std::time::Instant::now();
+    let said =
+        o.a.finish_post(&o.replies, std::time::Duration::from_millis(200))
+            .expect("something to say");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "the wait was not bounded: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        said.contains("the post to #4840 did not finish")
+            && said.contains("may or may not be posted"),
+        "{said}"
+    );
+    assert!(!said.contains("failed"), "{said}");
+    assert_eq!(o.file(4840), before, "recorded on a guess");
+    assert!(o.a.posting.is_none());
+    release.send(()).unwrap();
+}
+
+/// However the event loop ended, the way out is the same. An error from a
+/// terminal that went away is not a reason to cut a review off half-sent: the
+/// post is waited for and recorded, nothing is drawn to the terminal that
+/// failed, and the error is handed on as it was.
+#[test]
+fn leaving_on_an_error_still_waits_for_the_post_and_records_it() {
+    for ended in [Ok(()), Err("the terminal went away")] {
+        let mut o = Outbox::new();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        o.gh.on_post(move |_| {
+            let _ = gate.lock().unwrap().recv();
+        });
+        o.ask(4840);
+        o.answer();
+        let later = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            release.send(()).unwrap();
+        });
+
+        let mut drawn = false;
+        let (handed_on, said) = o.a.leave(
+            ended,
+            &o.replies,
+            std::time::Duration::from_secs(10),
+            |_| drawn = true,
+        );
+        later.join().unwrap();
+        assert_eq!(handed_on, ended);
+        assert_eq!(said.as_deref(), Some("posted to #4840"), "{ended:?}");
+        assert_eq!(o.json(4840)["status"], "posted", "{ended:?}");
+        assert_eq!(
+            drawn,
+            ended.is_ok(),
+            "a terminal that failed is not drawn to"
+        );
+    }
+
+    // With nothing in flight there is nothing to wait for or to say.
+    let mut o = Outbox::new();
+    let (handed_on, said) = o.a.leave(
+        Err("x"),
+        &o.replies,
+        std::time::Duration::from_secs(10),
+        |_| {},
+    );
+    assert_eq!((handed_on, said), (Err("x"), None));
+    assert!(!o.a.quitting);
 }

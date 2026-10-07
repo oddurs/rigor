@@ -54,8 +54,8 @@ repository's pull requests: add `drafts` to `views`, or run `rigor -v drafts`.
 Keys: `o`/`Enter` opens the selected pull request in the browser, `c` its checks
 page, `y` copies the URL, `/` filters, `s` toggles between recency and
 merge-readiness ordering, `d` shows or hides draft pull requests, `r` refreshes,
-`?` lists everything. In the `Drafts` view, `a` posts the selected review draft
-(it asks first), `e` edits it and `x` skips it.
+`?` lists everything. In the `Drafts` view, `a` asks to post the selected review
+draft and `y` then posts it, `e` edits it and `x` skips it.
 
 CI shows as a rolled-up glyph with counts in each row (`✓ 19`, `✗ 1/19`,
 `◐ 15/19`); selecting a pull request expands every check run with its state and
@@ -123,32 +123,36 @@ link, or anything else under a draft's name, is listed as `invalid`.
 
 ### Posting a draft
 
-Posting is public and under your name, so it takes two deliberate keypresses,
-and the second asks GitHub before it sends anything.
+Posting is public and under your name, so it takes two different keys, and the
+second asks GitHub before it sends anything.
 
-The first `a` only asks. It opens an overlay showing exactly what would be
-posted, and nothing else: the pull request's number and title, the verdict,
-the body, and each inline comment at its `path:line`. The private `note` and
-`picked` are not in it, because they are not sent. The footer names the
-action:
+`a` only asks. It opens an overlay showing exactly what would be posted, and
+nothing else: the pull request's number and title, the verdict, the body, and
+each inline comment at its `path:line`. Nothing in it is cut short — a long
+path wraps — and the private `note` and `picked` are not in it, because they
+are not sent. The footer names the action:
 
 ```
-post approve to #101? a again to confirm, esc to cancel
+post approve to #101? y to post, esc to cancel
 ```
 
-A second `a` goes ahead, under three conditions:
+`y` goes ahead, under three conditions:
 
-- **It is a second press, not the first one still arriving.** An `a` counts
-  only after 400 ms with no `a` at all, so a held key or a chattering switch
-  never confirms. Pasted text never asks and never confirms.
+- **It answers a question you have had time to see.** A `y` in the first
+  400 ms after the overlay appears is ignored, so keys typed ahead are not an
+  answer. Pasted text never asks and never answers. And the key that asks is
+  not the key that answers: a second `a`, or an `a` held down, only takes the
+  overlay down again.
 - **You have been shown all of it.** A draft longer than the overlay scrolls
-  inside it with `j` / `k`, and `a` is turned away until its last line has
-  been on screen.
+  inside it with `j` / `k`, and `y` is turned away until every row of it has
+  been on screen; jumping to the end does not count for the rows in between.
+  In a window too small to show it without cutting something, the overlay asks
+  for a larger one and nothing is posted.
 - **It is still the question you were asked.** `esc` or any other key takes
   the overlay down and does nothing else; so does a refresh that changes the
-  draft or its pull request, and thirty seconds without an answer. The
-  question follows the draft's file, not its row, so a draft arriving above it
-  cannot slide another one under the key.
+  draft or its pull request, and thirty seconds without an answer or a scroll.
+  The question follows the draft's file, not its row, so a draft arriving
+  above it cannot slide another one under the key.
 
 Going ahead is a few reads, then at most one write:
 
@@ -176,7 +180,9 @@ already posted drafts are never offered; `a` says why.
 
 What happens next depends on GitHub's answer:
 
-- **Accepted.** The file's `status` becomes `posted` and `posted_at` is set.
+- **Accepted** — GitHub answers with the review it created: this verdict, on
+  this commit, under your name. Nothing less counts; `gh` exiting cleanly is
+  not evidence. The file's `status` becomes `posted` and `posted_at` is set.
   Those are the only two fields `rigor` ever writes, and it replaces the file
   in one step rather than writing over it. If the file was changed while the
   review was on its way, what was sent is what is recorded, and you are told.
@@ -184,14 +190,16 @@ What happens next depends on GitHub's answer:
   diff. GitHub's own message is shown, and stays until `esc` or the next
   attempt. The file is left exactly as it was; edit the draft and it can be
   sent.
-- **No answer** — a timeout, a dropped connection. The review may or may not
-  be there, and `rigor` says so rather than calling it a failure; the row reads
-  `maybe sent`. Press `a` again and the reads above settle it before anything
-  is sent a second time.
+- **No answer** — a timeout, a dropped connection, an answer that is not the
+  review. The review may or may not be there, and `rigor` says so rather than
+  calling it a failure; the row reads `maybe sent`. Ask again with `a` and the
+  reads above settle it before anything is sent a second time.
 
 One attempt runs at a time. While it does, `e` and `x` leave that draft alone,
-a second `rigor` on the same repository finds a lock beside the draft and
-stands back, and quitting waits for the answer and records it before it goes.
+and a second `rigor` on the same repository finds a lock beside the draft and
+stands back. However `rigor` is leaving — `q`, a signal, a terminal that went
+away — it waits for the answer and records it first, up to one call's timeout
+and a few seconds more; past that it goes, and says the outcome is not known.
 
 `e` opens the draft's file in `$VISUAL`, else `$EDITOR`, else `vi`, and reads
 it again when the editor exits. `x` skips a draft, or brings a skipped one

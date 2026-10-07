@@ -141,11 +141,11 @@ impl World {
         .unwrap();
     }
 
-    /// The inline comments of review `id` on pull request `number`. Until a
-    /// test says, a review has none.
-    fn review_comments(&self, number: u64, id: u64, comments: &serde_json::Value) {
+    /// The first page of the inline comments on pull request `number`,
+    /// whichever review each belongs to. Until a test says, there are none.
+    fn comments(&self, number: u64, comments: &serde_json::Value) {
         std::fs::write(
-            self.root().join(format!("comments.{number}.{id}.1.json")),
+            self.root().join(format!("comments.{number}.1.json")),
             comments.to_string(),
         )
         .unwrap();
@@ -220,27 +220,9 @@ fn init_repo(root: &Path) {
     );
 }
 
-/// A fake `gh` answering from the fixture (or hanging, failing, or reporting a
-/// rate limit), a `git` shim logging every call, and an opener that records the
-/// URL it was handed.
-fn install_fakes(root: &Path) {
-    let bin = root.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let landed = isolated("git", &root.join("wt/landed"))
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .unwrap();
-    let landed = String::from_utf8(landed.stdout).unwrap();
-    assert!(FIXTURE.contains(FIXTURE_LANDED_OID));
-    std::fs::write(
-        root.join("fixture.json"),
-        FIXTURE.replace(FIXTURE_LANDED_OID, landed.trim()),
-    )
-    .unwrap();
-    std::fs::write(root.join("gh.mode"), "ok").unwrap();
-    write_exe(
-        &bin.join("gh"),
-        r#"#!/bin/sh
+/// The fake `gh`. It answers from files a test leaves beside it, so what it
+/// says is the test's to decide, and it writes down every call it takes.
+const FAKE_GH: &str = r#"#!/bin/sh
 dir="$(cd "$(dirname "$0")/.." && pwd)"
 # Every call, in the order it came. The fetch's query spans many lines, so it
 # is logged by name; the rest by their arguments.
@@ -263,16 +245,17 @@ case "$*" in
       echo "gh: Unprocessable Entity (HTTP 422)" >&2
       exit 1
     fi
-    printf '%s' '{"id":1,"state":"APPROVED"}'
+    # What GitHub answers a write with: the review it created.
+    cat "$dir/post.response.json"
     exit 0 ;;
 esac
-# The reads made before a write: one pull request, its reviews a page at a
-# time, and the inline comments of one review.
+# The reads made before a write: one pull request, and its reviews and its
+# inline comments a page at a time.
 case "$2" in
-  repos/*/pulls/*/reviews/*/comments*)
-    n="${2#*/pulls/}"; n="${n%%/*}"; id="${2#*/reviews/}"; id="${id%%/*}"; page="${2##*page=}"
-    if [ -f "$dir/comments.$n.$id.$page.json" ]; then
-      cat "$dir/comments.$n.$id.$page.json"
+  repos/*/pulls/*/comments*)
+    n="${2#*/pulls/}"; n="${n%%/*}"; page="${2##*page=}"
+    if [ -f "$dir/comments.$n.$page.json" ]; then
+      cat "$dir/comments.$n.$page.json"
     else
       printf '[]'
     fi
@@ -308,8 +291,27 @@ case "$(cat "$dir/gh.mode")" in
   ratelimit) printf '%s' '{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded for user ID 1."}]}' ;;
   *) cat "$dir/fixture.json" ;;
 esac
-"#,
-    );
+"#;
+
+/// A fake `gh` answering from the fixture (or hanging, failing, or reporting a
+/// rate limit), a `git` shim logging every call, and an opener that records the
+/// URL it was handed.
+fn install_fakes(root: &Path) {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let landed = isolated("git", &root.join("wt/landed"))
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let landed = String::from_utf8(landed.stdout).unwrap();
+    assert!(FIXTURE.contains(FIXTURE_LANDED_OID));
+    std::fs::write(
+        root.join("fixture.json"),
+        FIXTURE.replace(FIXTURE_LANDED_OID, landed.trim()),
+    )
+    .unwrap();
+    std::fs::write(root.join("gh.mode"), "ok").unwrap();
+    write_exe(&bin.join("gh"), FAKE_GH);
     let real_git = String::from_utf8(
         Command::new("sh")
             .args(["-c", "command -v git"])
@@ -329,9 +331,28 @@ esac
         &bin.join("open-log"),
         "#!/bin/sh\necho \"$1\" >> \"$(cd \"$(dirname \"$0\")/..\" && pwd)/opened.log\"\n",
     );
+    // Nothing a test presses reaches the real clipboard.
     std::fs::write(
         root.join("config.toml"),
-        format!("open_command = \"{}\"\n", bin.join("open-log").display()),
+        format!(
+            "open_command = \"{}\"\ncopy_command = \"true\"\n",
+            bin.join("open-log").display()
+        ),
+    )
+    .unwrap();
+    // What the fake `gh` answers a write with, until a test says otherwise:
+    // the review `World::draft` describes, created, by the fixture's viewer.
+    std::fs::write(
+        root.join("post.response.json"),
+        serde_json::json!({
+            "id": 900,
+            "user": { "login": "octocat" },
+            "state": "APPROVED",
+            "commit_id": FIXTURE_HEAD_101,
+            "body": "Reads well.",
+            "submitted_at": "2026-01-15T10:00:00Z"
+        })
+        .to_string(),
     )
     .unwrap();
 }
@@ -817,8 +838,8 @@ fn reviews_call(number: u64, page: usize) -> String {
     format!("api repos/acme/widget/pulls/{number}/reviews?per_page=100&page={page}")
 }
 
-fn comments_call(number: u64, review: u64) -> String {
-    format!("api repos/acme/widget/pulls/{number}/reviews/{review}/comments?per_page=100&page=1")
+fn comments_call(number: u64) -> String {
+    format!("api repos/acme/widget/pulls/{number}/comments?per_page=100&page=1")
 }
 
 fn post_call(number: u64) -> String {
@@ -838,11 +859,16 @@ fn review(id: u64, login: &str, state: &str, body: &str) -> serde_json::Value {
     })
 }
 
-/// The one inline comment `World::draft` writes, as GitHub lists it on a
-/// review.
-fn the_drafts_comment() -> serde_json::Value {
+/// The one inline comment `World::draft` writes, as GitHub lists it among a
+/// pull request's comments, on review `review` — beside somebody else's.
+fn the_drafts_comment_on(review: u64) -> serde_json::Value {
     serde_json::json!([
-        { "id": 1, "path": "src/x.rs", "line": 84, "side": "RIGHT", "body": "Worth a test." }
+        { "id": 1, "pull_request_review_id": 3, "path": "src/y.rs", "line": 2,
+          "original_line": 2, "side": "RIGHT", "original_side": null,
+          "start_line": null, "subject_type": "line", "body": "Elsewhere." },
+        { "id": 2, "pull_request_review_id": review, "path": "src/x.rs", "line": 84,
+          "original_line": 84, "side": "RIGHT", "original_side": null,
+          "start_line": null, "subject_type": "line", "body": "Worth a test." }
     ])
 }
 
@@ -868,13 +894,13 @@ fn ready_to_post_with(w: &World, env: &[(&str, &str)]) -> (Term, PathBuf, String
 /// The question a first `a` puts up, drawn.
 const ASKED: &str = "this is what will be posted";
 
-/// `a`, the overlay, a pause any person would leave, and `a` again.
+/// `a`, the overlay read, a pause any person would leave, and `y`.
 fn confirm(t: &Term) {
     t.send(b"a");
     t.wait_for(ASKED, LOAD);
-    t.wait_for("a again to confirm", LOAD);
+    t.wait_for("y to post, esc to cancel", LOAD);
     std::thread::sleep(Duration::from_millis(600));
-    t.send(b"a");
+    t.send(b"y");
 }
 
 /// The one write rigor makes to GitHub, end to end. The first `a` only asks,
@@ -890,7 +916,7 @@ fn a_confirmed_post_reads_twice_then_sends_exactly_one_review() {
 
     t.send(b"a");
     t.wait_for(
-        "post approve with 1 inline comment to #101? a again to confirm, esc to cancel",
+        "post approve with 1 inline comment to #101? y to post, esc to cancel",
         LOAD,
     );
     // What will go out is on screen, under the pull request it is for, and
@@ -915,7 +941,7 @@ fn a_confirmed_post_reads_twice_then_sends_exactly_one_review() {
     assert_eq!(w.calls(), [FETCH], "one a reached GitHub");
 
     std::thread::sleep(Duration::from_millis(600));
-    t.send(b"a");
+    t.send(b"y");
     t.wait_line("#101 posted", LOAD, |l| {
         l.contains("#101") && l.contains("✓ posted")
     });
@@ -961,10 +987,10 @@ fn a_confirmed_post_reads_twice_then_sends_exactly_one_review() {
     );
 }
 
-/// A stray keypress reaches nothing: `a` on its own only asks, and anything
-/// that is not a second `a` withdraws the question.
+/// A stray keypress reaches nothing: `a` only asks, a second `a` is not an
+/// answer, and anything that is not `y` takes the question down.
 #[test]
-fn a_single_a_sends_nothing() {
+fn a_alone_sends_nothing_and_a_second_a_cancels() {
     let w = World::new();
     w.pull(101, "open", false, FIXTURE_HEAD_101);
     let (t, path, before) = ready_to_post(&w);
@@ -973,11 +999,17 @@ fn a_single_a_sends_nothing() {
         t.wait("the question to go", LOAD, |s| !s.contains(ASKED));
     };
 
+    // However long after: the key that asks is not the key that answers.
+    t.send(b"a");
+    asked(&t);
+    std::thread::sleep(Duration::from_millis(900));
+    t.send(b"a");
+    withdrawn(&t);
+
     t.send(b"a");
     asked(&t);
     t.send(b"\x1b");
     withdrawn(&t);
-    // After a cancel the next `a` is a first `a` again.
     t.send(b"a");
     asked(&t);
     t.send(b"x");
@@ -1000,30 +1032,43 @@ fn a_single_a_sends_nothing() {
     );
 }
 
-/// A key held down, a switch that chatters, a paste with `aa` in it: none of
-/// them is a decision, and none of them posts.
+/// A key held down, keys typed ahead, a paste with `ay` in it: none of them
+/// is a decision, and none of them posts.
 #[test]
-fn a_held_or_pasted_a_does_not_confirm() {
+fn a_held_a_typed_ahead_ay_and_a_paste_do_not_post() {
     let w = World::new();
     w.pull(101, "open", false, FIXTURE_HEAD_101);
     let (t, path, before) = ready_to_post(&w);
 
-    // Held: the first `a` asks, and the rest arrive hard on its heels for
-    // well over the pause a deliberate press would leave.
-    for _ in 0..40 {
-        t.send(b"a");
-        std::thread::sleep(Duration::from_millis(40));
-    }
+    // Held: one press, the keyboard's own delay, then a repeat every few
+    // hundredths of a second for a couple of seconds.
+    t.send(b"a");
     t.wait_for(ASKED, LOAD);
+    std::thread::sleep(Duration::from_millis(500));
+    for _ in 0..60 {
+        t.send(b"a");
+        std::thread::sleep(Duration::from_millis(30));
+    }
     std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(w.calls(), [FETCH], "a held key confirmed");
+    assert_eq!(w.calls(), [FETCH], "a held a posted");
+    // Each repeat took the question down or put it back up; wherever that
+    // left it, take it down.
+    t.send(b"\x1b");
+    t.wait("the question to go", LOAD, |s| !s.contains(ASKED));
+
+    // Typed ahead: both keys in one write. The `a` asks; the `y` arrives
+    // before the question has been on screen long enough to be an answer.
+    t.send(b"ay");
+    t.wait_for(ASKED, LOAD);
+    std::thread::sleep(Duration::from_millis(900));
+    assert_eq!(w.calls(), [FETCH], "typed-ahead ay posted");
+    assert!(t.text().contains(ASKED), "and the question is still up");
 
     // A paste is not an answer, and takes the question down.
-    std::thread::sleep(Duration::from_millis(600));
-    t.send(b"\x1b[200~a\x1b[201~");
+    t.send(b"\x1b[200~y\x1b[201~");
     t.wait("the question to go", LOAD, |s| !s.contains(ASKED));
     // Nor is it a question.
-    t.send(b"\x1b[200~aa\x1b[201~");
+    t.send(b"\x1b[200~ay\x1b[201~");
     t.send(b"?");
     t.wait_for(" keys ", LOAD);
     let text = t.text();
@@ -1087,8 +1132,8 @@ fn drafts_that_never_arm_ask_github_nothing() {
         });
         t.send(b"a");
         t.wait_for(why, LOAD);
-        std::thread::sleep(Duration::from_millis(600));
-        t.send(b"a");
+        // No question went up: the screen says why, and shows no overlay.
+        assert!(!t.text().contains(ASKED), "#{number} asked to be posted");
         t.send(b"\x1b");
         t.wait("the filter to clear", LOAD, |s| {
             !s.contains(&format!("/{number} "))
@@ -1158,7 +1203,7 @@ fn a_review_already_on_github_marks_the_draft_posted_and_sends_nothing() {
         2,
         &serde_json::json!([review(555, "octocat", "APPROVED", "Reads well.")]),
     );
-    w.review_comments(101, 555, &the_drafts_comment());
+    w.comments(101, &the_drafts_comment_on(555));
     let (t, path, before) = ready_to_post(&w);
     let before: serde_json::Value = serde_json::from_str(&before).unwrap();
 
@@ -1173,7 +1218,7 @@ fn a_review_already_on_github_marks_the_draft_posted_and_sends_nothing() {
             pull_call(101),
             reviews_call(101, 1),
             reviews_call(101, 2),
-            comments_call(101, 555)
+            comments_call(101)
         ]
     );
     let mut want = before;
@@ -1210,7 +1255,7 @@ fn a_review_that_only_looks_the_same_does_not_mark_the_draft_posted() {
             FETCH.to_string(),
             pull_call(101),
             reviews_call(101, 1),
-            comments_call(101, 555)
+            comments_call(101)
         ]
     );
     assert_eq!(
@@ -1321,13 +1366,19 @@ fn a_post_that_times_out_is_unknown_and_is_not_posted_twice() {
     let w = World::new();
     w.pull(101, "open", false, FIXTURE_HEAD_101);
     std::fs::write(w.root().join("post.hang"), "").unwrap();
-    let (t, path, before) = ready_to_post_with(&w, &[("RIGOR_GH_TIMEOUT_SECS", "2")]);
+    // Short enough that the unanswered write does not hold the test up for
+    // long, long enough that the fetch before it never comes near it, however
+    // busy the machine running the suite is.
+    let (t, path, before) = ready_to_post_with(&w, &[("RIGOR_GH_TIMEOUT_SECS", "6")]);
 
     confirm(&t);
-    t.wait_for("the review was sent and no answer came back", LOAD);
+    t.wait_for(
+        "whether it was posted is not known",
+        Duration::from_secs(30),
+    );
     let text = t.text();
     assert!(
-        text.contains("It may or may not be posted") && !text.contains("posting to #101 failed"),
+        text.contains("the review was sent") && !text.contains("posting to #101 failed"),
         "{text}"
     );
     t.wait_line("#101 no longer a plain draft", LOAD, |l| {
@@ -1345,7 +1396,7 @@ fn a_post_that_times_out_is_unknown_and_is_not_posted_twice() {
     let mut landed = review(555, "octocat", "APPROVED", "Reads well.");
     landed["submitted_at"] = String::from_utf8(now.stdout).unwrap().trim().into();
     w.reviews(101, 1, &serde_json::Value::Array(vec![landed]));
-    w.review_comments(101, 555, &the_drafts_comment());
+    w.comments(101, &the_drafts_comment_on(555));
     confirm(&t);
     t.wait_line("#101 posted", LOAD, |l| {
         l.contains("#101") && l.contains("✓ posted")
@@ -1353,11 +1404,7 @@ fn a_post_that_times_out_is_unknown_and_is_not_posted_twice() {
     assert_eq!(w.posts(), 1, "posted twice: {:?}", w.calls());
     assert_eq!(
         w.calls()[4..],
-        [
-            pull_call(101),
-            reviews_call(101, 1),
-            comments_call(101, 555)
-        ],
+        [pull_call(101), reviews_call(101, 1), comments_call(101)],
         "the second attempt read, and did not write"
     );
 }
@@ -1414,6 +1461,73 @@ fn quitting_mid_post_lets_it_finish_and_records_it() {
     );
 }
 
+/// A signal ends rigor the same way a key does, and gets the same care: the
+/// post in flight is let finish and is recorded.
+#[test]
+fn a_signal_mid_post_lets_it_finish_and_records_it() {
+    let w = World::new();
+    w.pull(101, "open", false, FIXTURE_HEAD_101);
+    std::fs::write(w.root().join("post.delay"), "2").unwrap();
+    let (mut t, path, _) = ready_to_post(&w);
+
+    confirm(&t);
+    let end = Instant::now() + LOAD;
+    while w.posts() == 0 && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(w.posts(), 1, "the write never started");
+    // SAFETY: kill(2) takes plain integers and touches no memory; the target is
+    // the rigor this test started and still owns.
+    unsafe { libc::kill(t.pid(), libc::SIGTERM) };
+    let status = t.wait_exit(Duration::from_secs(15));
+    assert!(status.success(), "{status:?}");
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(after["status"], "posted", "the post was cut off");
+}
+
+/// `gh` exited cleanly, but what GitHub sent back is not this review: the
+/// pull request itself, as a request redirected and followed as a read would
+/// bring, or a review that is somebody else's. The draft is not marked
+/// posted on an exit status.
+#[test]
+fn an_answer_that_is_not_the_review_is_not_recorded_as_posted() {
+    let answers = [
+        serde_json::json!({
+            "number": 101, "state": "open", "merged": false,
+            "user": { "login": "hubot" }, "head": { "sha": FIXTURE_HEAD_101 }
+        }),
+        review(901, "hubot", "APPROVED", "Reads well."),
+    ];
+    for answer in answers {
+        let w = World::new();
+        w.pull(101, "open", false, FIXTURE_HEAD_101);
+        std::fs::write(w.root().join("post.response.json"), answer.to_string()).unwrap();
+        let (t, path, before) = ready_to_post(&w);
+
+        confirm(&t);
+        t.wait_for("whether it was posted is not known", LOAD);
+        t.wait_line("#101 no longer a plain draft", LOAD, |l| {
+            l.contains("#101") && l.contains("maybe sent")
+        });
+        assert_eq!(
+            w.calls(),
+            [
+                FETCH.to_string(),
+                pull_call(101),
+                reviews_call(101, 1),
+                post_call(101)
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "marked posted on gh's exit status alone: {answer}"
+        );
+    }
+}
+
 /// A draft for a pull request the fetch never returned is not stuck: the
 /// prompt says the list cannot vouch for it, and the confirming read finds
 /// its head matches and sends it.
@@ -1431,13 +1545,13 @@ fn an_unverified_draft_whose_live_head_matches_is_posted() {
 
     t.send(b"a");
     t.wait_for(
-        "#999? not fetched here, so GitHub is asked for its head first. a again to confirm",
+        "#999? not fetched here, so GitHub is asked for its head first. y to post",
         LOAD,
     );
     assert_eq!(w.calls(), [FETCH]);
 
     std::thread::sleep(Duration::from_millis(600));
-    t.send(b"a");
+    t.send(b"y");
     t.wait_line("#999 posted", LOAD, |l| {
         l.contains("#999") && l.contains("✓ posted")
     });

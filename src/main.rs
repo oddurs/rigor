@@ -138,21 +138,41 @@ fn main() -> Result<()> {
         owner: a.repo.owner.clone(),
         name: a.repo.name.clone(),
     });
-    let result = run(&mut term, &mut a, &rx);
+    // The loop's result goes straight through `leave`, however it ended, so
+    // that a post in flight is let finish before `proc::shutdown` would kill
+    // `gh` in the middle of one.
+    let ended = run(&mut term, &mut a, &rx);
+    let limit = github::gh_timeout() + QUIT_MARGIN;
+    let (result, said) = a.leave(ended, &rx, limit, |a| {
+        let _ = term.draw(|f| ui::draw(f, a));
+    });
+    if said.is_some() {
+        discard_typed_ahead();
+    }
     restore(&mut term, mouse);
     proc::shutdown();
-    // Quit waited for a post to finish, and the screen that would have said
-    // how it went is gone. Say it where it can still be read.
-    if a.quitting {
-        let outcome = a
-            .post_error
-            .as_ref()
-            .or_else(|| a.notice.as_ref().map(|(text, _)| text));
-        if let Some(outcome) = outcome {
-            eprintln!("rigor: {outcome}");
-        }
+    // The screen that would have said how the post went is gone, so say it
+    // where it can still be read. If that cannot be written either, the file
+    // already has been.
+    if let Some(said) = said {
+        let _ = writeln!(std::io::stderr(), "rigor: {said}");
     }
     result
+}
+
+/// How much longer than one call to GitHub the way out will wait for a post
+/// in flight, all told.
+const QUIT_MARGIN: Duration = Duration::from_secs(5);
+
+/// Keys struck while rigor waited on its way out were for rigor, not for the
+/// shell it is about to hand the terminal back to. Dropped unread.
+fn discard_typed_ahead() {
+    #[cfg(unix)]
+    // SAFETY: tcflush(3) takes a file descriptor and a constant, touches no
+    // memory, and only discards input not yet read.
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
 }
 
 fn parse_view(name: &str) -> Result<View, String> {
@@ -205,41 +225,8 @@ fn run(
         a.tick();
 
         if a.quit || stop.load(std::sync::atomic::Ordering::Relaxed) {
-            finish_post(term, a, rx);
             return Ok(());
         }
-    }
-}
-
-/// Quitting must not cut a review off half-sent: `gh` killed mid-request
-/// leaves it unknown whether the review landed, with nobody left to find out.
-/// So a post in flight is let finish — every call it makes has a deadline —
-/// and its result is recorded before rigor goes. The screen says so; input is
-/// read and dropped, so that keys typed while waiting do not land in the
-/// shell afterwards. Best effort on the terminal throughout: after a SIGHUP
-/// it may already be gone, and the post is still worth finishing.
-fn finish_post(
-    term: &mut Terminal<CrosstermBackend<Stdout>>,
-    a: &mut App,
-    rx: &std::sync::mpsc::Receiver<app::Msg>,
-) {
-    if a.posting.is_none() {
-        return;
-    }
-    a.quitting = true;
-    while a.posting.is_some() {
-        let _ = term.draw(|f| ui::draw(f, a));
-        while matches!(poll(Duration::ZERO), Ok(true)) {
-            if read().is_err() {
-                break;
-            }
-        }
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(msg) => a.on_msg(msg),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-        a.spinner = a.spinner.wrapping_add(1);
     }
 }
 

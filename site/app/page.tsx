@@ -37,7 +37,10 @@ const KEYS = [
   ['/', 'filter by title, branch, author or label'],
   ['s', 'sort by recency or by merge-readiness'],
   ['d', 'show or hide draft pull requests'],
-  ['a', 'in Drafts: post the review — asks first, then checks GitHub'],
+  [
+    'a, then y',
+    'in Drafts: ask to post the review, then post it — GitHub is checked first',
+  ],
   ['e', 'in Drafts: edit the draft in your editor'],
   ['x', 'in Drafts: skip the draft, or bring it back'],
   ['r', 'refresh now'],

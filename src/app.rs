@@ -36,13 +36,13 @@ impl drafts::Remote for Unwired {
     fn pull(&self, _: u64) -> Result<drafts::Live, String> {
         Err("GitHub is not wired up".into())
     }
-    fn reviews(&self, _: u64) -> Result<Vec<drafts::Review>, String> {
+    fn reviews(&self, _: u64, _: usize) -> Result<Vec<drafts::Review>, String> {
         Err("GitHub is not wired up".into())
     }
-    fn review_comments(&self, _: u64, _: u64) -> Result<Vec<drafts::Comment>, String> {
+    fn comments(&self, _: u64, _: usize) -> Result<Vec<drafts::Placed>, String> {
         Err("GitHub is not wired up".into())
     }
-    fn post(&self, _: u64, _: &str) -> Result<(), drafts::PostFailure> {
+    fn post(&self, _: u64, _: &str) -> Result<drafts::Review, drafts::PostFailure> {
         Err(drafts::PostFailure::Declined(
             "GitHub is not wired up".into(),
         ))
@@ -52,12 +52,13 @@ impl drafts::Remote for Unwired {
     }
 }
 
-/// A confirming `a` counts only after this long with no `a` of any kind: a
-/// held key repeats, a worn switch chatters, and neither is a decision.
-pub const A_QUIET_MS: i64 = 400;
+/// The answer to the question counts only once the question has been on
+/// screen this long. Keys typed ahead, or struck in the same breath as the
+/// `a` that asked, are not an answer to something nobody has yet read.
+pub const ANSWER_FLOOR_MS: i64 = 400;
 
-/// A question nobody answers withdraws itself after this long, so that an
-/// `a` typed much later is a first `a` again.
+/// A question nobody answers or reads withdraws itself after this long, so
+/// that a `y` typed much later is not about it.
 pub const ARMED_FOR_MS: i64 = 30_000;
 
 /// A post waiting to be confirmed: a question on screen, and the overlay that
@@ -69,6 +70,9 @@ pub const ARMED_FOR_MS: i64 = 30_000;
 /// selected draft stops being that file with that text in that state, the
 /// question on screen is no longer the one a keypress would be answering, and
 /// it is withdrawn.
+///
+/// The question is asked with `a` and answered with `y`: a different key, so
+/// that neither holding `a` down nor striking it twice can be the answer.
 #[derive(Debug, Clone)]
 pub struct Armed {
     pub path: PathBuf,
@@ -78,15 +82,53 @@ pub struct Armed {
     /// `Ready`, or `Unverified` for a pull request the last fetch did not
     /// include. The prompt says which.
     pub state: drafts::State,
-    /// When the question went up, on `now_millis`'s clock.
+    /// When the question went up or was last read, on `now_millis`'s clock,
+    /// which stops while the machine sleeps —
     at: i64,
+    /// — and on the wall clock, which does not: a question asked before the
+    /// lid closed is gone when it opens.
+    at_wall: i64,
+    /// When the overlay was first on screen. `None` until a frame has drawn
+    /// it; the floor is counted from here, not from the key that asked.
+    pub drawn_at: Option<i64>,
     /// How far down the overlay is scrolled. Clamped as it is drawn.
     pub scroll: u16,
-    /// Whether the end of what would be sent has been on screen. Until it
-    /// has, `a` does not confirm: nothing is posted unread.
-    pub seen_end: bool,
-    /// An `a` was turned away for that reason, so the overlay says it louder.
+    /// Which rows of the overlay have been on screen since it opened, at the
+    /// width they were last laid out for. Nothing is posted until every one
+    /// has: reaching the end is not the same as having passed the middle.
+    pub seen: Vec<bool>,
+    /// The width `seen` was laid out for. At another width the rows are
+    /// other rows, and what was read of these says nothing about those.
+    pub seen_width: u16,
+    /// The window is too small for the overlay to show its rows whole.
+    /// Nothing is posted from a window that cannot show it.
+    pub cramped: bool,
+    /// A `y` was turned away for either reason, so the overlay says it louder.
     pub nudged: bool,
+}
+
+impl Armed {
+    /// How many rows of what would be posted have not been on screen yet.
+    pub fn unread(&self) -> usize {
+        self.seen.iter().filter(|seen| !**seen).count()
+    }
+
+    /// Whether all of it has been shown: the overlay has been drawn, in a
+    /// window large enough, and no row is still unread.
+    pub fn shown(&self) -> bool {
+        self.drawn_at.is_some() && !self.cramped && self.unread() == 0
+    }
+
+    /// Note that the question is being read: it has that much longer.
+    fn read_on(&mut self) {
+        self.at = now_millis();
+        self.at_wall = now_secs();
+    }
+
+    fn expired(&self) -> bool {
+        let wall = now_secs() - self.at_wall;
+        now_millis() - self.at >= ARMED_FOR_MS || wall >= ARMED_FOR_MS / 1000
+    }
 }
 
 /// An attempt in flight: which draft, and exactly what was read from it when
@@ -275,8 +317,6 @@ pub struct App {
     /// they are on GitHub is not known, and their row says so until an
     /// attempt gets far enough to find out.
     unsettled: HashSet<PathBuf>,
-    /// When the last `a` of any kind arrived, on `now_millis`'s clock.
-    last_a: Option<i64>,
     /// Quit was asked for while a post was in flight. It is being let finish.
     pub quitting: bool,
     /// Head commits GitHub reported at the moment of a post, for pull
@@ -337,7 +377,6 @@ impl App {
             armed: None,
             posting: None,
             unsettled: HashSet::new(),
-            last_a: None,
             quitting: false,
             live_heads: HashMap::new(),
             post_error: None,
@@ -375,11 +414,7 @@ impl App {
 
     /// Called every turn of the event loop. Starts whatever is due; never waits.
     pub fn tick(&mut self) {
-        if self
-            .armed
-            .as_ref()
-            .is_some_and(|armed| now_millis() - armed.at >= ARMED_FOR_MS)
-        {
+        if self.armed.as_ref().is_some_and(Armed::expired) {
             self.armed = None;
             self.note("the question timed out; nothing was posted");
         }
@@ -591,7 +626,7 @@ impl App {
                 (
                     None,
                     Some(format!(
-                        "#{number}: the review was sent and no answer came back ({e}). It may or may not be posted; a again asks GitHub before sending anything"
+                        "#{number}: the review was sent, and whether it was posted is not known ({e}). a asks again, and GitHub is checked before anything is sent"
                     )),
                 )
             }
@@ -811,19 +846,9 @@ impl App {
         }
     }
 
-    /// Note that an `a` arrived, and say whether it came after a pause. Every
-    /// `a` counts, pressed, repeated or released, so a key held down keeps
-    /// pushing the pause back and can never be the one that confirms.
-    pub fn a_arrived(&mut self) -> bool {
-        let now = now_millis();
-        let quiet = self.last_a.is_none_or(|last| now - last >= A_QUIET_MS);
-        self.last_a = Some(now);
-        quiet
-    }
-
     /// `a` with no question up. Posting is public and under the user's name,
     /// so this only asks: it opens the overlay showing exactly what would be
-    /// sent. Sending takes a second, deliberate `a` (`confirm`).
+    /// sent. Sending takes a different key, `y` (`confirm`).
     pub fn post_key(&mut self) {
         use drafts::State;
         let Some(entry) = self.selected_draft().cloned() else {
@@ -860,29 +885,43 @@ impl App {
             draft,
             state,
             at: now_millis(),
+            at_wall: now_secs(),
+            drawn_at: None,
             scroll: 0,
-            seen_end: false,
+            seen: Vec::new(),
+            seen_width: 0,
+            cramped: false,
             nudged: false,
         });
     }
 
-    /// Scroll the overlay. It does not withdraw the question: reading what
-    /// would be sent is the point of asking.
+    /// Scroll the overlay. It does not withdraw the question, and it gives it
+    /// longer: reading what would be sent is the point of asking.
     pub fn scroll_confirm(&mut self, delta: i32) {
         if let Some(armed) = &mut self.armed {
             let to = i32::from(armed.scroll).saturating_add(delta).max(0);
             armed.scroll = u16::try_from(to).unwrap_or(u16::MAX);
+            armed.read_on();
         }
     }
 
-    /// A deliberate second `a`, with the question up. Goes ahead only once
-    /// the end of what would be sent has been on screen — and then only if
-    /// GitHub, asked there and then, still agrees (`drafts::deliver`).
+    /// `y`, with the question up. Goes ahead only once all of what would be
+    /// sent has been on screen, in a window that can show it, for long enough
+    /// to have been seen — and then only if GitHub, asked there and then,
+    /// still agrees (`drafts::deliver`).
     pub fn confirm(&mut self) {
         let Some(armed) = &mut self.armed else {
             return;
         };
-        if !armed.seen_end {
+        // Too soon after the overlay first drew — or before it has drawn at
+        // all — to be an answer to it. Not a reason to take it down either.
+        if armed
+            .drawn_at
+            .is_none_or(|drawn| now_millis() - drawn < ANSWER_FLOOR_MS)
+        {
+            return;
+        }
+        if !armed.shown() {
             armed.nudged = true;
             return;
         }
@@ -891,8 +930,9 @@ impl App {
         };
 
         // The file is the draft. If it changed after the question went up,
-        // what was shown is no longer what it says.
-        let on_disk = std::fs::read_to_string(&armed.path).ok();
+        // what was shown is no longer what it says. Read the way the list
+        // reads it: only ever a regular file of ordinary size.
+        let on_disk = drafts::read_text(&armed.path).ok();
         if on_disk.as_deref() != Some(armed.raw.as_str()) {
             self.reload_drafts();
             self.note(format!(
@@ -921,6 +961,71 @@ impl App {
                 &draft,
             ))
         });
+    }
+
+    /// The one way out of the event loop. `ended` is how the loop ended, and
+    /// is handed back untouched; whatever it is — a key, a signal, an error
+    /// from a terminal that went away — a post in flight is let finish first
+    /// (`finish_post`). Taking the loop's own result is the point: there is
+    /// no ending the loop this is not called for.
+    ///
+    /// `show` draws the screen once, to say what is being waited for. It is
+    /// only used when the loop ended in good order: otherwise the terminal
+    /// may be what failed, and nothing here may depend on it.
+    pub fn leave<E>(
+        &mut self,
+        ended: Result<(), E>,
+        replies: &Receiver<Msg>,
+        limit: std::time::Duration,
+        show: impl FnOnce(&mut Self),
+    ) -> (Result<(), E>, Option<String>) {
+        if self.posting.is_none() {
+            return (ended, None);
+        }
+        self.quitting = true;
+        if ended.is_ok() {
+            show(self);
+        }
+        let said = self.finish_post(replies, limit);
+        (ended, said)
+    }
+
+    /// Rigor is on its way out with an attempt in flight. Let it finish:
+    /// `gh` cut off mid-request leaves it unknown whether the review landed,
+    /// with nobody left to find out. The answer is taken from `replies` and
+    /// recorded as it would be at any other time.
+    ///
+    /// The wait is bounded by `limit`, once, for the whole of what is left —
+    /// not by each call's own deadline one after another. It reads nothing
+    /// from the terminal, which may be gone. Returns what to tell the user;
+    /// `None` when nothing was in flight.
+    pub fn finish_post(
+        &mut self,
+        replies: &Receiver<Msg>,
+        limit: std::time::Duration,
+    ) -> Option<String> {
+        let number = self.posting.as_ref()?.number;
+        self.quitting = true;
+        let deadline = std::time::Instant::now() + limit;
+        while self.posting.is_some() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match replies.recv_timeout(left) {
+                Ok(msg) => self.on_msg(msg),
+                Err(_) => break,
+            }
+        }
+        if let Some(unfinished) = self.posting.take() {
+            // Out of time. What is known is that it was started: say that,
+            // and leave the file saying what is true of it, a draft.
+            self.unsettled.insert(unfinished.path);
+            return Some(format!(
+                "the post to #{number} did not finish in {}s. It may or may not be posted; open rigor and press a on it, and GitHub is asked before anything is sent again",
+                limit.as_secs()
+            ));
+        }
+        self.post_error
+            .clone()
+            .or_else(|| self.notice.as_ref().map(|(text, _)| text.clone()))
     }
 
     /// Whether `entry` is the draft an attempt is in flight for.

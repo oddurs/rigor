@@ -22,7 +22,7 @@ expression: "render(&mut o.a, 120, 30)"
 ──────────────────│            Should this cap at the caller's deadline?                             │──────────────────
  #4840 Move the pa│  comment   src/retry.rs:120                                                      │
  octocat · 2h ago │            A test for the zero-budget case would pin this.                       │
-  picked    Touche└ this is all of it · a posts · esc cancels ───────────────────────────────────────┘
+  picked    Touche└ this is all of it · y posts · esc cancels ───────────────────────────────────────┘
   verdict   comment
   body      Reads well overall.
 
@@ -31,4 +31,4 @@ expression: "render(&mut o.a, 120, 30)"
             Should this cap at the caller's deadline?
   comment   src/retry.rs:120
             A test for the zero-budget case would pin this.                                            ↓ more below · J
- post comment with 2 inline comments to #4840? a again to confirm, esc to cancel
+ post comment with 2 inline comments to #4840? y to post, esc to cancel

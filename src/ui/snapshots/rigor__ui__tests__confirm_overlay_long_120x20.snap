@@ -20,5 +20,5 @@ expression: "render(&mut o.a, 120, 20)"
   verdict   approv│            Paragraph 11 of the review.                                           │
   body      Paragr│            Paragraph 12 of the review.                                           │
             Paragr│            Paragraph 13 of the review.                                           │
-            Paragr└ ↓ 29 more below · j ─────────────────────────────────────────────────────────────┘ ↓ more below · J
- post approve with 1 inline comment to #4840? j scrolls to the end, then a confirms; esc cancels
+            Paragr└ 29 rows still to read · j / k ───────────────────────────────────────────────────┘ ↓ more below · J
+ post approve with 1 inline comment to #4840? 29 rows still to read (j / k), then y posts; esc cancels

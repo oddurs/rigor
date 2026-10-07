@@ -27,11 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sends to GitHub, and only on a confirmed keypress.
   - The first `a` opens an overlay showing exactly what would be posted — the
     pull request, the verdict, the body, each inline comment — and not the
-    draft's private `note` and `picked`, which are never sent. A second `a`
-    goes ahead only after a pause, so a held key, a chattering switch or a
-    paste never confirms, and only once the end of the overlay has been on
-    screen. Any other key takes it down and does nothing else; so does a
-    refresh that changes the draft, and thirty seconds without an answer.
+    draft's private `note` and `picked`, which are never sent. Nothing in it
+    is cut short. `y` then posts: a different key, so that neither a held `a`
+    nor a second one can be the answer. It is ignored in the first 400 ms
+    after the overlay appears, and turned away until every row of the overlay
+    has been on screen, or while the window is too small to show it whole. A
+    paste never asks or answers. Any other key takes the overlay down and
+    does nothing else; so does a refresh that changes the draft, and thirty
+    seconds without an answer or a scroll.
   - Going ahead reads the pull request and its reviews from GitHub first, and
     sends nothing if a read fails. A pull request closed without merging, or
     one that has moved on from the commit the draft was written against, is
@@ -41,13 +44,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     written, or have a review started and not submitted, it is not sent on
     top. An `unverified` draft can be posted, since the read does the checking
     the list could not.
-  - On success the file is marked `posted`, replaced in one step, and records
-    what was sent even if the file changed meanwhile. When GitHub declines the
+  - A post counts as sent only when GitHub answers with the review it
+    created: this verdict, on this commit, by you. Then the file is marked
+    `posted`, replaced in one step, and records what was sent even if the
+    file changed meanwhile. When GitHub declines the
     review its own message is shown until `esc` and the file is untouched.
     When no answer comes back the outcome is reported as unknown, the row
     reads `maybe sent`, and trying again asks GitHub before sending anything.
   - One attempt at a time: a lock beside the draft keeps a second rigor from
-    posting it too, and quitting waits for a post in flight and records it.
+    posting it too. On every way out — a key, a signal, an error — rigor
+    waits for a post in flight and records it, up to a limit, past which it
+    says the outcome is not known.
   - `e` opens the draft in `$VISUAL` or `$EDITOR` and reads it again
     afterwards; `x` skips a draft or brings it back.
 

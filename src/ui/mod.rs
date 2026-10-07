@@ -478,12 +478,16 @@ fn footer_alert(app: &App) -> Option<Line<'static>> {
         } else {
             ""
         };
-        // Nothing is posted unread: until the end of it has been on screen,
-        // `a` is not offered.
-        let keys = if armed.seen_end {
-            " a again to confirm, esc to cancel"
+        // Nothing is posted unread, or from a window that cannot show it:
+        // until all of it has been on screen, `y` is not offered.
+        let unread = armed.unread();
+        let keys = if armed.cramped {
+            " the window is too small to show it: enlarge it to post; esc cancels".to_string()
+        } else if unread > 0 {
+            let rows = if unread == 1 { "row" } else { "rows" };
+            format!(" {unread} {rows} still to read (j / k), then y posts; esc cancels")
         } else {
-            " j scrolls to the end, then a confirms; esc cancels"
+            " y to post, esc to cancel".to_string()
         };
         return Some(Line::from(vec![
             Span::styled(

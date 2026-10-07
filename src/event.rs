@@ -16,10 +16,6 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Handle one key. What a key means depends on the mode: while typing a filter
 /// letters are text, and while help is open everything else is swallowed.
 pub fn key(app: &mut App, k: KeyEvent) {
-    // Noted before anything else, and for every kind of event: a release and
-    // a repeat are an `a` too, as far as the pause before a confirming one
-    // goes.
-    let after_a_pause = k.code != KeyCode::Char('a') || app.a_arrived();
     if k.kind == KeyEventKind::Release {
         return;
     }
@@ -29,7 +25,7 @@ pub fn key(app: &mut App, k: KeyEvent) {
     }
     // A question on screen is modal: it is answered, read, or withdrawn.
     if app.armed.is_some() {
-        confirm_key(app, k, after_a_pause);
+        confirm_key(app, k);
         return;
     }
     match app.mode {
@@ -39,22 +35,21 @@ pub fn key(app: &mut App, k: KeyEvent) {
     }
 }
 
-/// Keys while the overlay asks whether to post. `a` after a pause answers
-/// yes. The movement keys read what would be sent and leave the question up.
-/// Anything else withdraws it and does nothing more: a key pressed to get out
-/// of a question about posting should not also act on the list behind it.
-fn confirm_key(app: &mut App, k: KeyEvent, after_a_pause: bool) {
+/// Keys while the overlay asks whether to post. `y` answers yes. The
+/// movement keys read what would be sent and leave the question up. Anything
+/// else withdraws it and does nothing more: a key pressed to get out of a
+/// question about posting should not also act on the list behind it.
+///
+/// That includes `a`, the key that asked. A key held down repeats once the
+/// keyboard's own delay has passed, and no pause demanded between two `a`s
+/// can tell that from a second press; so a second `a` is never the answer,
+/// and a held one only opens the question and closes it again.
+fn confirm_key(app: &mut App, k: KeyEvent) {
     let chord = k
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
     match k.code {
-        // Without the pause it is a held key or a bounce: not an answer, and
-        // not a reason to take the question down either.
-        KeyCode::Char('a') if !chord => {
-            if after_a_pause {
-                app.confirm();
-            }
-        }
+        KeyCode::Char('y') if !chord => app.confirm(),
         KeyCode::Char('j') | KeyCode::Down if !chord => app.scroll_confirm(1),
         KeyCode::Char('k') | KeyCode::Up if !chord => app.scroll_confirm(-1),
         KeyCode::PageDown => app.scroll_confirm(10),
@@ -66,7 +61,7 @@ fn confirm_key(app: &mut App, k: KeyEvent, after_a_pause: bool) {
 }
 
 /// Pasted text, which a terminal with bracketed paste hands over whole. It is
-/// never a keypress: a paste that happens to contain `aa` must not ask to
+/// never a keypress: a paste that happens to contain `ay` must not ask to
 /// post, let alone confirm. While a filter is being typed it is text for the
 /// filter; anywhere else it is nothing, except that a question on screen was
 /// not answered by it and is withdrawn.

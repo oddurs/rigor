@@ -73,7 +73,7 @@ pub struct Fetched {
 /// repository paginates; the point is that a stalled connection cannot hold the
 /// refresh forever. `RIGOR_GH_TIMEOUT_SECS` overrides it — for very slow links,
 /// and so the end-to-end tests can exercise the timeout in seconds, not minutes.
-fn gh_timeout() -> Duration {
+pub fn gh_timeout() -> Duration {
     let secs = std::env::var("RIGOR_GH_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -137,36 +137,15 @@ pub struct Gh {
     pub name: String,
 }
 
-/// Lists are read a page at a time, and all of them: the entry that matters
-/// may be on the last page.
-const PER_PAGE: usize = 100;
-/// More pages than this and the read is abandoned rather than made on part
-/// of the list.
-const MAX_PAGES: usize = 30;
-
 impl Gh {
     fn pulls(&self, number: u64) -> String {
         format!("repos/{}/{}/pulls/{number}", self.owner, self.name)
     }
 }
 
-/// Every page of the list at `path`, each parsed by `parse`.
-fn every_page<T>(path: &str, parse: impl Fn(&Value) -> Result<Vec<T>>) -> Result<Vec<T>, String> {
-    let mut all = Vec::new();
-    for page in 1..=MAX_PAGES {
-        let mut batch = get(&format!("{path}?per_page={PER_PAGE}&page={page}"))
-            .and_then(|v| parse(&v))
-            .map_err(|e| format!("{e:#}"))?;
-        let last = batch.len() < PER_PAGE;
-        all.append(&mut batch);
-        if last {
-            return Ok(all);
-        }
-    }
-    Err(format!(
-        "more than {} entries; not all of them were read",
-        PER_PAGE * MAX_PAGES
-    ))
+/// One page of the list at `path`.
+fn page_of(path: &str, page: usize) -> Result<Value> {
+    get(&format!("{path}?per_page={}&page={page}", drafts::PAGE))
 }
 
 impl drafts::Remote for Gh {
@@ -176,15 +155,19 @@ impl drafts::Remote for Gh {
             .map_err(|e| format!("{e:#}"))
     }
 
-    fn reviews(&self, number: u64) -> Result<Vec<drafts::Review>, String> {
-        every_page(&format!("{}/reviews", self.pulls(number)), parse_reviews)
+    fn reviews(&self, number: u64, page: usize) -> Result<Vec<drafts::Review>, String> {
+        page_of(&format!("{}/reviews", self.pulls(number)), page)
+            .and_then(|v| parse_reviews(&v))
+            .map_err(|e| format!("{e:#}"))
     }
 
-    fn review_comments(&self, number: u64, review: u64) -> Result<Vec<drafts::Comment>, String> {
-        every_page(
-            &format!("{}/reviews/{review}/comments", self.pulls(number)),
-            parse_review_comments,
-        )
+    /// Every inline comment on the pull request, not one review's: the list
+    /// GitHub keeps per review leaves out the line and the side, which are
+    /// what there is to compare.
+    fn comments(&self, number: u64, page: usize) -> Result<Vec<drafts::Placed>, String> {
+        page_of(&format!("{}/comments", self.pulls(number)), page)
+            .and_then(|v| parse_comments(&v))
+            .map_err(|e| format!("{e:#}"))
     }
 
     /// The only call rigor makes that changes anything on GitHub. `body` is
@@ -192,8 +175,10 @@ impl drafts::Remote for Gh {
     ///
     /// Only an answer that says no is a no. A 4xx is GitHub declining the
     /// review; anything else — a timeout, a dropped connection, a gateway
-    /// error — leaves it unknown whether the review was taken.
-    fn post(&self, number: u64, body: &str) -> Result<(), drafts::PostFailure> {
+    /// error — leaves it unknown whether the review was taken. And only a
+    /// review in the answer is a yes: `gh` exits cleanly on whatever a
+    /// redirect led it to.
+    fn post(&self, number: u64, body: &str) -> Result<drafts::Review, drafts::PostFailure> {
         use drafts::PostFailure::NoAnswer;
         let mut cmd = Command::new("gh");
         cmd.args(["api", "--method", "POST"])
@@ -201,16 +186,26 @@ impl drafts::Remote for Gh {
             .args(["--input", "-"]);
         let out = proc::run_with_input(&mut cmd, body.as_bytes(), gh_timeout(), Priority::Normal)
             .map_err(|e| NoAnswer(format!("gh api: {e:#}")))?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(post_failure(&out))
+        if !out.status.success() {
+            return Err(post_failure(&out));
         }
+        created_review(&out.stdout)
+            .map_err(|e| NoAnswer(format!("GitHub's answer was not a review: {e:#}")))
     }
 
     fn timeout(&self) -> Duration {
         gh_timeout()
     }
+}
+
+/// The review a successful post answers with. Anything that does not read as
+/// exactly one submitted review, in full, is not one.
+fn created_review(stdout: &[u8]) -> Result<drafts::Review> {
+    let v: Value = serde_json::from_slice(stdout).context("it was not JSON")?;
+    if !v.is_object() {
+        bail!("it was not one object");
+    }
+    parse_review(&v)?.context("it has no author")
 }
 
 /// What a write that `gh` reported as failed amounts to. A 4xx is GitHub
@@ -295,70 +290,80 @@ fn parse_live(v: &Value) -> Result<drafts::Live> {
     })
 }
 
-/// Every entry is read in full or the whole read fails. A review with no
-/// author, no state, or no time when it claims to be submitted is one that
-/// cannot be told apart from the viewer's own, and a list with a hole in it
-/// is not one to decide a post on.
+/// One review. `None` for one with no author at all: the account is gone,
+/// and whoever it was, it is not the viewer. Anything else missing — the id,
+/// the state, the time of a review that claims to be submitted — is an error:
+/// a review that might be the viewer's and cannot be read is not one to
+/// decide a post around.
+fn parse_review(r: &Value) -> Result<Option<drafts::Review>> {
+    if r.get("user").is_none_or(Value::is_null) {
+        return Ok(None);
+    }
+    let id = r.get("id").and_then(Value::as_u64);
+    let about = || id.map_or_else(|| "a review".to_string(), |id| format!("review {id}"));
+    let field = |key: &str| r.get(key).and_then(Value::as_str);
+    let state = field("state")
+        .filter(|s| !s.is_empty())
+        .with_context(|| format!("{} has no state", about()))?;
+    let submitted_at = field("submitted_at");
+    if state != "PENDING" && submitted_at.and_then(parse_iso8601).is_none() {
+        bail!("{} has no time it was submitted", about());
+    }
+    Ok(Some(drafts::Review {
+        id: id.context("a review has no id")?,
+        author: str_at(r, &["user", "login"])
+            .filter(|login| !login.is_empty())
+            .with_context(|| format!("{} has an author with no login", about()))?,
+        state: state.to_string(),
+        commit: string(r, "commit_id"),
+        body: string(r, "body"),
+        submitted_at: submitted_at.map(String::from),
+    }))
+}
+
+/// A page of reviews: every one that has an author, each read in full or
+/// the whole read fails.
 fn parse_reviews(v: &Value) -> Result<Vec<drafts::Review>> {
     let list = v.as_array().context("the reviews were not a list")?;
     list.iter()
-        .map(|r| {
-            let id = r.get("id").and_then(Value::as_u64);
-            let about = || id.map_or_else(|| "a review".to_string(), |id| format!("review {id}"));
-            let field = |key: &str| r.get(key).and_then(Value::as_str);
-            let state = field("state")
-                .filter(|s| !s.is_empty())
-                .with_context(|| format!("{} has no state", about()))?;
-            let submitted_at = field("submitted_at");
-            if state != "PENDING" && submitted_at.and_then(parse_iso8601).is_none() {
-                bail!("{} has no time it was submitted", about());
-            }
-            Ok(drafts::Review {
-                id: id.context("a review has no id")?,
-                author: str_at(r, &["user", "login"])
-                    .filter(|login| !login.is_empty())
-                    .with_context(|| format!("{} has no author", about()))?,
-                state: state.to_string(),
-                commit: string(r, "commit_id"),
-                body: string(r, "body"),
-                submitted_at: submitted_at.map(String::from),
-            })
-        })
+        .filter_map(|r| parse_review(r).transpose())
         .collect()
 }
 
-/// A review's inline comments, in the draft's own terms so the two can be
-/// compared. A comment GitHub no longer places on a line is given by where it
-/// was written; one with no place at all fails the read.
-fn parse_review_comments(v: &Value) -> Result<Vec<drafts::Comment>> {
-    let list = v
-        .as_array()
-        .context("the review comments were not a list")?;
+/// A page of a pull request's inline comments, in the draft's own terms so
+/// the two can be compared.
+///
+/// `line` is where the comment sits now, and is null once later commits have
+/// moved on from it; `original_line` is where it was made. Either says where
+/// a comment on the pull request's current head is. A comment with neither —
+/// one on a whole file — or with a `start_line` — one on a range — is not
+/// something a draft can say, and is given as having no place.
+fn parse_comments(v: &Value) -> Result<Vec<drafts::Placed>> {
+    let list = v.as_array().context("the comments were not a list")?;
     list.iter()
         .map(|c| {
-            let line = c
-                .get("line")
-                .and_then(Value::as_u64)
-                .or_else(|| c.get("original_line").and_then(Value::as_u64))
-                .context("a review comment has no line")?;
-            let side = match c
-                .get("side")
-                .and_then(Value::as_str)
-                .or_else(|| c.get("original_side").and_then(Value::as_str))
-            {
-                Some("LEFT") => drafts::Side::Left,
-                Some("RIGHT") => drafts::Side::Right,
-                _ => bail!("a review comment has no side"),
+            let number = |key: &str| c.get(key).and_then(Value::as_u64);
+            let text = |key: &str| c.get(key).and_then(Value::as_str);
+            let path = text("path").context("a comment has no path")?;
+            let side = match text("side").or_else(|| text("original_side")) {
+                Some("LEFT") => Some(drafts::Side::Left),
+                Some("RIGHT") => Some(drafts::Side::Right),
+                _ => None,
             };
-            Ok(drafts::Comment {
-                path: c
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .context("a review comment has no path")?
-                    .to_string(),
-                line,
-                side,
-                body: string(c, "body"),
+            let line = number("line").or_else(|| number("original_line"));
+            let ranged = number("start_line").is_some() || number("original_start_line").is_some();
+            let at = match (line, side) {
+                (Some(line), Some(side)) if !ranged => Some(drafts::Comment {
+                    path: path.to_string(),
+                    line,
+                    side,
+                    body: string(c, "body"),
+                }),
+                _ => None,
+            };
+            Ok(drafts::Placed {
+                review: number("pull_request_review_id"),
+                at,
             })
         })
         .collect()
@@ -865,9 +870,27 @@ mod tests {
         assert_eq!((got[2].commit.as_str(), got[2].body.as_str()), ("", ""));
     }
 
-    /// One entry that cannot be read spoils the list: a review with no
-    /// author might be the viewer's, and a post is not decided on a list
-    /// with a hole in it. The whole read fails, which sends nothing.
+    /// A review whose account is gone has no author at all. Whoever it was,
+    /// it is not the viewer, so it is left out — it does not make every
+    /// other review on the pull request unreadable.
+    #[test]
+    fn a_review_with_no_author_is_left_out_not_fatal() {
+        let got = parse_reviews(&serde_json::json!([
+            { "id": 11, "user": null, "state": "APPROVED", "commit_id": "1a2b3c4d",
+              "body": "", "submitted_at": "2027-01-15T08:00:00Z" },
+            // Nothing else about it has to be readable either.
+            { "id": null, "user": null },
+            { "id": 13, "user": { "login": "octocat" }, "state": "COMMENTED",
+              "commit_id": "1a2b3c4d", "body": "", "submitted_at": "2027-01-15T08:01:00Z" }
+        ]))
+        .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].id, got[0].author.as_str()), (13, "octocat"));
+    }
+
+    /// One entry with an author that still cannot be read spoils the list: it
+    /// might be the viewer's, and a post is not decided on a list with a hole
+    /// in it. The whole read fails, which sends nothing.
     #[test]
     fn a_review_that_cannot_be_read_fails_the_whole_read() {
         type Edit = fn(&mut Value);
@@ -883,15 +906,14 @@ mod tests {
         };
         assert!(parse_reviews(&Value::Array(vec![good.clone()])).is_ok());
 
-        let cases: [(Edit, &str); 9] = [
-            (|r| r["user"] = Value::Null, "review 11 has no author"),
+        let cases: [(Edit, &str); 8] = [
             (
                 |r| r["user"] = serde_json::json!({}),
-                "review 11 has no author",
+                "review 11 has an author with no login",
             ),
             (
                 |r| r["user"]["login"] = "".into(),
-                "review 11 has no author",
+                "review 11 has an author with no login",
             ),
             (|r| r["state"] = Value::Null, "review 11 has no state"),
             (|r| r["state"] = "".into(), "review 11 has no state"),
@@ -921,34 +943,90 @@ mod tests {
         );
     }
 
+    /// The shapes below are the ones GitHub sends, copied from its answers:
+    /// `line` null on a comment later commits moved on from, `original_side`
+    /// null throughout, `start_line` on a comment over a range.
     #[test]
-    fn reads_a_reviews_inline_comments() {
-        let got = parse_review_comments(&serde_json::json!([
-            { "path": "src/x.rs", "line": 84, "side": "RIGHT", "body": "Worth a test." },
-            // No longer placed on a line: where it was written is what counts.
-            { "path": "src/old.rs", "line": null, "original_line": 7,
-              "side": null, "original_side": "LEFT", "body": "Why was this dropped?" }
+    fn reads_a_pull_requests_inline_comments() {
+        let got = parse_comments(&serde_json::json!([
+            { "pull_request_review_id": 77, "path": "src/x.rs", "line": 84,
+              "original_line": 84, "side": "RIGHT", "original_side": null,
+              "start_line": null, "subject_type": "line", "body": "Worth a test." },
+            // Outdated: only where it was made is known.
+            { "pull_request_review_id": 77, "path": "src/old.rs", "line": null,
+              "original_line": 7, "side": "LEFT", "original_side": null,
+              "start_line": null, "subject_type": "line", "body": "Why was this dropped?" },
+            // On a range of lines.
+            { "pull_request_review_id": 78, "path": "src/x.rs", "line": 47,
+              "original_line": 47, "side": "RIGHT", "start_line": 43,
+              "start_side": "RIGHT", "subject_type": "line", "body": "All of this." },
+            // On the file as a whole.
+            { "pull_request_review_id": 79, "path": "src/x.rs", "line": null,
+              "original_line": null, "side": null, "subject_type": "file", "body": "Rename it." },
+            { "pull_request_review_id": null, "path": "src/x.rs", "line": 1,
+              "side": "RIGHT", "body": "" }
         ]))
         .unwrap();
-        assert_eq!(got.len(), 2);
+        assert_eq!(got.len(), 5);
+        let at = got[0].at.as_ref().unwrap();
+        assert_eq!(got[0].review, Some(77));
         assert_eq!(
-            (got[0].path.as_str(), got[0].line, got[0].side),
-            ("src/x.rs", 84, drafts::Side::Right)
+            (at.path.as_str(), at.line, at.side, at.body.as_str()),
+            ("src/x.rs", 84, drafts::Side::Right, "Worth a test.")
         );
-        assert_eq!(got[0].body, "Worth a test.");
+        let at = got[1].at.as_ref().unwrap();
         assert_eq!(
-            (got[1].path.as_str(), got[1].line, got[1].side),
+            (at.path.as_str(), at.line, at.side),
             ("src/old.rs", 7, drafts::Side::Left)
         );
+        // Neither is an error, and neither is a comment a draft could have
+        // made: each has no place.
+        assert_eq!((got[2].review, got[2].at.is_none()), (Some(78), true));
+        assert_eq!((got[3].review, got[3].at.is_none()), (Some(79), true));
+        assert_eq!(got[4].review, None);
 
-        // A comment that cannot be placed cannot be compared.
-        for bad in [
-            serde_json::json!([{ "path": "src/x.rs", "side": "RIGHT", "body": "" }]),
-            serde_json::json!([{ "path": "src/x.rs", "line": 84, "body": "" }]),
-            serde_json::json!([{ "line": 84, "side": "RIGHT", "body": "" }]),
-            serde_json::json!({ "message": "Not Found" }),
+        assert!(
+            parse_comments(&serde_json::json!([{ "pull_request_review_id": 1, "line": 3 }]))
+                .is_err(),
+            "a comment on no file is not a comment"
+        );
+        assert!(parse_comments(&serde_json::json!({ "message": "Not Found" })).is_err());
+    }
+
+    /// What a post is answered with has to be one review, readable in full,
+    /// before it is evidence of anything. What a redirect followed as a read
+    /// would bring back is not.
+    #[test]
+    fn only_a_review_in_the_answer_is_a_created_review() {
+        let review = r#"{"id": 91, "user": {"login": "octocat"}, "state": "APPROVED",
+            "commit_id": "1a2b3c4d", "body": "Reads well.",
+            "submitted_at": "2027-01-15T08:00:00Z"}"#;
+        let got = created_review(review.as_bytes()).unwrap();
+        assert_eq!(
+            (
+                got.id,
+                got.author.as_str(),
+                got.state.as_str(),
+                got.commit.as_str()
+            ),
+            (91, "octocat", "APPROVED", "1a2b3c4d")
+        );
+
+        for not_a_review in [
+            // The reviews already on the pull request, as a GET would list.
+            format!("[{review}]"),
+            "[]".to_string(),
+            // The pull request itself.
+            r#"{"number": 101, "state": "open", "user": {"login": "hubot"}, "head": {"sha": "1a2b3c4d"}}"#.to_string(),
+            r#"{"id": 91, "user": null, "state": "APPROVED", "submitted_at": "2027-01-15T08:00:00Z"}"#.to_string(),
+            r#"{"id": 91, "user": {"login": "octocat"}, "state": "APPROVED"}"#.to_string(),
+            "<html>Moved</html>".to_string(),
+            String::new(),
         ] {
-            assert!(parse_review_comments(&bad).is_err(), "{bad}");
+            assert!(
+                created_review(not_a_review.as_bytes()).is_err(),
+                "{not_a_review}"
+            );
         }
     }
 
@@ -983,6 +1061,75 @@ mod tests {
         assert!(
             f.prs.iter().any(|p| !p.checks.is_empty()),
             "check runs still come through the rollup"
+        );
+    }
+
+    /// A pull request that is closed, unmerged and years old, in a public
+    /// repository: what it says about itself will not change.
+    const LIVE: (&str, &str, u64) = ("cli", "cli", 7);
+    /// One of its reviews, which carries four inline comments.
+    const LIVE_REVIEW: u64 = 299_434_370;
+
+    fn live() -> Gh {
+        Gh {
+            owner: LIVE.0.into(),
+            name: LIVE.1.into(),
+        }
+    }
+
+    /// The contract for the first read made before a post.
+    #[test]
+    #[ignore = "live: needs network and gh auth"]
+    fn live_pull_request_still_reads() {
+        use drafts::Remote;
+        let pull = live().pull(LIVE.2).expect("live read");
+        assert!(!pull.open && !pull.merged, "{pull:?}");
+        assert_eq!(pull.head.len(), 40, "{pull:?}");
+    }
+
+    /// The contract for the second: every review comes back with an id, an
+    /// author, a state and a time, or the read would fail.
+    #[test]
+    #[ignore = "live: needs network and gh auth"]
+    fn live_reviews_still_read() {
+        use drafts::Remote;
+        let reviews = live().reviews(LIVE.2, 1).expect("live read");
+        let known = reviews
+            .iter()
+            .find(|r| r.id == LIVE_REVIEW)
+            .expect("the known review");
+        assert_eq!(
+            (known.author.as_str(), known.state.as_str()),
+            ("mislav", "COMMENTED")
+        );
+        assert_eq!(known.commit.len(), 40);
+        assert_eq!(known.submitted_at.as_deref(), Some("2019-10-09T14:47:47Z"));
+    }
+
+    /// The contract for the read that tells one review from another: inline
+    /// comments still name their review and still say where they sit. The
+    /// list GitHub keeps per review says neither a line nor a side, which is
+    /// why this is the one read.
+    #[test]
+    #[ignore = "live: needs network and gh auth"]
+    fn live_inline_comments_still_say_where_they_sit() {
+        use drafts::Remote;
+        let comments = live().comments(LIVE.2, 1).expect("live read");
+        let mut of_review: Vec<_> = comments
+            .iter()
+            .filter(|c| c.review == Some(LIVE_REVIEW))
+            .map(|c| c.at.as_ref().expect("a place"))
+            .map(|at| (at.path.as_str(), at.line, at.side))
+            .collect();
+        of_review.sort_unstable();
+        assert_eq!(
+            of_review,
+            [
+                ("command/pr.go", 347, drafts::Side::Right),
+                ("command/pr.go", 400, drafts::Side::Right),
+                ("context/context.go", 28, drafts::Side::Right),
+                ("context/context.go", 29, drafts::Side::Right),
+            ]
         );
     }
 }
