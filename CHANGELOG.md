@@ -21,7 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a decision shows beside the sort order from every view. The cursor stays on
   its draft, by file, as drafts come, go and re-sort; a draft longer than the
   detail pane says there is more below. Only a regular file of at most 256 KB
-  is read, and a draft's timestamps must be RFC 3339.
+  is read, and a draft's timestamps must be RFC 3339. A pull request number
+  of any length is shown whole.
 
 - `--print-config` lists the tab bar, and spells every value the way a config
   file does, so a line can be copied into one.

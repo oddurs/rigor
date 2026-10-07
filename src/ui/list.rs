@@ -61,6 +61,15 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         home: home.as_deref(),
         // In Mine every author is you; give the title the room instead.
         authors: app.view != View::Mine,
+        // Wide enough for the longest draft's number and a gutter, and never
+        // narrower than the pull request lists' own.
+        draft_label_w: app
+            .drafts
+            .iter()
+            .map(|e| crate::util::width(&e.label()) + 1)
+            .max()
+            .unwrap_or(0)
+            .clamp(7, 14),
     };
     let mut lines = Vec::with_capacity(height);
 
@@ -134,6 +143,8 @@ struct RowCtx<'a> {
     home: Option<&'a str>,
     /// Whether the author column earns its width.
     authors: bool,
+    /// How wide the Drafts view's first column is.
+    draft_label_w: usize,
 }
 
 /// `▎#4846  ✗ 1/3   ✔ ⌂ Give the read path a retry budget      octocat     3m`
@@ -351,7 +362,10 @@ fn draft_line(
     let mut spans = vec![
         Span::styled(if selected { "▎" } else { " " }, base.fg(t.accent)),
         Span::styled(
-            pad(&entry.label(), 7),
+            // The column is sized to the longest number in the list. A file
+            // not named for a pull request shows its own name, which can be
+            // any length: that is cut short of the column, not into it.
+            cell(&entry.label(), ctx.draft_label_w),
             base.fg(if decided || state == State::Invalid {
                 quiet
             } else {
@@ -364,7 +378,7 @@ fn draft_line(
         ),
     ];
 
-    let left = 1 + 7 + 13;
+    let left = 1 + ctx.draft_label_w + 13;
     let show_size = width >= 92;
     let show_age = width >= 62;
     let right_w = (if show_size { 14 } else { 0 }) + (if show_age { 5 } else { 0 });

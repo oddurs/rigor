@@ -1562,6 +1562,34 @@ fn the_cursor_stays_on_its_draft_when_the_list_changes_underneath() {
     }
 }
 
+/// A pull request number of any length is shown whole, and the columns
+/// beside it still line up.
+#[test]
+fn long_pull_request_numbers_are_not_cut_in_the_drafts_list() {
+    let (mut a, dir) = bare_drafts();
+    for number in [7, 123_456, 1_234_567] {
+        put_draft(&dir, number);
+    }
+    a.reload_drafts();
+    let screen = render(&mut a, 160, 24);
+    let row = |number: u64| {
+        screen
+            .lines()
+            .find(|l| l.contains(&format!("#{number} ")))
+            .unwrap_or_else(|| panic!("#{number} is cut or missing:\n{screen}"))
+            .to_string()
+    };
+    // In columns, not bytes: the selected row starts with a wider character.
+    let column = |number: u64| {
+        let row = row(number);
+        row.split("unverified").next().unwrap().chars().count()
+    };
+    assert!(row(1_234_567).contains("#1234567 unverified"), "{screen}");
+    assert_eq!(column(7), column(123_456), "{screen}");
+    assert_eq!(column(7), column(1_234_567), "{screen}");
+    assert!(!screen.contains("#12345…") && !screen.contains("#1234…"));
+}
+
 /// A fetch re-sorts the list by how recently each pull request moved. The
 /// cursor goes with its draft there too.
 #[test]
