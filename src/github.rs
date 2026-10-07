@@ -28,7 +28,7 @@ query($owner:String!, $name:String!, $cursor:String) {
       nodes {
         number title url isDraft updatedAt
         author { login }
-        headRefName baseRefName
+        headRefName headRefOid baseRefName
         additions deletions changedFiles
         mergeable
         reviewDecision
@@ -226,6 +226,7 @@ fn parse_pr(n: &Value) -> Pr {
         updated_at: opt_ts(n, "updatedAt").unwrap_or(0),
         author: str_at(n, &["author", "login"]).unwrap_or_else(|| "ghost".into()),
         head_ref: string(n, "headRefName"),
+        head_oid: string(n, "headRefOid"),
         base_ref: string(n, "baseRefName"),
         additions: num(n, "additions"),
         deletions: num(n, "deletions"),
@@ -433,6 +434,7 @@ mod tests {
     fn reads_people_and_metadata() {
         let pr = &page().prs[0];
         assert_eq!(pr.author, "octocat");
+        assert_eq!(pr.head_oid, "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b");
         assert_eq!(
             pr.review_requests,
             vec!["hubot", "platform"],
@@ -510,6 +512,11 @@ mod tests {
         assert!(
             !f.merged.is_empty() && f.merged.iter().all(|m| m.head_oid.len() >= 40),
             "headRefOid on merged pull requests"
+        );
+        // Posting a review draft is decided by this one.
+        assert!(
+            f.prs.iter().all(|p| p.head_oid.len() >= 40),
+            "headRefOid on open pull requests"
         );
         assert!(
             f.prs

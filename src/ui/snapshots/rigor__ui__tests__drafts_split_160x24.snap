@@ -1,0 +1,28 @@
+---
+source: src/ui/tests.rs
+expression: "render(&mut a, 160, 24)"
+---
+ rigor │ acme/widget  ⎇ chore/release-notes                                                                                                            @octocat
+ Ready 1   Mine 2   Review 1   Blocked 1   All 3   Worktrees 5   Drafts 7                                                ⌫ 1 removable   ✎ 4 drafted   ↕ recent
+─────────────────────────────────────────────────────────────────━━━━━━━━────────────────────┬──────────────────────────────────────────────────────────────────
+ #4846  approve      Give the read path a retry budget                         +220 −24   3m │ #4840 Move the palette onto color tokens
+▎#4840  comment +2   Move the palette onto color tokens                        +220 −24   2h │ octocat · 2h ago · +220 −24 · 6 files · 2 comments
+ #4801  ✓ posted     draft · Treat a filtered empty result as unknown          +220 −24   3d │  picked    Touches the read path; small and self-contained.
+ #4700  stale        merged · Drop the monospace count chips                              4d │  verdict   comment
+ #4701  skipped      merged · Fix the row hover state                                     5d │  body      Reads well overall.
+ #4980  invalid      not among the fetched pull requests                                     │
+ #4990  unverified   not among the fetched pull requests                                     │            One question on the cap before this goes in.
+                                                                                             │  comment   src/retry.rs:84
+                                                                                             │            Should this cap at the caller's deadline?
+                                                                                             │  comment   src/retry.rs:120
+                                                                                             │            A test for the zero-budget case would pin this.
+                                                                                             │  note      private · never posted
+                                                                                             │            Second look at the backoff math if there is time.
+                                                                                             │  head      1a2b3c4  matches the pull request
+                                                                                             │
+                                                                                             │
+                                                                                             │
+                                                                                             │
+                                                                                             │
+                                                                                             │
+ 1–7 view   o open   c checks   y copy   / filter   s sort   r refresh                                                                          ? help   q quit

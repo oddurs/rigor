@@ -16,11 +16,12 @@ pub enum View {
     Blocked,
     All,
     Worktrees,
+    Drafts,
 }
 
 impl View {
     /// Every view that exists, for config validation and tests.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Ready,
         Self::Mine,
         Self::Review,
@@ -28,6 +29,7 @@ impl View {
         Self::Blocked,
         Self::All,
         Self::Worktrees,
+        Self::Drafts,
     ];
 
     /// The tabs shown when config says nothing. Ready leads because merging what
@@ -50,6 +52,7 @@ impl View {
             "blocked" | "stuck" => Some(Self::Blocked),
             "all" => Some(Self::All),
             "worktrees" | "agents" => Some(Self::Worktrees),
+            "drafts" => Some(Self::Drafts),
             _ => None,
         }
     }
@@ -73,6 +76,7 @@ impl View {
             Self::Blocked => "Blocked",
             Self::All => "All",
             Self::Worktrees => "Worktrees",
+            Self::Drafts => "Drafts",
         }
     }
 
@@ -85,6 +89,7 @@ impl View {
             Self::Blocked => "Nothing is blocked — no red CI, conflicts or requested changes.",
             Self::All => "No open PRs in this repo.",
             Self::Worktrees => "No git worktrees found.",
+            Self::Drafts => "No review drafts for this repo.",
         }
     }
 }
@@ -346,7 +351,7 @@ pub const SAMPLE: &str = r##"# rigor — PR dashboard configuration
 
 default_view    = "ready"  # any name from `views` below
 # The tab bar, in order. Number keys 1-9 select them positionally.
-# Available: ready | mine | review | assigned | blocked | all | worktrees
+# Available: ready | mine | review | assigned | blocked | all | worktrees | drafts
 views = ["ready", "mine", "review", "blocked", "all", "worktrees"]
 refresh_secs    = 90       # 0 disables background refresh
 layout          = "auto"   # auto | split (side-by-side) | stack (list over detail)
@@ -439,6 +444,12 @@ mod tests {
             "deduplicated, in order"
         );
         assert_eq!(s.default_view, View::Mine, "falls back to the first tab");
+
+        // Views left off the default bar are added the same way.
+        let opt_in = write(d.path(), "e.toml", "views = [\"all\", \"drafts\"]\n");
+        let s = load(d.path(), Some(&opt_in)).unwrap();
+        assert_eq!(s.views, vec![View::All, View::Drafts]);
+        assert!(!View::DEFAULT.contains(&View::Drafts), "drafts are opt-in");
 
         let bad = write(d.path(), "b.toml", "views = [\"mine\", \"nope\"]\n");
         let err = load(d.path(), Some(&bad)).unwrap_err().to_string();

@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod drafts;
 mod event;
 mod git;
 mod github;
@@ -46,8 +47,8 @@ struct Cli {
     #[arg(short = 'R', long)]
     repo: Option<String>,
 
-    /// Start on this view: ready, mine, review, assigned, blocked, all or
-    /// worktrees
+    /// Start on this view: ready, mine, review, assigned, blocked, all,
+    /// worktrees or drafts
     #[arg(short = 'v', long, value_parser = parse_view)]
     view: Option<View>,
 
@@ -131,6 +132,7 @@ fn main() -> Result<()> {
         }
     };
     let (mut a, rx) = App::new(repo, settings, theme);
+    a.drafts_dir = drafts::dir(|key| std::env::var_os(key));
     let result = run(&mut term, &mut a, &rx);
     restore(&mut term, mouse);
     proc::shutdown();

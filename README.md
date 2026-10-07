@@ -46,6 +46,8 @@ Six views, selected with the number keys, Tab, or a click:
 
 An `Assigned` view, for pull requests assigned to you, is off the tab bar by
 default; add it with `views` in the config, or open on it with `rigor -v assigned`.
+So is `Drafts`, which lists [review drafts](#review-drafts) written for this
+repository's pull requests: add `drafts` to `views`, or run `rigor -v drafts`.
 
 Keys: `o`/`Enter` opens the selected pull request in the browser, `c` its checks
 page, `y` copies the URL, `/` filters, `s` toggles between recency and
@@ -62,6 +64,58 @@ merged at, with nothing uncommitted, is marked `removable`, with the
 branch name, means a reused branch name with new work is never offered, and a
 squash-merged branch whose remote was deleted still is. `rigor` never modifies
 your repository — it only tells you what is safe to collect.
+
+## Review drafts
+
+A review draft is a file some other tool has written about one pull request: a
+verdict, a body, and any inline comments. `rigor` does not write drafts and
+does not care what does. It reads them from
+`<drafts dir>/<owner>/<repo>/<number>.json`, where the drafts directory is
+`$RIGOR_DRAFTS_DIR`, else `$XDG_DATA_HOME/rigor/drafts`, else
+`~/.local/share/rigor/drafts`:
+
+```json
+{
+  "version": 1,
+  "repo": "acme/widget",
+  "number": 101,
+  "head_sha": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+  "verdict": "approve",
+  "body": "Reads well.",
+  "comments": [
+    { "path": "src/x.rs", "line": 84, "side": "RIGHT", "body": "Worth a test." }
+  ],
+  "note": "For you, not for the pull request.",
+  "picked": "Why this pull request.",
+  "created_at": "2027-01-15T09:00:00Z",
+  "status": "drafted",
+  "posted_at": null
+}
+```
+
+`verdict` is `approve` or `comment`; `status` is `drafted`, `posted` or
+`skipped`. `head_sha` is the commit the draft was written against.
+
+The `Drafts` view shows one row per file, with the pull request's title, size
+and age beside what the draft would send — `approve`, or `comment +2` when two
+inline comments ride along — or the one word for why it cannot be sent:
+
+| State | Meaning |
+|---|---|
+| `stale` | The pull request has moved on from the commit the draft was written against |
+| `unverified` | The pull request is not among those `rigor` fetched, so its head is not known |
+| `invalid` | The file is not a draft `rigor` understands; the detail pane says why |
+| `✓ posted`, `skipped` | Already decided |
+
+Selecting a draft shows it in the detail pane, with `note` marked as private.
+A long draft does not fit: the pane scrolls with `J` / `K` and says when there
+is more below. A count of drafts still awaiting a decision sits beside the sort
+order in every view.
+
+Every field is required and, as in the config file, an unknown key, value or
+`version` is an error, not silently ignored. Timestamps are RFC 3339, with `Z`
+or a numeric offset. Only a regular file of at most 256 KB is read; a symbolic
+link, or anything else under a draft's name, is listed as `invalid`.
 
 ## Configuration
 

@@ -17,7 +17,7 @@ use common::{QUIET_GIT, inherited_git_vars, isolated, write_exe};
 
 use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,6 +27,8 @@ const FIXTURE: &str = include_str!("fixtures/graphql_page.json");
 /// run's repository has its own commit ids, so the fake `gh` answers with the
 /// landed desk's real HEAD in its place.
 const FIXTURE_LANDED_OID: &str = "5d6c7b8a9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b";
+/// The commit the fixture gives open PR #101 as its head.
+const FIXTURE_HEAD_101: &str = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b";
 const ROWS: u16 = 30;
 const COLS: u16 = 160;
 
@@ -53,6 +55,49 @@ impl World {
 
     fn gh(&self, mode: &str) {
         std::fs::write(self.root().join("gh.mode"), mode).unwrap();
+    }
+
+    /// Leave a review draft for `acme/widget#number`, the way whatever writes
+    /// them would: valid and written against #101's head, until `edit` says
+    /// otherwise.
+    fn draft(&self, number: u64, edit: impl FnOnce(&mut serde_json::Value)) -> PathBuf {
+        let mut v = serde_json::json!({
+            "version": 1,
+            "repo": "acme/widget",
+            "number": number,
+            "head_sha": FIXTURE_HEAD_101,
+            "verdict": "approve",
+            "body": "Reads well.",
+            "comments": [
+                { "path": "src/x.rs", "line": 84, "side": "RIGHT", "body": "Worth a test." }
+            ],
+            "note": "PRIVATE-NOTE",
+            "picked": "PRIVATE-PICKED",
+            // Well in the past, whenever this runs: rigor here is on the real
+            // clock, and a draft is written before it is read.
+            "created_at": "2026-01-15T09:00:00Z",
+            "status": "drafted",
+            "posted_at": null
+        });
+        edit(&mut v);
+        let dir = self.root().join("drafts/acme/widget");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{number}.json"));
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        path
+    }
+
+    /// rigor on the Drafts view, reading this world's drafts.
+    fn drafts_view(&self) -> Term {
+        let dir = self.root().join("drafts");
+        Term::start(
+            self,
+            Opts {
+                args: &["-v", "drafts"],
+                env: &[("RIGOR_DRAFTS_DIR", dir.to_str().unwrap())],
+                ..Opts::default()
+            },
+        )
     }
 
     fn log(&self, name: &str) -> Vec<String> {
@@ -231,6 +276,8 @@ impl Term {
             "HERDR_THEME_FILE",
             "NO_COLOR",
             "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "RIGOR_DRAFTS_DIR",
         ] {
             cmd.env_remove(k);
         }
@@ -602,4 +649,44 @@ fn a_rate_limited_budget_pauses_instead_of_retrying() {
     let before = w.log("gh.log").len();
     std::thread::sleep(Duration::from_secs(3));
     assert_eq!(w.log("gh.log").len(), before, "fetched again while paused");
+}
+
+// -------------------------------------------------------------------- drafts
+
+/// Drafts are found through the environment and checked against what GitHub
+/// says the pull request's head is, by the real binary.
+#[test]
+fn drafts_are_read_from_the_drafts_directory_and_checked_against_the_head() {
+    let w = World::new();
+    w.draft(101, |_| {});
+    // #102 is at another commit in the fixture.
+    w.draft(102, |_| {});
+    w.draft(999, |_| {});
+    let t = w.drafts_view();
+    // Only once the fetch lands is #101 known to be at the draft's commit;
+    // until then every draft is unverified.
+    t.wait_line("#101 ready to post", LOAD, |l| {
+        l.contains("#101") && l.contains("approve +1")
+    });
+    t.wait_line("#102 stale", LOAD, |l| {
+        l.contains("#102") && l.contains("stale")
+    });
+    t.wait_line("#999 unverified", LOAD, |l| {
+        l.contains("#999") && l.contains("unverified")
+    });
+    assert!(t.row(1).contains("Drafts 3"), "{:?}", t.row(1));
+}
+
+/// With no drafts and the view left off the bar, the screen says nothing
+/// about them.
+#[test]
+fn the_default_screen_does_not_mention_drafts() {
+    let w = World::new();
+    let t = Term::start(&w, Opts::default());
+    t.wait_for("#101", LOAD);
+    let text = t.text();
+    assert!(
+        !text.contains("Drafts") && !text.contains("drafted"),
+        "{text}"
+    );
 }

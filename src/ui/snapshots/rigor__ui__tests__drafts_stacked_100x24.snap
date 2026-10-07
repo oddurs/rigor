@@ -1,0 +1,28 @@
+---
+source: src/ui/tests.rs
+expression: "render(&mut a, 100, 24)"
+---
+ rigor │ acme/widget  ⎇ chore/release-notes                                                @octocat
+ Ready 1   Mine 2   Review 1   Blocked 1   All 3   Worktrees 5   Drafts 7
+─────────────────────────────────────────────────────────────────━━━━━━━━───────────────────────────
+▎#4846  approve      Give the read path a retry budget                                +220 −24   3m
+ #4840  comment +2   Move the palette onto color tokens                               +220 −24   2h
+ #4801  ✓ posted     draft · Treat a filtered empty result as unknown                 +220 −24   3d
+ #4700  stale        merged · Drop the monospace count chips                                     4d
+ #4701  skipped      merged · Fix the row hover state                                            5d
+ #4980  invalid      not among the fetched pull requests
+ #4990  unverified   not among the fetched pull requests
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ #4846 Give the read path a retry budget
+ octocat · 3m ago · +220 −24 · 6 files · 2 comments
+  picked    Small, green and waiting on one review.
+  verdict   approve
+  body      none
+  note      none
+  head      1a2b3c4  matches the pull request
+
+
+ 1–7 view   o open   c checks   y copy   / filter   s sort   r refresh              ? help   q quit

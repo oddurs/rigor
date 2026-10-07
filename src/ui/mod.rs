@@ -13,7 +13,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::app::{App, Hits, Mode};
+use crate::app::{App, DraftPr, Hits, Mode};
 use crate::config::{LayoutMode, View};
 use crate::util::{cols, now_secs, rel_time, secs};
 
@@ -288,11 +288,25 @@ fn draw_subnav(
             Style::new().fg(t.muted),
         ));
     }
-    right.push(Span::styled("↕ ", Style::new().fg(t.border)));
-    right.push(Span::styled(
-        format!("{} ", app.sort.label()),
-        Style::new().fg(t.muted),
-    ));
+    let sort = [
+        Span::styled("↕ ", Style::new().fg(t.border)),
+        Span::styled(format!("{} ", app.sort.label()), Style::new().fg(t.muted)),
+    ];
+    // Review drafts still waiting on a decision. Shown from every view, so a
+    // draft is noticed even with the Drafts tab left off the bar — and the
+    // first thing to go on a tight bar, so it never costs the bar the rest.
+    let drafted = app.drafted_count();
+    if drafted > 0 {
+        let counter = [
+            Span::styled("✎ ", Style::new().fg(t.pending)),
+            Span::styled(format!("{drafted} drafted   "), Style::new().fg(t.muted)),
+        ];
+        let rest = width_of(&spans) + width_of(&right) + width_of(&sort);
+        if rest + width_of(&counter) < area.width as usize {
+            right.extend(counter);
+        }
+    }
+    right.extend(sort);
 
     let used = width_of(&spans);
     let width = area.width as usize;
@@ -473,6 +487,11 @@ fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
         .selected_worktree()
         .and_then(|w| w.branch.as_deref())
         .is_some_and(|b| app.merged_for_branch(b).is_some());
+    // A draft's pull request may have merged since; it still has a page.
+    let draft_merged = matches!(
+        app.selected_draft().map(|e| app.draft_pr(e)),
+        Some(DraftPr::Merged(_))
+    );
     let views = app.settings.views.len();
     let view_keys = if views > 1 {
         format!("1–{}", views.min(9))
@@ -481,11 +500,13 @@ fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let mut left: Vec<Vec<Span<'_>>> = vec![key(&view_keys, "view")];
-    if has_pr || has_merged {
+    if has_pr || has_merged || draft_merged {
         left.push(key("o", "open"));
     }
     if has_pr {
         left.push(key("c", "checks"));
+    }
+    if has_pr || draft_merged {
         left.push(key("y", "copy"));
     }
     left.push(key("/", "filter"));

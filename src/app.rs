@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::config::{Settings, View};
+use crate::drafts;
 use crate::git;
 use crate::github;
 use crate::model::{
@@ -66,11 +67,49 @@ impl InFlight {
     }
 }
 
-/// A visible line in the list: either a pull request or a worktree.
+/// A visible line in the list: a pull request, a worktree, or a review draft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Row {
     Pr(usize),
     Wt(usize),
+    Draft(usize),
+}
+
+/// What the last fetch knows about the pull request a draft was written for.
+#[derive(Clone, Copy)]
+pub enum DraftPr<'a> {
+    Open(&'a Pr),
+    Merged(&'a MergedPr),
+    /// Not among the open or recently merged pull requests rigor fetched.
+    Unknown,
+}
+
+impl DraftPr<'_> {
+    /// The pull request's head commit, when the fetch carried one.
+    pub const fn head(&self) -> Option<&str> {
+        match self {
+            Self::Open(p) => Some(p.head_oid.as_str()),
+            Self::Merged(m) => Some(m.head_oid.as_str()),
+            Self::Unknown => None,
+        }
+    }
+
+    pub const fn url(&self) -> Option<&str> {
+        match self {
+            Self::Open(p) => Some(p.url.as_str()),
+            Self::Merged(m) => Some(m.url.as_str()),
+            Self::Unknown => None,
+        }
+    }
+
+    /// When the pull request last moved, for ordering and the age column.
+    pub const fn touched_at(&self) -> Option<i64> {
+        match self {
+            Self::Open(p) => Some(p.updated_at),
+            Self::Merged(m) => Some(m.merged_at),
+            Self::Unknown => None,
+        }
+    }
 }
 
 /// What a worktree is good for right now — the question the worktree view is
@@ -150,6 +189,10 @@ pub struct App {
     pub wt_by_branch: HashMap<String, usize>,
     pub merged: Vec<MergedPr>,
     pub merged_by_branch: HashMap<String, usize>,
+    /// Where review drafts are read from. `main` sets it; an `App` built
+    /// without it reads none, so a test never picks up the developer's own.
+    pub drafts_dir: Option<PathBuf>,
+    pub drafts: Vec<drafts::Entry>,
     pub view: View,
     pub sort: Sort,
     pub rows: Vec<Row>,
@@ -188,6 +231,8 @@ impl App {
             wt_by_branch: HashMap::new(),
             merged: Vec::new(),
             merged_by_branch: HashMap::new(),
+            drafts_dir: None,
+            drafts: Vec::new(),
             sort: Sort::Recent,
             rows: Vec::new(),
             selected: 0,
@@ -236,6 +281,9 @@ impl App {
     }
 
     pub fn refresh_prs(&mut self) {
+        // Read here rather than on a worker: a handful of small local files,
+        // and a draft written since the last look should not wait on GitHub.
+        self.reload_drafts();
         if self.in_flight.prs {
             return;
         }
@@ -437,11 +485,98 @@ impl App {
             .count()
     }
 
+    // ---------------------------------------------------------------- drafts
+
+    /// Read this repository's drafts again. Rows hold positions in the list,
+    /// so the Drafts view is rebuilt with it.
+    pub fn reload_drafts(&mut self) {
+        let Some(dir) = &self.drafts_dir else {
+            return;
+        };
+        // Taken before the list is replaced: after it, the same position in
+        // the list may be another draft.
+        let cursor = self.selected_draft().map(|e| e.path.clone());
+        match drafts::load(dir, &self.repo.owner, &self.repo.name) {
+            Ok(found) => self.drafts = found,
+            Err(e) => self.note(format!("could not read review drafts: {e}")),
+        }
+        if self.view == View::Drafts {
+            self.rebuild_around(cursor);
+        }
+    }
+
+    /// The pull request a draft is for, open or recently merged, as of the
+    /// last fetch.
+    pub fn draft_pr(&self, entry: &drafts::Entry) -> DraftPr<'_> {
+        let Some(number) = entry.number else {
+            return DraftPr::Unknown;
+        };
+        if let Some(p) = self.prs.iter().find(|p| p.number == number) {
+            return DraftPr::Open(p);
+        }
+        self.merged
+            .iter()
+            .find(|m| m.number == number)
+            .map_or(DraftPr::Unknown, DraftPr::Merged)
+    }
+
+    pub fn draft_state(&self, entry: &drafts::Entry) -> drafts::State {
+        drafts::state(&entry.draft, self.draft_pr(entry).head())
+    }
+
+    /// Drafts still waiting on a decision: neither posted nor skipped.
+    pub fn drafted_count(&self) -> usize {
+        self.drafts
+            .iter()
+            .filter(|e| {
+                e.draft
+                    .as_ref()
+                    .is_ok_and(|d| d.status == drafts::Status::Drafted)
+            })
+            .count()
+    }
+
+    pub fn selected_draft(&self) -> Option<&drafts::Entry> {
+        match self.selected_row()? {
+            Row::Draft(i) => self.drafts.get(i),
+            Row::Pr(_) | Row::Wt(_) => None,
+        }
+    }
+
+    fn draft_matches(&self, i: usize, q: &str) -> bool {
+        if q.is_empty() {
+            return true;
+        }
+        let entry = &self.drafts[i];
+        let about_pr = match self.draft_pr(entry) {
+            DraftPr::Open(p) => {
+                p.title.to_lowercase().contains(q)
+                    || p.head_ref.to_lowercase().contains(q)
+                    || p.author.to_lowercase().contains(q)
+            }
+            DraftPr::Merged(m) => {
+                m.title.to_lowercase().contains(q) || m.head_ref.to_lowercase().contains(q)
+            }
+            DraftPr::Unknown => false,
+        };
+        about_pr || entry.label().to_lowercase().contains(q)
+    }
+
     // ------------------------------------------------------------- row set
 
     /// Recompute the visible rows for the current view, filter and sort,
     /// keeping the previously selected item selected where possible.
     pub fn rebuild(&mut self) {
+        let cursor = self.selected_draft().map(|e| e.path.clone());
+        self.rebuild_around(cursor);
+    }
+
+    /// `rebuild`, told which draft the selection was on — by file, since a
+    /// row's position and a draft's place in the list both change as drafts
+    /// come, go and re-sort. A draft is what a keypress may post, so in the
+    /// Drafts view the selection follows the draft and nothing else.
+    fn rebuild_around(&mut self, cursor: Option<PathBuf>) {
+        let was = self.selected;
         let keep = if self.user_selected {
             self.rows.get(self.selected).copied()
         } else {
@@ -468,6 +603,23 @@ impl App {
                 });
                 idx.into_iter().map(Row::Wt).collect()
             }
+            View::Drafts => {
+                let mut idx: Vec<usize> = (0..self.drafts.len())
+                    .filter(|&i| self.draft_matches(i, &q))
+                    .collect();
+                // Newest pull request first, as in the other views; a draft
+                // whose pull request was not fetched has no age and goes last.
+                let touched =
+                    |i: usize| std::cmp::Reverse(self.draft_pr(&self.drafts[i]).touched_at());
+                if self.sort == Sort::Attention {
+                    idx.sort_by_key(|&i| {
+                        (draft_rank(self.draft_state(&self.drafts[i])), touched(i))
+                    });
+                } else {
+                    idx.sort_by_key(|&i| touched(i));
+                }
+                idx.into_iter().map(Row::Draft).collect()
+            }
             v => {
                 let mut idx: Vec<usize> = (0..self.prs.len())
                     .filter(|&i| self.in_view(&self.prs[i], v) && self.pr_matches(i, &q))
@@ -481,10 +633,26 @@ impl App {
             }
         };
 
+        let last = self.rows.len().saturating_sub(1);
+        if self.view == View::Drafts {
+            let same = cursor.and_then(|path| {
+                self.rows
+                    .iter()
+                    .position(|r| matches!(r, Row::Draft(i) if self.drafts[*i].path == path))
+            });
+            // Still on its draft: nothing the reader sees has to move, the
+            // detail pane's scroll included. Gone: the nearest row, not the
+            // top of the list.
+            if same.is_none() {
+                self.detail_scroll = 0;
+            }
+            self.selected = same.unwrap_or(was).min(last);
+            return;
+        }
         self.selected = keep
             .and_then(|k| self.rows.iter().position(|r| *r == k))
             .unwrap_or(0)
-            .min(self.rows.len().saturating_sub(1));
+            .min(last);
         self.detail_scroll = 0;
     }
 
@@ -523,7 +691,7 @@ impl App {
             View::Assigned => p.assigned_to_me(&self.viewer),
             View::Blocked => p.is_blocked(),
             View::All => true,
-            View::Worktrees => false,
+            View::Worktrees | View::Drafts => false,
         }
     }
 
@@ -533,6 +701,7 @@ impl App {
     pub fn count_for(&self, v: View) -> usize {
         match v {
             View::Worktrees => self.worktrees.len(),
+            View::Drafts => self.drafts.len(),
             _ => self.prs.iter().filter(|p| self.in_view(p, v)).count(),
         }
     }
@@ -548,6 +717,10 @@ impl App {
                 let b = self.worktrees.get(i)?.branch.as_deref()?;
                 self.pr_for_branch(b)
             }
+            Row::Draft(i) => match self.draft_pr(self.drafts.get(i)?) {
+                DraftPr::Open(p) => Some(p),
+                DraftPr::Merged(_) | DraftPr::Unknown => None,
+            },
         }
     }
 
@@ -555,6 +728,7 @@ impl App {
         match self.selected_row()? {
             Row::Wt(i) => self.worktrees.get(i),
             Row::Pr(i) => self.worktree_for(self.prs.get(i)?),
+            Row::Draft(_) => self.worktree_for(self.selected_pr()?),
         }
     }
 
@@ -641,9 +815,23 @@ impl App {
         }
     }
 
+    /// The selected row's pull request on GitHub. A draft's may have merged
+    /// since it was written.
+    fn selected_url(&self) -> Option<String> {
+        if let Some(entry) = self.selected_draft() {
+            return self.draft_pr(entry).url().map(String::from);
+        }
+        self.selected_pr().map(|p| p.url.clone())
+    }
+
     pub fn open_selected(&mut self) {
-        if let Some(url) = self.selected_pr().map(|p| p.url.clone()) {
+        if let Some(url) = self.selected_url() {
             self.open_url(&url);
+            return;
+        }
+        if let Some(entry) = self.selected_draft() {
+            let label = entry.label();
+            self.note(format!("{label} is not among the fetched pull requests"));
             return;
         }
         // A collected desk still has a story: open the PR its branch landed as.
@@ -680,7 +868,7 @@ impl App {
     }
 
     pub fn copy_url(&mut self) {
-        let Some(url) = self.selected_pr().map(|p| p.url.clone()) else {
+        let Some(url) = self.selected_url() else {
             return;
         };
         let cmd = self.settings.copy_command.clone();
@@ -753,6 +941,19 @@ fn attention_rank(p: &Pr) -> i32 {
         return 6;
     }
     5
+}
+
+/// Ordering for the "attention" sort in the Drafts view: what can be posted
+/// now, then what needs a look before it can, then what is already decided.
+const fn draft_rank(state: drafts::State) -> u8 {
+    match state {
+        drafts::State::Ready => 0,
+        drafts::State::Stale => 1,
+        drafts::State::Unverified => 2,
+        drafts::State::Invalid => 3,
+        drafts::State::Skipped => 4,
+        drafts::State::Posted => 5,
+    }
 }
 
 #[cfg(test)]

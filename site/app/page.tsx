@@ -105,7 +105,9 @@ export default function Page() {
           <h2 {...stylex.props(s.h2)}>Six views, one keystroke apart</h2>
           <p {...stylex.props(s.lede, s.tight)}>
             Number keys, Tab, or a click. The tab bar is configurable, so a repository
-            with different traffic can show a different set.
+            with different traffic can show a different set. Two more views stay off the
+            bar until you add them: Assigned, and Drafts, which lists review drafts
+            written for the repository’s pull requests.
           </p>
           <ul {...stylex.props(s.viewGrid)}>
             {VIEWS.map(([name, desc]) => (

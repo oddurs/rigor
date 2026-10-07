@@ -169,6 +169,7 @@ fn pr(
         updated_at: updated,
         author: author.into(),
         head_ref: head.into(),
+        head_oid: crate::drafts::tests::HEAD.into(),
         base_ref: "main".into(),
         additions: 220,
         deletions: 24,
@@ -280,7 +281,9 @@ fn attention_sort_puts_mergeable_first() {
         .iter()
         .map(|r| match r {
             crate::app::Row::Pr(i) => a.prs[*i].number,
-            crate::app::Row::Wt(_) => unreachable!("only pull requests in this view"),
+            crate::app::Row::Wt(_) | crate::app::Row::Draft(_) => {
+                unreachable!("only pull requests in this view")
+            }
         })
         .collect();
     // approved + green, then the failing one, then the conflicting draft
@@ -405,7 +408,9 @@ fn removable_worktrees_need_a_clean_desk() {
 fn pr_num(a: &App, r: &crate::app::Row) -> u64 {
     match r {
         crate::app::Row::Pr(i) => a.prs[*i].number,
-        crate::app::Row::Wt(_) => unreachable!("only pull requests in this view"),
+        crate::app::Row::Wt(_) | crate::app::Row::Draft(_) => {
+            unreachable!("only pull requests in this view")
+        }
     }
 }
 
@@ -1171,4 +1176,560 @@ fn a_failed_copy_does_not_claim_success() {
     a.copy_url();
     let note = a.notice.clone().unwrap().0;
     assert!(note.starts_with("copied "), "{note}");
+}
+
+// ----------------------------------------------------------------- drafts
+
+fn draft_json(number: u64, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    let mut v = crate::drafts::tests::sample();
+    v["number"] = number.into();
+    edit(&mut v);
+    serde_json::to_string_pretty(&v).unwrap()
+}
+
+/// `sample_app` on the Drafts view, with a drafts directory holding one draft
+/// in every state the view can show. The directory lives as long as the
+/// returned guard.
+fn drafts_app() -> (App, tempfile::TempDir) {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("acme").join("widget");
+    std::fs::create_dir_all(&repo).unwrap();
+    let put = |number: u64, text: String| {
+        std::fs::write(repo.join(format!("{number}.json")), text).unwrap();
+    };
+
+    // Ready: a bare approval of the commit the PR is at.
+    put(
+        4846,
+        draft_json(4846, |v| {
+            v["body"] = json!("");
+            v["comments"] = json!([]);
+            v["note"] = json!("");
+            v["picked"] = json!("Small, green and waiting on one review.");
+        }),
+    );
+    // Ready, and saying more than a verdict.
+    put(
+        4840,
+        draft_json(4840, |v| {
+            v["verdict"] = json!("comment");
+            v["body"] =
+                json!("Reads well overall.\n\nOne question on the cap before this goes in.");
+            v["comments"] = json!([
+                { "path": "src/retry.rs", "line": 84, "side": "RIGHT",
+                  "body": "Should this cap at the caller's deadline?" },
+                { "path": "src/retry.rs", "line": 120, "side": "RIGHT",
+                  "body": "A test for the zero-budget case would pin this." }
+            ]);
+            v["note"] = json!("Second look at the backoff math if there is time.");
+            v["picked"] = json!("Touches the read path; small and self-contained.");
+        }),
+    );
+    put(
+        4801,
+        draft_json(4801, |v| {
+            v["status"] = json!("posted");
+            // Half an hour after it was written, half an hour before now.
+            v["posted_at"] = json!("2027-01-15T07:30:00Z");
+        }),
+    );
+    put(4701, draft_json(4701, |v| v["status"] = json!("skipped")));
+    // Merged at another commit than the draft was written against: stale.
+    put(4700, draft_json(4700, |_| {}));
+    // Not among the fetched pull requests: unverified.
+    put(4990, draft_json(4990, |_| {}));
+    put(4980, "{ \"version\": 1,".into());
+
+    let mut a = sample_app();
+    a.settings.views.push(View::Drafts);
+    a.drafts_dir = Some(dir.path().to_path_buf());
+    a.reload_drafts();
+    a.set_view(View::Drafts);
+    (a, dir)
+}
+
+fn draft_numbers(a: &App) -> Vec<u64> {
+    a.rows
+        .iter()
+        .map(|r| match r {
+            crate::app::Row::Draft(i) => a.drafts[*i].number.unwrap(),
+            crate::app::Row::Pr(_) | crate::app::Row::Wt(_) => {
+                unreachable!("only drafts in this view")
+            }
+        })
+        .collect()
+}
+
+fn select_draft(a: &mut App, number: u64) {
+    let at = draft_numbers(a).iter().position(|n| *n == number).unwrap();
+    a.select(at);
+}
+
+/// The list's own columns of the row for `number`: side by side, the detail
+/// pane shares its screen line.
+fn draft_row(a: &mut App, number: u64) -> String {
+    let out = render(a, 160, 24);
+    let list_width = usize::from(a.hits.list.width);
+    out.lines()
+        .map(|l| l.chars().take(list_width).collect::<String>())
+        .find(|l| l.contains(&format!("#{number} ")))
+        .unwrap_or_else(|| panic!("no row for #{number}:\n{out}"))
+}
+
+/// The state column is what the view is for: what posting would send, or the
+/// one word for why nothing can be.
+#[test]
+fn each_draft_shows_what_it_would_send_or_why_it_cannot() {
+    let (mut a, _dir) = drafts_app();
+    for (number, state) in [
+        (4846, " approve "),
+        (4840, " comment +2 "),
+        (4801, " ✓ posted "),
+        (4701, " skipped "),
+        (4700, " stale "),
+        (4990, " unverified "),
+        (4980, " invalid "),
+    ] {
+        let row = draft_row(&mut a, number);
+        assert!(row.contains(state), "#{number}: {row:?}");
+    }
+    assert_eq!(a.count_for(View::Drafts), a.rows.len());
+
+    // Title, size and age are the pull request's own.
+    let row = draft_row(&mut a, 4846);
+    assert!(
+        row.contains("Give the read path a retry budget")
+            && row.contains("+220 −24")
+            && row.trim_end().ends_with("3m"),
+        "{row:?}"
+    );
+    // A merged PR has a title and an age; one never fetched has neither.
+    let row = draft_row(&mut a, 4700);
+    assert!(
+        row.contains("merged · Drop the monospace count chips") && row.trim_end().ends_with("4d"),
+        "{row:?}"
+    );
+    let row = draft_row(&mut a, 4990);
+    assert!(
+        row.contains("not among the fetched pull requests"),
+        "{row:?}"
+    );
+}
+
+/// A draft carrying inline comments stands out; one already decided recedes.
+#[test]
+fn drafts_with_comments_stand_out_and_decided_ones_recede() {
+    let (mut a, _dir) = drafts_app();
+    // Keep the selection, which lifts every dim column, off the rows read.
+    select_draft(&mut a, 4990);
+    let buf = frame(&mut a, 160, 24);
+    let y_of = |n: u64| {
+        (0..24)
+            .find(|y| row_text(&buf, *y).contains(&format!("#{n} ")))
+            .unwrap()
+    };
+    // Column 1 is the number, column 8 the state.
+    let fg = |n: u64, x: u16| buf[(x, y_of(n))].fg;
+    assert_eq!(fg(4840, 8), a.theme.pending, "comments take the busy color");
+    assert_eq!(fg(4846, 8), a.theme.success, "a bare approval");
+    assert_eq!(fg(4700, 8), a.theme.warn, "stale");
+    assert_eq!(fg(4980, 8), a.theme.failure, "invalid");
+    for decided in [4801, 4701] {
+        assert_eq!(fg(decided, 1), a.theme.muted, "#{decided} number");
+        assert_eq!(fg(decided, 8), a.theme.muted, "#{decided} state");
+    }
+    assert_eq!(
+        fg(4846, 1),
+        a.theme.accent,
+        "an undecided number stays bright"
+    );
+}
+
+/// The detail pane is where a draft is read before it is sent: everything it
+/// says, the note unmistakably private, and whether it still matches the PR.
+#[test]
+fn the_draft_detail_shows_the_whole_draft() {
+    let (mut a, _dir) = drafts_app();
+    select_draft(&mut a, 4840);
+    let out = render(&mut a, 160, 30);
+    for needle in [
+        "#4840 Move the palette onto color tokens",
+        "picked    Touches the read path; small and self-contained.",
+        "verdict   comment",
+        "body      Reads well overall.",
+        "One question on the cap before this goes in.",
+        "comment   src/retry.rs:84",
+        "Should this cap at the caller's deadline?",
+        "comment   src/retry.rs:120",
+        "note      private · never posted",
+        "Second look at the backoff math if there is time.",
+        "head      1a2b3c4  matches the pull request",
+    ] {
+        assert!(out.contains(needle), "missing {needle:?}:\n{out}");
+    }
+
+    // An approval with no words says so rather than leaving a gap.
+    select_draft(&mut a, 4846);
+    let out = render(&mut a, 160, 30);
+    assert!(
+        out.contains("body      none") && out.contains("note      none"),
+        "{out}"
+    );
+
+    select_draft(&mut a, 4801);
+    let out = render(&mut a, 160, 30);
+    assert!(out.contains("verdict   approve  · posted 30m ago"), "{out}");
+}
+
+/// The rows that cannot be posted say why, in the detail pane.
+#[test]
+fn the_draft_detail_explains_stale_unverified_and_invalid() {
+    let (mut a, _dir) = drafts_app();
+
+    select_draft(&mut a, 4700);
+    let out = render(&mut a, 160, 30);
+    assert!(
+        out.contains("head      1a2b3c4  the pull request is now at 0f1e2d3"),
+        "{out}"
+    );
+    assert!(out.contains("merged 4d ago"), "{out}");
+
+    select_draft(&mut a, 4990);
+    let out = render(&mut a, 160, 30);
+    assert!(
+        out.contains("head      1a2b3c4  the pull request's head is not known"),
+        "{out}"
+    );
+
+    select_draft(&mut a, 4980);
+    let out = render(&mut a, 160, 30);
+    assert!(out.contains("invalid   not valid JSON"), "{out}");
+    assert!(out.contains("4980.json"), "the file to fix: {out}");
+    assert!(
+        !out.contains("verdict"),
+        "an unread draft has no verdict:\n{out}"
+    );
+}
+
+/// Drafts order like every other view: newest pull request first, or by what
+/// can be acted on. One whose pull request was never fetched goes last.
+#[test]
+fn drafts_sort_by_recency_or_by_what_can_be_posted() {
+    let (mut a, _dir) = drafts_app();
+    assert_eq!(
+        draft_numbers(&a),
+        [4846, 4840, 4801, 4700, 4701, 4980, 4990]
+    );
+    press(&mut a, "s");
+    assert_eq!(
+        draft_numbers(&a),
+        [4846, 4840, 4700, 4990, 4980, 4701, 4801],
+        "ready, stale, unverified, invalid, skipped, posted"
+    );
+    press(&mut a, "s/palette\n");
+    assert_eq!(draft_numbers(&a), [4840], "the filter reads the PR's title");
+}
+
+/// The keys that act on a pull request act on a draft's pull request.
+#[test]
+fn open_on_a_draft_opens_its_pull_request() {
+    let (mut a, _dir) = drafts_app();
+    a.settings.open_command = "true".into();
+    let mut opened = |number: u64| {
+        select_draft(&mut a, number);
+        press(&mut a, "o");
+        a.notice.clone().unwrap().0
+    };
+    assert_eq!(
+        opened(4846),
+        "opened https://github.com/acme/widget/pull/4846"
+    );
+    assert_eq!(
+        opened(4700),
+        "opened https://github.com/acme/widget/pull/4700",
+        "a merged pull request still has a page"
+    );
+    assert_eq!(
+        opened(4990),
+        "#4990 is not among the fetched pull requests",
+        "an address is never made up"
+    );
+}
+
+/// Drafts are opt-in, like Assigned: without the view on the bar and without
+/// any drafts, nothing on the screen mentions them.
+#[test]
+fn drafts_stay_off_the_screen_until_asked_for() {
+    assert!(!Settings::default().views.contains(&View::Drafts));
+    assert_eq!(View::parse("drafts"), Some(View::Drafts));
+
+    let mut a = sample_app();
+    let out = render(&mut a, 160, 24);
+    assert!(!out.contains("Drafts") && !out.contains("drafted"), "{out}");
+
+    // With drafts waiting, every view says so, even with the tab off the bar.
+    let (mut a, _dir) = drafts_app();
+    a.settings.views.retain(|v| *v != View::Drafts);
+    a.set_view(View::All);
+    let subnav = row_text(&frame(&mut a, 160, 24), 1);
+    assert!(subnav.contains("✎ 4 drafted"), "{subnav:?}");
+    assert!(!subnav.contains("Drafts"), "{subnav:?}");
+
+    // On a bar too tight for it the count goes first, and takes nothing else
+    // with it.
+    a.settings.views.push(View::Drafts);
+    let subnav = row_text(&frame(&mut a, 110, 24), 1);
+    assert!(
+        subnav.contains("Drafts 7") && subnav.contains("↕ recent") && !subnav.contains("drafted"),
+        "{subnav:?}"
+    );
+}
+
+/// A drafts directory is read as it is on each refresh: a draft written
+/// while rigor runs shows up, and one removed goes away.
+#[test]
+fn drafts_are_reread_on_refresh() {
+    let (mut a, dir) = drafts_app();
+    let repo = dir.path().join("acme").join("widget");
+    std::fs::remove_file(repo.join("4990.json")).unwrap();
+    std::fs::write(repo.join("4801.json"), "nonsense").unwrap();
+    a.reload_drafts();
+    assert_eq!(a.rows.len(), 6);
+    assert!(draft_row(&mut a, 4801).contains(" invalid "));
+}
+
+/// A fresh app on the Drafts view of an empty drafts directory, and a way to
+/// drop a valid draft into it. None of these pull requests were fetched, so
+/// the rows keep the order of their numbers.
+fn bare_drafts() -> (App, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("acme").join("widget")).unwrap();
+    let mut a = sample_app();
+    a.settings.views.push(View::Drafts);
+    a.drafts_dir = Some(dir.path().to_path_buf());
+    a.set_view(View::Drafts);
+    (a, dir)
+}
+
+fn put_draft(dir: &tempfile::TempDir, number: u64) {
+    let path = dir.path().join(format!("acme/widget/{number}.json"));
+    std::fs::write(path, draft_json(number, |_| {})).unwrap();
+}
+
+fn cursor(a: &App) -> Option<u64> {
+    a.selected_draft().and_then(|e| e.number)
+}
+
+/// The cursor is on a draft, not on a position. Drafts arrive while rigor is
+/// open; if one sorting earlier could slide the highlight onto its neighbor,
+/// the next keypress would be about a draft nobody chose.
+#[test]
+fn the_cursor_stays_on_its_draft_when_the_list_changes_underneath() {
+    // Whether or not the cursor was ever moved by hand.
+    for touched in [false, true] {
+        let (mut a, dir) = bare_drafts();
+        put_draft(&dir, 100);
+        put_draft(&dir, 105);
+        a.reload_drafts();
+        assert_eq!(draft_numbers(&a), [100, 105]);
+        if touched {
+            a.select(0);
+        }
+        assert_eq!(cursor(&a), Some(100));
+        a.detail_scroll = 3;
+
+        put_draft(&dir, 90);
+        a.reload_drafts();
+        assert_eq!(draft_numbers(&a), [90, 100, 105]);
+        assert_eq!(cursor(&a), Some(100), "touched={touched}: the cursor slid");
+        assert_eq!(a.detail_scroll, 3, "and its detail pane kept its place");
+
+        // One going away above it moves the row, not the choice.
+        std::fs::remove_file(dir.path().join("acme/widget/90.json")).unwrap();
+        a.reload_drafts();
+        assert_eq!(cursor(&a), Some(100));
+
+        // Its own file going away leaves the cursor where it was in the list,
+        // on whatever is nearest, and at the top of that draft.
+        put_draft(&dir, 90);
+        a.reload_drafts();
+        std::fs::remove_file(dir.path().join("acme/widget/100.json")).unwrap();
+        a.reload_drafts();
+        assert_eq!(draft_numbers(&a), [90, 105]);
+        assert_eq!(cursor(&a), Some(105), "the nearest row, not the first");
+        assert_eq!(a.detail_scroll, 0);
+    }
+}
+
+/// A pull request number of any length is shown whole, and the columns
+/// beside it still line up.
+#[test]
+fn long_pull_request_numbers_are_not_cut_in_the_drafts_list() {
+    let (mut a, dir) = bare_drafts();
+    for number in [7, 123_456, 1_234_567] {
+        put_draft(&dir, number);
+    }
+    a.reload_drafts();
+    let screen = render(&mut a, 160, 24);
+    let row = |number: u64| {
+        screen
+            .lines()
+            .find(|l| l.contains(&format!("#{number} ")))
+            .unwrap_or_else(|| panic!("#{number} is cut or missing:\n{screen}"))
+            .to_string()
+    };
+    // In columns, not bytes: the selected row starts with a wider character.
+    let column = |number: u64| {
+        let row = row(number);
+        row.split("unverified").next().unwrap().chars().count()
+    };
+    assert!(row(1_234_567).contains("#1234567 unverified"), "{screen}");
+    assert_eq!(column(7), column(123_456), "{screen}");
+    assert_eq!(column(7), column(1_234_567), "{screen}");
+    assert!(!screen.contains("#12345…") && !screen.contains("#1234…"));
+}
+
+/// A fetch re-sorts the list by how recently each pull request moved. The
+/// cursor goes with its draft there too.
+#[test]
+fn the_cursor_stays_on_its_draft_when_a_fetch_reorders_the_list() {
+    let (mut a, dir) = bare_drafts();
+    put_draft(&dir, 100);
+    put_draft(&dir, 105);
+    a.reload_drafts();
+    assert_eq!(cursor(&a), Some(100));
+
+    // #105 turns out to be an open pull request; #100 is still unknown, and
+    // sorts after it.
+    let mut seen = a.prs[0].clone();
+    seen.number = 105;
+    a.on_msg(crate::app::Msg::Prs(Ok(crate::github::Fetched {
+        budget: None,
+        viewer: "octocat".into(),
+        default_branch: "main".into(),
+        prs: vec![seen],
+        merged: vec![],
+    })));
+    assert_eq!(draft_numbers(&a), [105, 100]);
+    assert_eq!(cursor(&a), Some(100));
+}
+
+/// A draft longer than the pane says there is more of it, and a refresh in
+/// the background does not throw the reader back to its top.
+#[test]
+fn a_long_draft_says_there_is_more_below_and_keeps_its_place() {
+    let (mut a, dir) = drafts_app();
+    let long = draft_json(4846, |v| {
+        v["body"] = (1..=40)
+            .map(|i| format!("Paragraph {i} of the review."))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
+    });
+    std::fs::write(dir.path().join("acme/widget/4846.json"), long).unwrap();
+    a.reload_drafts();
+    select_draft(&mut a, 4846);
+
+    let out = render(&mut a, 160, 24);
+    assert!(out.contains("↓ more below · J"), "{out}");
+    assert!(!out.contains("Paragraph 40"), "{out}");
+
+    press(&mut a, "JJJJJ");
+    a.reload_drafts();
+    a.on_msg(crate::app::Msg::Worktrees(Ok(a.worktrees.clone())));
+    assert_eq!(a.detail_scroll, 5, "a background refresh scrolled it back");
+
+    // At the end there is no more, and the pane stops saying so.
+    a.detail_scroll = u16::MAX;
+    let out = render(&mut a, 160, 24);
+    assert!(
+        out.contains("Paragraph 40") && !out.contains("more below"),
+        "{out}"
+    );
+
+    // A short draft never says it.
+    select_draft(&mut a, 4701);
+    assert!(!render(&mut a, 160, 24).contains("more below"));
+}
+
+/// Nothing overflows the frame, at any width, with every state on screen.
+#[test]
+fn drafts_render_at_every_width() {
+    let (mut a, _dir) = drafts_app();
+    for number in [4840, 4980] {
+        select_draft(&mut a, number);
+        for (w, h) in [
+            (200u16, 40u16),
+            (140, 30),
+            (110, 24),
+            (80, 20),
+            (52, 12),
+            (40, 8),
+        ] {
+            let out = render(&mut a, w, h);
+            assert!(
+                out.lines().all(|l| crate::util::width(l) <= w as usize),
+                "#{number} overflowed at {w}x{h}:\n{out}"
+            );
+        }
+    }
+}
+
+#[test]
+fn drafts_snapshots() {
+    let (mut a, _dir) = drafts_app();
+    select_draft(&mut a, 4840);
+    insta::assert_snapshot!("drafts_split_160x24", render(&mut a, 160, 24));
+
+    a.settings.layout = LayoutMode::Stack;
+    select_draft(&mut a, 4846);
+    insta::assert_snapshot!("drafts_stacked_100x24", render(&mut a, 100, 24));
+    a.settings.layout = LayoutMode::Auto;
+
+    insta::assert_snapshot!("drafts_narrow_60x16", render(&mut a, 60, 16));
+}
+
+proptest::proptest! {
+    /// A draft is a file some other program wrote. Its text is drawn into the
+    /// terminal like a title from the API, and gets the same guarantee.
+    #[test]
+    fn a_drafts_text_never_reaches_the_terminal_as_control_characters(
+        payload in proptest::string::string_regex(
+            "[a-z ]{0,6}(\\x1b\\[31m|\\x1b\\]8;;https://evil\\x07|\\x07|\\x08|\\r|\\x9b2J|\\u{202e}|\\u{2067}|\\x00)[a-z ]{0,6}"
+        ).unwrap()
+    ) {
+        let (mut a, dir) = drafts_app();
+        let text = draft_json(4846, |v| {
+            v["body"] = format!("BODYTEXT{payload}").into();
+            v["note"] = format!("NOTETEXT{payload}").into();
+            v["picked"] = format!("PICKEDTEXT{payload}").into();
+            v["comments"][0]["path"] = format!("PATHTEXT{payload}").into();
+            v["comments"][0]["body"] = format!("COMMENTTEXT{payload}").into();
+        });
+        std::fs::write(dir.path().join("acme/widget/4846.json"), text).unwrap();
+        a.reload_drafts();
+        select_draft(&mut a, 4846);
+        // The draft was drawn at all: without this, a pane that drew nothing
+        // would pass for one that drew nothing dangerous.
+        let drawn = render(&mut a, 160, 30);
+        for printable in ["BODYTEXT", "NOTETEXT", "PICKEDTEXT", "PATHTEXT", "COMMENTTEXT"] {
+            proptest::prop_assert!(drawn.contains(printable), "{} was not drawn:\n{}", printable, drawn);
+        }
+        let buf = frame(&mut a, 160, 30);
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let sym = buf[(x, y)].symbol();
+                let dangerous = |c: char| {
+                    c.is_control()
+                        || ('\u{202a}'..='\u{202e}').contains(&c)
+                        || ('\u{2066}'..='\u{2069}').contains(&c)
+                };
+                proptest::prop_assert!(
+                    !sym.chars().any(dangerous),
+                    "dangerous character {:?} at ({x},{y}) from payload {:?}", sym, payload
+                );
+            }
+        }
+    }
 }
