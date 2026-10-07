@@ -25,13 +25,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of any length is shown whole.
 - A review draft can be posted from the `Drafts` view: the one thing rigor
   sends to GitHub, and only on a confirmed keypress. The first `a` asks, naming
-  what would be sent; a second `a` on the same row sends it, and any other key,
-  a click, or a refresh that changes the row withdraws the question. A draft is
-  posted only while the pull request is still at the commit it was written
-  against, and its private `note` and `picked` are never sent. On success the
-  file is marked `posted`, replaced in one step; if `gh` fails it is left
-  untouched. `e` opens the draft in `$VISUAL` or `$EDITOR` and reads it again
-  afterwards; `x` skips a draft or brings it back.
+  what would be sent; a second `a` on the same row goes ahead, and any other
+  key, a click, or a refresh that changes the row withdraws the question.
+  Going ahead reads the pull request and its reviews from GitHub first, and
+  sends nothing if either read fails. A pull request closed without merging,
+  or one that has moved on from the commit the draft was written against, is
+  refused, and the row turns `stale`. If the same review from you is already
+  there — a post that timed out or was cut off by quitting still landed — the
+  draft is marked `posted` and nothing is sent twice; if you have reviewed
+  differently since the draft was written, it is not sent on top. An
+  `unverified` draft can be posted, since the read does the checking the list
+  could not. The private `note` and `picked` are never sent. On success the
+  file is marked `posted`, replaced in one step; when GitHub declines the
+  review its own message is shown and the file is left untouched. `e` opens
+  the draft in `$VISUAL` or `$EDITOR` and reads it again afterwards; `x` skips
+  a draft or brings it back.
 
 - `--print-config` lists the tab bar, and spells every value the way a config
   file does, so a line can be copied into one.

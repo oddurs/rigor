@@ -36,7 +36,10 @@ const KEYS = [
   ['y', 'copy the pull request URL'],
   ['/', 'filter by title, branch, author or label'],
   ['s', 'sort by recency or by merge-readiness'],
-  ['d', 'show or hide drafts'],
+  ['d', 'show or hide draft pull requests'],
+  ['a', 'in Drafts: post the review — asks first, then checks GitHub'],
+  ['e', 'in Drafts: edit the draft in your editor'],
+  ['x', 'in Drafts: skip the draft, or bring it back'],
   ['r', 'refresh now'],
   ['?', 'every key, including the mouse bindings'],
 ];
@@ -125,8 +128,9 @@ export default function Page() {
           <h3 {...stylex.props(s.h4)}>Install</h3>
           <p {...stylex.props(s.body)}>
             rigor reads everything through the <Mono>gh</Mono> CLI, so it uses your
-            existing authentication and never asks for a token. You need <Mono>gh</Mono>{' '}
-            authenticated and a Rust toolchain.
+            existing authentication and never asks for a token. The one thing it ever
+            sends to GitHub is a review draft you chose to post, on a confirmed keypress.
+            You need <Mono>gh</Mono> authenticated and a Rust toolchain.
           </p>
           <Code>{`cargo install --git https://github.com/oddurs/rigor`}</Code>
 

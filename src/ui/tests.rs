@@ -1755,42 +1755,146 @@ proptest::proptest! {
 
 // ---------------------------------------------------------------- posting
 
-type Sent = std::sync::Arc<std::sync::Mutex<Vec<(String, u64, String)>>>;
+use crate::drafts::{Live, Remote, Review};
+use std::sync::{Arc, Mutex};
 
-/// The drafts fixture with a poster that records what it is handed instead of
-/// sending it anywhere, and answers with `outcome`. Nothing in these tests can
-/// reach `gh`: an `App` only posts through the poster it is given.
+/// The commit a pull request has moved on to, in the tests where it has.
+const MOVED: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432";
+
+/// GitHub, for these tests: it answers from what it has been told, records
+/// every call in the order it came, and reaches nothing. An `App` only talks
+/// to GitHub through the remote it is given, so no test here can run `gh`.
+struct FakeGitHub {
+    calls: Mutex<Vec<String>>,
+    /// Pull requests with something other than the default to say about
+    /// themselves. The default is open, at the commit the drafts were
+    /// written against.
+    pulls: Mutex<std::collections::HashMap<u64, Result<Live, String>>>,
+    reviews: Mutex<Result<Vec<Review>, String>>,
+    post: Mutex<Result<(), String>>,
+    /// Run when a post arrives, before it is answered.
+    on_post: Mutex<Option<OnPost>>,
+}
+
+type OnPost = Box<dyn Fn(&FakeGitHub) + Send>;
+
+impl FakeGitHub {
+    fn pull_is(&self, number: u64, live: Result<Live, String>) {
+        self.pulls.lock().unwrap().insert(number, live);
+    }
+
+    fn reviews_are(&self, reviews: Result<Vec<Review>, String>) {
+        *self.reviews.lock().unwrap() = reviews;
+    }
+
+    fn post_answers(&self, answer: Result<(), String>) {
+        *self.post.lock().unwrap() = answer;
+    }
+
+    fn on_post(&self, f: impl Fn(&Self) + Send + 'static) {
+        *self.on_post.lock().unwrap() = Some(Box::new(f));
+    }
+}
+
+impl Remote for FakeGitHub {
+    fn pull(&self, number: u64) -> Result<Live, String> {
+        self.calls.lock().unwrap().push(format!("pull {number}"));
+        self.pulls
+            .lock()
+            .unwrap()
+            .get(&number)
+            .cloned()
+            .unwrap_or_else(|| Ok(live(true, false, crate::drafts::tests::HEAD)))
+    }
+
+    fn reviews(&self, number: u64) -> Result<Vec<Review>, String> {
+        self.calls.lock().unwrap().push(format!("reviews {number}"));
+        self.reviews.lock().unwrap().clone()
+    }
+
+    fn post(&self, number: u64, body: &str) -> Result<(), String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("post {number} {body}"));
+        if let Some(f) = self.on_post.lock().unwrap().as_ref() {
+            f(self);
+        }
+        self.post.lock().unwrap().clone()
+    }
+}
+
+fn live(open: bool, merged: bool, head: &str) -> Live {
+    Live {
+        open,
+        merged,
+        head: head.into(),
+    }
+}
+
+/// A review by the viewer, half an hour after the fixture's drafts were
+/// written, on the commit they were written against.
+fn review_by_viewer(state: &str, body: &str) -> Review {
+    Review {
+        author: "octocat".into(),
+        state: state.into(),
+        commit: crate::drafts::tests::HEAD.into(),
+        body: body.into(),
+        submitted_at: Some("2027-01-15T09:30:00Z".into()),
+    }
+}
+
+/// The body of the fixture's draft for #4840, as it would be sent.
+const BODY_4840: &str = "Reads well overall.\n\nOne question on the cap before this goes in.";
+
+/// The drafts fixture wired to `FakeGitHub`.
 struct Outbox {
     a: App,
-    sent: Sent,
+    gh: Arc<FakeGitHub>,
     replies: std::sync::mpsc::Receiver<crate::app::Msg>,
     dir: tempfile::TempDir,
 }
 
 impl Outbox {
-    fn new(outcome: Result<(), String>) -> Self {
+    fn new() -> Self {
         let (mut a, replies, dir) = drafts_app_and_replies();
-        let sent = Sent::default();
-        let log = std::sync::Arc::clone(&sent);
-        a.poster = std::sync::Arc::new(move |owner, name, number, body| {
-            log.lock()
-                .unwrap()
-                .push((format!("{owner}/{name}"), number, body.to_string()));
-            outcome.clone()
+        let gh = Arc::new(FakeGitHub {
+            calls: Mutex::default(),
+            pulls: Mutex::default(),
+            reviews: Mutex::new(Ok(Vec::new())),
+            post: Mutex::new(Ok(())),
+            on_post: Mutex::new(None),
         });
+        a.remote = Arc::clone(&gh) as Arc<dyn Remote>;
         Self {
             a,
-            sent,
+            gh,
             replies,
             dir,
         }
     }
 
-    fn sent(&self) -> Vec<(String, u64, String)> {
-        self.sent.lock().unwrap().clone()
+    /// Every call GitHub was asked to take, in order.
+    fn calls(&self) -> Vec<String> {
+        self.gh.calls.lock().unwrap().clone()
     }
 
-    /// Let the post in flight report back, as the event loop would.
+    /// How many of those were writes.
+    fn posts(&self) -> usize {
+        self.calls()
+            .iter()
+            .filter(|c| c.starts_with("post "))
+            .count()
+    }
+
+    /// `a`, `a`, and the answer, as the event loop would deliver it.
+    fn confirm(&mut self, number: u64) {
+        select_draft(&mut self.a, number);
+        press(&mut self.a, "aa");
+        self.settle();
+    }
+
+    /// Let the attempt in flight report back.
     fn settle(&mut self) {
         let reply = self
             .replies
@@ -1814,21 +1918,27 @@ impl Outbox {
     fn json(&self, number: u64) -> serde_json::Value {
         serde_json::from_str(&self.file(number)).unwrap()
     }
+
+    fn failure(&self) -> String {
+        self.a.post_error.clone().expect("no failure was reported")
+    }
 }
 
 /// Posting is public and under the user's name. One `a` only asks, naming
-/// exactly what would be sent; a second `a` on the same row sends it once, and
-/// only then is the file marked posted.
+/// exactly what would be sent. A second `a` on the same row asks GitHub where
+/// the pull request is and what has been said on it, then sends the review
+/// once, and only then is the file marked posted.
 #[test]
-fn one_a_asks_and_a_second_a_posts_exactly_the_review() {
-    let mut o = Outbox::new(Ok(()));
+fn one_a_asks_and_a_second_a_checks_then_posts_exactly_the_review() {
+    let mut o = Outbox::new();
     select_draft(&mut o.a, 4840);
     let before = o.json(4840);
 
     press(&mut o.a, "a");
     assert!(
-        o.a.posting.is_none() && o.sent().is_empty(),
-        "one a sent it"
+        o.a.posting.is_none() && o.calls().is_empty(),
+        "one a reached GitHub: {:?}",
+        o.calls()
     );
     let prompt = footer(&frame(&mut o.a, 160, 24));
     assert!(
@@ -1847,17 +1957,18 @@ fn one_a_asks_and_a_second_a_posts_exactly_the_review() {
     o.settle();
 
     let head = crate::drafts::tests::HEAD;
-    assert_eq!(
-        o.sent(),
-        [(
-            "acme/widget".to_string(),
-            4840,
-            format!(
-                r#"{{"commit_id":"{head}","event":"COMMENT","body":"Reads well overall.\n\nOne question on the cap before this goes in.","comments":[{{"path":"src/retry.rs","line":84,"side":"RIGHT","body":"Should this cap at the caller's deadline?"}},{{"path":"src/retry.rs","line":120,"side":"RIGHT","body":"A test for the zero-budget case would pin this."}}]}}"#
-            )
-        )]
+    let body = format!(
+        r#"{{"commit_id":"{head}","event":"COMMENT","body":"Reads well overall.\n\nOne question on the cap before this goes in.","comments":[{{"path":"src/retry.rs","line":84,"side":"RIGHT","body":"Should this cap at the caller's deadline?"}},{{"path":"src/retry.rs","line":120,"side":"RIGHT","body":"A test for the zero-budget case would pin this."}}]}}"#
     );
-    let body = &o.sent()[0].2;
+    assert_eq!(
+        o.calls(),
+        [
+            "pull 4840".to_string(),
+            "reviews 4840".to_string(),
+            format!("post 4840 {body}")
+        ],
+        "two reads, then exactly one write"
+    );
     assert!(
         !body.contains("backoff math") && !body.contains("self-contained"),
         "note or picked left the machine: {body}"
@@ -1876,7 +1987,7 @@ fn one_a_asks_and_a_second_a_posts_exactly_the_review() {
 /// still be seen: a prompt nobody can read is a stray keypress from posting.
 #[test]
 fn the_prompt_outranks_a_sync_error() {
-    let mut o = Outbox::new(Ok(()));
+    let mut o = Outbox::new();
     o.a.error = Some("gh api graphql: timed out after 45s".into());
     select_draft(&mut o.a, 4846);
     press(&mut o.a, "a");
@@ -1892,7 +2003,7 @@ fn the_prompt_outranks_a_sync_error() {
 #[test]
 fn anything_but_a_second_a_withdraws_the_prompt() {
     use ratatui::crossterm::event::{MouseButton, MouseEventKind};
-    let mut o = Outbox::new(Ok(()));
+    let mut o = Outbox::new();
     select_draft(&mut o.a, 4840);
     render(&mut o.a, 160, 24);
     let (row_y, _) = o.a.hits.rows[o.a.selected];
@@ -1927,14 +2038,14 @@ fn anything_but_a_second_a_withdraws_the_prompt() {
         "moving the pointer withdrew the prompt"
     );
 
-    assert!(o.sent().is_empty(), "{:?}", o.sent());
+    assert!(o.calls().is_empty(), "{:?}", o.calls());
 }
 
 /// Esc answers the prompt and nothing more: it must not also clear a filter
 /// the user had narrowed the list with.
 #[test]
 fn esc_cancels_the_prompt_without_clearing_the_filter() {
-    let mut o = Outbox::new(Ok(()));
+    let mut o = Outbox::new();
     press(&mut o.a, "/palette\na\x1b");
     assert!(o.a.armed.is_none());
     assert_eq!(o.a.filter, "palette");
@@ -1945,7 +2056,7 @@ fn esc_cancels_the_prompt_without_clearing_the_filter() {
 /// prompt did not say.
 #[test]
 fn a_refresh_that_changes_the_row_withdraws_the_prompt() {
-    let mut o = Outbox::new(Ok(()));
+    let mut o = Outbox::new();
     select_draft(&mut o.a, 4840);
 
     press(&mut o.a, "a");
@@ -1975,34 +2086,33 @@ fn a_refresh_that_changes_the_row_withdraws_the_prompt() {
     assert!(o.a.armed.is_none(), "the prompt outlived its draft");
 
     press(&mut o.a, "a");
-    assert!(o.sent().is_empty() && o.a.posting.is_none());
+    assert!(o.calls().is_empty() && o.a.posting.is_none());
 }
 
 /// Between the prompt and the second `a` the file can change without a
 /// refresh having noticed. What would go out is then not what was confirmed.
 #[test]
 fn a_draft_changed_on_disk_after_the_prompt_is_not_sent() {
-    let mut o = Outbox::new(Ok(()));
+    let mut o = Outbox::new();
     select_draft(&mut o.a, 4840);
     press(&mut o.a, "a");
     let text = draft_json(4840, |v| v["verdict"] = "comment".into());
     std::fs::write(o.path(4840), &text).unwrap();
     press(&mut o.a, "a");
-    assert!(o.a.posting.is_none() && o.sent().is_empty());
+    assert!(o.a.posting.is_none() && o.calls().is_empty());
     let note = o.a.notice.clone().unwrap().0;
     assert!(note.contains("#4840 changed on disk"), "{note}");
     assert_eq!(o.file(4840), text, "and the file is left alone");
 }
 
-/// Every draft that must not be posted: `a`, twice, sends nothing and says
-/// why. Stale and unverified are the ones that matter most — a review is only
-/// ever offered for the exact commit it was written against.
+/// The drafts that never arm: `a`, twice, does not so much as ask GitHub, and
+/// says why. Stale is the one that matters most — a review is only ever
+/// offered for the exact commit it was written against.
 #[test]
 fn a_draft_that_must_not_be_posted_only_explains_itself() {
-    let mut o = Outbox::new(Ok(()));
+    let mut o = Outbox::new();
     for (number, why) in [
         (4700, "#4700 is stale"),
-        (4990, "#4990 is unverified"),
         (4980, "#4980 is invalid"),
         (4701, "#4701 is skipped"),
         (4801, "#4801 is already posted"),
@@ -2016,39 +2126,44 @@ fn a_draft_that_must_not_be_posted_only_explains_itself() {
         assert!(note.starts_with(why), "#{number}: {note}");
         assert_eq!(o.file(number), before, "#{number} was rewritten");
     }
-    assert!(o.sent().is_empty(), "{:?}", o.sent());
+    assert!(o.calls().is_empty(), "{:?}", o.calls());
 }
 
 /// A pull request that moved on after its draft was loaded is stale from the
 /// next fetch, without the file changing at all.
 #[test]
 fn a_ready_draft_goes_stale_when_the_pull_request_moves() {
-    let mut o = Outbox::new(Ok(()));
+    let mut o = Outbox::new();
     let moved = o.a.prs.iter_mut().find(|p| p.number == 4846).unwrap();
     moved.head_oid = "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432".into();
     o.a.rebuild();
     select_draft(&mut o.a, 4846);
     assert!(draft_row(&mut o.a, 4846).contains(" stale "));
     press(&mut o.a, "aa");
-    assert!(o.sent().is_empty() && o.a.posting.is_none());
+    assert!(o.calls().is_empty() && o.a.posting.is_none());
 }
 
-/// When `gh` refuses, nothing went out: the file is byte for byte what it
-/// was, the row is still a draft, and the footer says what failed.
+/// When GitHub declines the review — an approval it will not take, a comment
+/// on a line that is not in the diff — nothing went out. The footer says so in
+/// GitHub's words, the file is byte for byte what it was, and the row is still
+/// a draft: fix it, and it can be sent.
 #[test]
-fn a_failed_post_leaves_the_draft_untouched() {
-    let mut o = Outbox::new(Err("gh api failed: HTTP 422".into()));
-    select_draft(&mut o.a, 4840);
+fn a_refusal_from_github_is_shown_and_the_draft_stays_postable() {
+    let mut o = Outbox::new();
+    o.gh.post_answers(Err(
+        "Validation Failed: line must be part of the diff (HTTP 422)".into(),
+    ));
     let before = o.file(4840);
-    press(&mut o.a, "aa");
-    o.settle();
+    o.confirm(4840);
 
-    assert_eq!(o.sent().len(), 1, "it was attempted once");
+    assert_eq!(o.posts(), 1, "it was attempted once");
     assert_eq!(o.file(4840), before);
     assert!(draft_row(&mut o.a, 4840).contains(" comment +2 "));
     let line = footer(&frame(&mut o.a, 160, 24));
     assert!(
-        line.contains("✗ posting to #4840 failed: gh api failed: HTTP 422"),
+        line.contains(
+            "✗ posting to #4840 failed: Validation Failed: line must be part of the diff (HTTP 422)"
+        ),
         "{line:?}"
     );
     // A sync that succeeds meanwhile must not sweep the failure away.
@@ -2056,22 +2171,27 @@ fn a_failed_post_leaves_the_draft_untouched() {
     assert!(footer(&frame(&mut o.a, 160, 24)).contains("posting to #4840 failed"));
     press(&mut o.a, "j");
     assert!(o.a.post_error.is_none(), "it stays until the next key");
+
+    // The offending comment is edited out, and the draft goes through.
+    let fixed = draft_json(4840, |v| v["comments"] = serde_json::json!([]));
+    std::fs::write(o.path(4840), fixed).unwrap();
+    o.a.reload_drafts();
+    o.gh.post_answers(Ok(()));
+    o.confirm(4840);
+    assert_eq!(o.posts(), 2);
+    assert_eq!(o.json(4840)["status"], "posted");
 }
 
-/// While a review is on its way, `a` — however often — sends nothing more.
+/// While an attempt is on its way, `a` — however often, on whatever row —
+/// starts nothing more: one at a time.
 #[test]
 fn a_post_in_flight_is_not_sent_twice() {
-    let mut o = Outbox::new(Ok(()));
-    // A poster that holds each call until the test lets it go.
+    let mut o = Outbox::new();
+    // GitHub holds the write until the test lets it go.
     let (release, gate) = std::sync::mpsc::channel::<()>();
-    let gate = std::sync::Mutex::new(gate);
-    let log = std::sync::Arc::clone(&o.sent);
-    o.a.poster = std::sync::Arc::new(move |owner, name, number, body| {
-        log.lock()
-            .unwrap()
-            .push((format!("{owner}/{name}"), number, body.to_string()));
+    let gate = Mutex::new(gate);
+    o.gh.on_post(move |_| {
         let _ = gate.lock().unwrap().recv();
-        Ok(())
     });
 
     select_draft(&mut o.a, 4840);
@@ -2084,68 +2204,309 @@ fn a_post_in_flight_is_not_sent_twice() {
     // Nor can the draft be set aside from under its own review.
     press(&mut o.a, "x");
     assert_eq!(o.json(4840)["status"], "drafted");
-    // Another row is held back too: one review at a time.
+    // Another row is held back too.
     select_draft(&mut o.a, 4846);
     press(&mut o.a, "aa");
 
     release.send(()).unwrap();
     o.settle();
-    assert_eq!(o.sent().len(), 1, "{:?}", o.sent());
+    assert_eq!(
+        o.calls().iter().filter(|c| c.starts_with("pull ")).count(),
+        1,
+        "a second attempt was started: {:?}",
+        o.calls()
+    );
+    assert_eq!(o.posts(), 1);
 
     // And once it has landed, the row is posted, not postable.
     select_draft(&mut o.a, 4840);
     press(&mut o.a, "aa");
     assert!(o.a.posting.is_none());
-    assert_eq!(o.sent().len(), 1);
+    assert_eq!(o.posts(), 1);
 }
 
 /// A review that went out but could not be written down is still out. The
-/// file says `drafted`; rigor must not offer it again on the file's word.
+/// file says `drafted`; the next attempt finds the review on GitHub, marks the
+/// draft posted, and sends nothing.
 #[test]
-fn a_posted_review_whose_file_was_not_updated_is_not_offered_again() {
-    let mut o = Outbox::new(Ok(()));
+fn a_review_that_was_sent_but_not_recorded_is_found_not_sent_again() {
+    let mut o = Outbox::new();
     let path = o.path(4840);
     let text = o.file(4840);
-    let log = std::sync::Arc::clone(&o.sent);
     let gone = path.clone();
-    // The file vanishes while the review is on its way.
-    o.a.poster = std::sync::Arc::new(move |_, _, number, body| {
-        log.lock()
-            .unwrap()
-            .push((String::new(), number, body.to_string()));
+    // The file vanishes while the review is on its way; GitHub takes it.
+    o.gh.on_post(move |gh| {
         std::fs::remove_file(&gone).unwrap();
-        Ok(())
+        gh.reviews_are(Ok(vec![review_by_viewer("COMMENTED", BODY_4840)]));
     });
-    select_draft(&mut o.a, 4840);
-    press(&mut o.a, "aa");
-    o.settle();
-    let line = o.a.post_error.clone().unwrap();
+    o.confirm(4840);
     assert!(
-        line.starts_with("the review was posted to #4840, but its draft file could not be updated"),
-        "{line}"
+        o.failure()
+            .starts_with("the review was posted to #4840, but its draft file could not be updated"),
+        "{}",
+        o.failure()
     );
 
     // Whatever wrote the draft writes it again, still `drafted`.
     std::fs::write(&path, text).unwrap();
     o.a.reload_drafts();
-    select_draft(&mut o.a, 4840);
-    press(&mut o.a, "aa");
-    assert!(o.a.posting.is_none() && o.a.armed.is_none());
-    assert!(
-        o.a.notice
-            .clone()
-            .unwrap()
-            .0
-            .starts_with("#4840 was posted this session")
+    o.confirm(4840);
+    assert_eq!(o.posts(), 1, "{:?}", o.calls());
+    assert_eq!(o.json(4840)["status"], "posted");
+}
+
+/// A post that timed out, or was cut off by quitting, may have landed all the
+/// same. Trying again must not post it twice: the review is found on GitHub
+/// and the draft is simply marked posted.
+#[test]
+fn a_post_that_timed_out_but_landed_is_found_not_sent_again() {
+    let mut o = Outbox::new();
+    o.gh.post_answers(Err("gh api: timed out after 45s".into()));
+    o.gh.on_post(|gh| gh.reviews_are(Ok(vec![review_by_viewer("COMMENTED", BODY_4840)])));
+    let before = o.file(4840);
+    o.confirm(4840);
+    assert!(o.failure().contains("timed out"), "{}", o.failure());
+    assert_eq!(
+        o.file(4840),
+        before,
+        "a failure is never recorded as a post"
     );
-    assert_eq!(o.sent().len(), 1);
+
+    o.confirm(4840);
+    assert_eq!(o.posts(), 1, "posted twice: {:?}", o.calls());
+    assert_eq!(
+        o.calls()[3..],
+        ["pull 4840", "reviews 4840"],
+        "the second attempt read, and did not write"
+    );
+    let after = o.json(4840);
+    assert_eq!(after["status"], "posted");
+    assert_eq!(
+        after["posted_at"], "2027-01-15T09:30:00Z",
+        "posted when GitHub says it was"
+    );
+    let note = o.a.notice.clone().unwrap().0;
+    assert!(note.contains("already has this review"), "{note}");
+}
+
+/// The list is as old as the last refresh. A pull request that has moved on
+/// since is caught by the read on the confirming keypress: nothing is sent,
+/// and the row is stale from then on — also when the list had never seen the
+/// pull request at all.
+#[test]
+fn a_pull_request_that_moved_since_the_list_was_fetched_is_refused_and_goes_stale() {
+    for number in [4840, 4990] {
+        let mut o = Outbox::new();
+        o.gh.pull_is(number, Ok(live(true, false, MOVED)));
+        let before = o.file(number);
+        o.confirm(number);
+
+        assert_eq!(
+            o.calls(),
+            [format!("pull {number}")],
+            "nothing after the head"
+        );
+        assert_eq!(o.file(number), before);
+        assert_eq!(
+            o.failure(),
+            format!(
+                "nothing posted: #{number} has moved on to 9f8e7d6 since this draft was written"
+            )
+        );
+        assert!(draft_row(&mut o.a, number).contains(" stale "));
+        select_draft(&mut o.a, number);
+        let detail = render(&mut o.a, 160, 30);
+        assert!(
+            detail.contains("the pull request is now at 9f8e7d6"),
+            "{detail}"
+        );
+        // Stale never arms: there is no second try against the same head.
+        press(&mut o.a, "aa");
+        assert!(o.a.armed.is_none() && o.a.posting.is_none());
+        assert_eq!(o.calls().len(), 1);
+    }
+}
+
+/// What a confirming read learned holds until a fetch knows better. A fetch
+/// that covers the pull request is newer than the read, and replaces it.
+#[test]
+fn a_later_fetch_replaces_what_the_confirming_read_saw() {
+    let mut o = Outbox::new();
+    o.gh.pull_is(4840, Ok(live(true, false, MOVED)));
+    o.confirm(4840);
+    assert!(draft_row(&mut o.a, 4840).contains(" stale "));
+
+    // The force-push was undone: the next fetch has the old head again.
+    o.a.on_msg(crate::app::Msg::Prs(Ok(crate::github::Fetched {
+        budget: None,
+        viewer: "octocat".into(),
+        default_branch: "main".into(),
+        prs: o.a.prs.clone(),
+        merged: o.a.merged.clone(),
+    })));
+    assert!(draft_row(&mut o.a, 4840).contains(" comment +2 "));
+}
+
+/// A pull request closed without merging takes no review. A merged one still
+/// at the draft's commit does.
+#[test]
+fn a_closed_pull_request_is_refused_and_a_merged_one_is_not() {
+    let mut o = Outbox::new();
+    o.gh.pull_is(4840, Ok(live(false, false, crate::drafts::tests::HEAD)));
+    let before = o.file(4840);
+    o.confirm(4840);
+    assert_eq!(o.calls(), ["pull 4840"]);
+    assert_eq!(
+        o.failure(),
+        "nothing posted: #4840 was closed without being merged"
+    );
+    assert_eq!(o.file(4840), before);
+    assert!(draft_row(&mut o.a, 4840).contains(" comment +2 "));
+
+    o.gh.pull_is(4840, Ok(live(false, true, crate::drafts::tests::HEAD)));
+    o.confirm(4840);
+    assert_eq!(o.posts(), 1);
+    assert_eq!(o.json(4840)["status"], "posted");
+}
+
+/// The same review already on the pull request means the draft was sent:
+/// it is marked posted, with the time GitHub gives, and nothing goes out.
+#[test]
+fn a_review_already_on_github_marks_the_draft_posted_and_sends_nothing() {
+    let mut o = Outbox::new();
+    o.gh.reviews_are(Ok(vec![review_by_viewer("COMMENTED", BODY_4840)]));
+    let before = o.json(4840);
+    o.confirm(4840);
+
+    assert_eq!(o.calls(), ["pull 4840", "reviews 4840"]);
+    let mut want = before;
+    want["status"] = "posted".into();
+    want["posted_at"] = "2027-01-15T09:30:00Z".into();
+    assert_eq!(o.json(4840), want);
+    assert!(o.a.post_error.is_none());
+    let note = o.a.notice.clone().unwrap().0;
+    assert_eq!(
+        note,
+        "#4840 already has this review from you; marked posted, nothing sent"
+    );
+}
+
+/// A different review from the viewer since the draft was written means they
+/// have already said something else. The draft is not sent on top of it, and
+/// there is no key that sends it anyway.
+#[test]
+fn a_different_review_since_the_draft_was_written_blocks_it() {
+    let mut o = Outbox::new();
+    o.gh.reviews_are(Ok(vec![review_by_viewer(
+        "CHANGES_REQUESTED",
+        "Not yet: the cap is wrong.",
+    )]));
+    let before = o.file(4840);
+    for _ in 0..2 {
+        o.confirm(4840);
+        assert_eq!(o.posts(), 0, "{:?}", o.calls());
+        assert_eq!(o.file(4840), before);
+        assert_eq!(
+            o.failure(),
+            "nothing posted: you have reviewed #4840 since this draft was written; x skips it, or review in the browser"
+        );
+        assert!(draft_row(&mut o.a, 4840).contains(" comment +2 "));
+    }
+    assert_eq!(
+        o.calls(),
+        ["pull 4840", "reviews 4840", "pull 4840", "reviews 4840"]
+    );
+}
+
+/// If GitHub cannot be asked, nothing is sent on the list's word alone.
+#[test]
+fn a_failed_read_sends_nothing() {
+    let timed_out = "gh api: timed out after 45s".to_string();
+
+    let mut o = Outbox::new();
+    o.gh.pull_is(4840, Err(timed_out.clone()));
+    let before = o.file(4840);
+    o.confirm(4840);
+    assert_eq!(o.calls(), ["pull 4840"]);
+    assert_eq!(
+        o.failure(),
+        "nothing posted: could not check #4840 on GitHub: gh api: timed out after 45s"
+    );
+    assert_eq!(o.file(4840), before);
+
+    let mut o = Outbox::new();
+    o.gh.reviews_are(Err(timed_out));
+    o.confirm(4840);
+    assert_eq!(o.calls(), ["pull 4840", "reviews 4840"]);
+    assert!(
+        o.failure().contains("could not check #4840"),
+        "{}",
+        o.failure()
+    );
+    assert_eq!(o.file(4840), before);
+    assert!(draft_row(&mut o.a, 4840).contains(" comment +2 "));
+}
+
+/// Until a fetch has said who the viewer is, their reviews cannot be told
+/// from anyone else's, so nothing is sent.
+#[test]
+fn nothing_is_posted_before_the_viewer_is_known() {
+    let mut o = Outbox::new();
+    o.a.viewer.clear();
+    o.confirm(4840);
+    assert!(o.calls().is_empty(), "{:?}", o.calls());
+    assert!(o.failure().contains("your GitHub login is not known yet"));
+}
+
+/// A draft whose pull request the list never fetched can still be posted:
+/// the prompt says the list cannot vouch for it, and the read on the
+/// confirming keypress does the checking the list could not.
+#[test]
+fn an_unverified_draft_is_checked_on_github_and_then_posted() {
+    let mut o = Outbox::new();
+    select_draft(&mut o.a, 4990);
+    assert!(draft_row(&mut o.a, 4990).contains(" unverified "));
+    select_draft(&mut o.a, 4990);
+
+    press(&mut o.a, "a");
+    let prompt = footer(&frame(&mut o.a, 160, 24));
+    assert!(
+        prompt.contains(
+            "post approve with 1 inline comment to #4990? not fetched here, so GitHub is asked for its head first. a again to confirm, esc to cancel"
+        ),
+        "{prompt:?}"
+    );
+    assert!(o.calls().is_empty(), "one a reached GitHub");
+
+    press(&mut o.a, "a");
+    o.settle();
+    assert_eq!(o.calls()[..2], ["pull 4990", "reviews 4990"]);
+    assert_eq!(o.posts(), 1);
+    assert_eq!(o.json(4990)["status"], "posted");
+    assert!(draft_row(&mut o.a, 4990).contains(" ✓ posted "));
+}
+
+/// A prompt put up for an unverified draft does not carry over once a fetch
+/// has seen the pull request: the question has changed, so it is asked again.
+#[test]
+fn a_fetch_that_verifies_the_draft_withdraws_the_unverified_prompt() {
+    let mut o = Outbox::new();
+    select_draft(&mut o.a, 4990);
+    press(&mut o.a, "a");
+    assert!(o.a.armed.is_some());
+    let mut seen = o.a.prs[0].clone();
+    seen.number = 4990;
+    o.a.prs.push(seen);
+    o.a.rebuild();
+    assert!(o.a.armed.is_none());
+    assert!(o.calls().is_empty());
 }
 
 /// `a` posts only from the Drafts view, and never as a chord.
 #[test]
 fn a_does_nothing_outside_the_drafts_view_or_with_ctrl() {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    let mut o = Outbox::new(Ok(()));
+    let mut o = Outbox::new();
     o.a.set_view(View::All);
     press(&mut o.a, "aa");
     assert!(o.a.armed.is_none() && o.a.posting.is_none());
@@ -2158,14 +2519,14 @@ fn a_does_nothing_outside_the_drafts_view_or_with_ctrl() {
         }
         assert!(o.a.armed.is_none() && o.a.posting.is_none(), "{modifier:?}");
     }
-    assert!(o.sent().is_empty());
+    assert!(o.calls().is_empty());
 }
 
 /// `x` sets a draft aside and brings it back, touching only its status. It
 /// never rewrites a draft it cannot read, or one already posted.
 #[test]
 fn x_skips_a_draft_and_brings_it_back() {
-    let mut o = Outbox::new(Ok(()));
+    let mut o = Outbox::new();
     select_draft(&mut o.a, 4846);
     let before = o.json(4846);
 
@@ -2197,7 +2558,7 @@ fn x_skips_a_draft_and_brings_it_back() {
         let note = o.a.notice.clone().unwrap().0;
         assert!(note.contains(why), "#{number}: {note}");
     }
-    assert!(o.sent().is_empty());
+    assert!(o.calls().is_empty());
 }
 
 /// `e` hands the selected draft's file to the event loop, which owns the
@@ -2205,7 +2566,7 @@ fn x_skips_a_draft_and_brings_it_back() {
 /// of all.
 #[test]
 fn e_asks_for_the_selected_drafts_file() {
-    let mut o = Outbox::new(Ok(()));
+    let mut o = Outbox::new();
     select_draft(&mut o.a, 4980);
     press(&mut o.a, "e");
     assert_eq!(o.a.edit_request, Some(o.path(4980)));
@@ -2219,7 +2580,7 @@ fn e_asks_for_the_selected_drafts_file() {
 /// The footer offers what would do something on this row, and no more.
 #[test]
 fn the_footer_offers_only_what_applies_to_the_draft() {
-    let mut o = Outbox::new(Ok(()));
+    let mut o = Outbox::new();
     let mut keys = |number: u64| {
         select_draft(&mut o.a, number);
         footer(&frame(&mut o.a, 160, 24))
@@ -2233,6 +2594,11 @@ fn the_footer_offers_only_what_applies_to_the_draft() {
     assert!(
         !stale.contains("a post") && stale.contains("x skip"),
         "{stale:?}"
+    );
+    let unverified = keys(4990);
+    assert!(
+        unverified.contains("a post") && unverified.contains("x skip"),
+        "{unverified:?}"
     );
     let skipped = keys(4701);
     assert!(

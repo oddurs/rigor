@@ -34,7 +34,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         (Some(entry), _, _) => draft_detail(
             &mut lines,
             entry,
-            app.draft_state(entry),
+            (app.draft_state(entry), app.draft_head(entry)),
             app.draft_pr(entry),
             now,
             &t,
@@ -509,7 +509,7 @@ fn cleanup(lines: &mut Vec<Line<'static>>, desk: &Desk<'_>, home: Option<&str>, 
 fn draft_detail(
     lines: &mut Vec<Line<'static>>,
     entry: &Entry,
-    state: State,
+    (state, head): (State, Option<&str>),
     pr: DraftPr<'_>,
     now: i64,
     t: &Theme,
@@ -598,7 +598,7 @@ fn draft_detail(
     for l in note {
         lines.push(Line::from(vec![field("", t), Span::styled(l, muted)]));
     }
-    lines.push(head_line(d, state, pr, t));
+    lines.push(head_line(d, state, head, t));
 }
 
 /// A labeled block of prose, wrapped to the pane. An empty one says `none`
@@ -656,9 +656,9 @@ fn verdict_line(d: &Draft, now: i64, t: &Theme) -> Line<'static> {
 
 /// The commit the draft was written against, and whether the pull request is
 /// still there. This is the row that explains `stale` and `unverified`.
-fn head_line(d: &Draft, state: State, pr: DraftPr<'_>, t: &Theme) -> Line<'static> {
+fn head_line(d: &Draft, state: State, head: Option<&str>, t: &Theme) -> Line<'static> {
     let sha = super::list::short_sha(&d.head_sha).to_string();
-    let current = pr.head().filter(|h| !h.is_empty());
+    let current = head.filter(|h| !h.is_empty());
     let (text, color) = match current {
         Some(h) if h.eq_ignore_ascii_case(&d.head_sha) => {
             ("matches the pull request".to_string(), t.success)

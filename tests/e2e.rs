@@ -35,9 +35,9 @@ const COLS: u16 = 160;
 // ------------------------------------------------------------------ the world
 
 /// A repository with a bare origin and two worktrees, a fake `gh` that answers
-/// from a fixture (or hangs, fails, or reports a rate limit) and records every
-/// write it is asked to make, and a `git` shim that logs every call rigor
-/// makes.
+/// from a fixture (or hangs, fails, or reports a rate limit), serves what a
+/// test says about single pull requests, and records every call in order, and
+/// a `git` shim that logs every call rigor makes.
 struct World {
     dir: tempfile::TempDir,
 }
@@ -107,15 +107,38 @@ impl World {
         )
     }
 
-    /// Every write the fake `gh` was asked to make: its arguments, one call
-    /// per line.
-    fn posts(&self) -> Vec<String> {
-        self.log("gh.posts")
+    /// Every call the fake `gh` took, in the order it took them: its
+    /// arguments, one call per line. The fetch is `api graphql`.
+    fn calls(&self) -> Vec<String> {
+        self.log("gh.calls")
     }
 
     /// The exact bytes the `n`th write was given on stdin, counting from 1.
     fn post_body(&self, n: usize) -> String {
         std::fs::read_to_string(self.root().join(format!("gh.post.{n}"))).unwrap()
+    }
+
+    /// What GitHub says about pull request `number` when asked for it alone.
+    /// Until a test says, there is no such pull request.
+    fn pull(&self, number: u64, state: &str, merged: bool, head: &str) {
+        let v = serde_json::json!({
+            "number": number, "state": state, "merged": merged, "head": { "sha": head }
+        });
+        std::fs::write(
+            self.root().join(format!("pull.{number}.json")),
+            v.to_string(),
+        )
+        .unwrap();
+    }
+
+    /// One page of the reviews on pull request `number`. Until a test says,
+    /// every page is empty.
+    fn reviews(&self, number: u64, page: usize, reviews: &serde_json::Value) {
+        std::fs::write(
+            self.root().join(format!("reviews.{number}.{page}.json")),
+            reviews.to_string(),
+        )
+        .unwrap();
     }
 
     fn log(&self, name: &str) -> Vec<String> {
@@ -204,19 +227,51 @@ fn install_fakes(root: &Path) {
         &bin.join("gh"),
         r#"#!/bin/sh
 dir="$(cd "$(dirname "$0")/.." && pwd)"
-# A write is recorded whole — its arguments, and the body it was given on
-# stdin — and is never answered from the fixture. Kept out of gh.log, which
-# counts fetches.
+# Every call, in the order it came. The fetch's query spans many lines, so it
+# is logged by name; the rest by their arguments.
+case "$2" in
+  graphql) echo "api graphql" >> "$dir/gh.calls" ;;
+  *) echo "$*" >> "$dir/gh.calls" ;;
+esac
+# A write: the body it was given on stdin is kept, and it is accepted unless a
+# test left a refusal for it, which is answered the way gh answers an HTTP
+# error — the response body on stdout, a one-line summary on stderr.
 case "$*" in
   *--method*)
     echo "$*" >> "$dir/gh.posts"
     cat > "$dir/gh.post.$(wc -l < "$dir/gh.posts" | tr -d ' ')"
-    if [ "$(cat "$dir/gh.mode")" = fail ]; then
-      echo "gh: Validation Failed (HTTP 422)" >&2
+    if [ -f "$dir/post.refusal.json" ]; then
+      cat "$dir/post.refusal.json"
+      echo "gh: Unprocessable Entity (HTTP 422)" >&2
       exit 1
     fi
     printf '%s' '{"id":1,"state":"APPROVED"}'
     exit 0 ;;
+esac
+# The two reads made before a write: one pull request, and its reviews a page
+# at a time.
+case "$2" in
+  repos/*/pulls/*/reviews*)
+    n="${2#*/pulls/}"; n="${n%%/*}"; page="${2##*page=}"
+    if [ -f "$dir/reviews.$n.err" ]; then
+      cat "$dir/reviews.$n.err" >&2
+      exit 1
+    fi
+    if [ -f "$dir/reviews.$n.$page.json" ]; then
+      cat "$dir/reviews.$n.$page.json"
+    else
+      printf '[]'
+    fi
+    exit 0 ;;
+  repos/*/pulls/*)
+    n="${2##*/}"
+    if [ -f "$dir/pull.$n.json" ]; then
+      cat "$dir/pull.$n.json"
+      exit 0
+    fi
+    printf '%s' '{"message":"Not Found","status":"404"}'
+    echo "gh: Not Found (HTTP 404)" >&2
+    exit 1 ;;
 esac
 # One line per call. Not "$*": the query argument spans many lines, and
 # counting lines would count the query, not the calls.
@@ -725,26 +780,66 @@ fn the_default_screen_does_not_mention_drafts() {
     );
 }
 
-/// The one write rigor makes to GitHub, end to end: the first `a` only asks,
-/// the second sends exactly one request with exactly the review in it, and
-/// only then is the file marked posted.
-#[test]
-fn a_confirmed_post_sends_one_review_and_marks_the_draft_posted() {
-    let w = World::new();
+/// What the fake `gh` logs for each of the calls a post is made of.
+const FETCH: &str = "api graphql";
+
+fn pull_call(number: u64) -> String {
+    format!("api repos/acme/widget/pulls/{number}")
+}
+
+fn reviews_call(number: u64, page: usize) -> String {
+    format!("api repos/acme/widget/pulls/{number}/reviews?per_page=100&page={page}")
+}
+
+fn post_call(number: u64) -> String {
+    format!("api --method POST repos/acme/widget/pulls/{number}/reviews --input -")
+}
+
+/// A review as GitHub lists it: on the commit the drafts are written against,
+/// half an hour after they were written.
+fn review(login: &str, state: &str, body: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": 1,
+        "user": { "login": login },
+        "state": state,
+        "commit_id": FIXTURE_HEAD_101,
+        "body": body,
+        "submitted_at": "2027-01-15T09:30:00Z"
+    })
+}
+
+const MOVED: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432";
+
+/// A world with one draft for #101, rigor on the Drafts view, and the fetch
+/// landed: the draft is ready, and the viewer is known. Returns the draft's
+/// path and text as its author left it.
+fn ready_to_post(w: &World) -> (Term, PathBuf, String) {
     let path = w.draft(101, |_| {});
-    let before: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let before = std::fs::read_to_string(&path).unwrap();
     let t = w.drafts_view();
     t.wait_line("#101 ready to post", LOAD, |l| {
         l.contains("#101") && l.contains("approve +1")
     });
+    (t, path, before)
+}
+
+/// The one write rigor makes to GitHub, end to end. The first `a` only asks.
+/// The second reads the pull request and its reviews, there and then, and
+/// only after both sends exactly one request with exactly the review in it;
+/// only then is the file marked posted.
+#[test]
+fn a_confirmed_post_reads_twice_then_sends_exactly_one_review() {
+    let w = World::new();
+    w.pull(101, "open", false, FIXTURE_HEAD_101);
+    let (t, path, before) = ready_to_post(&w);
+    let before: serde_json::Value = serde_json::from_str(&before).unwrap();
 
     t.send(b"a");
     t.wait_for(
         "post approve with 1 inline comment to #101? a again to confirm, esc to cancel",
         LOAD,
     );
-    assert!(w.posts().is_empty(), "one a sent it: {:?}", w.posts());
+    assert_eq!(w.calls(), [FETCH], "one a reached GitHub");
 
     t.send(b"a");
     t.wait_line("#101 posted", LOAD, |l| {
@@ -752,8 +847,13 @@ fn a_confirmed_post_sends_one_review_and_marks_the_draft_posted() {
     });
 
     assert_eq!(
-        w.posts(),
-        ["api --method POST repos/acme/widget/pulls/101/reviews --input -"]
+        w.calls(),
+        [
+            FETCH.to_string(),
+            pull_call(101),
+            reviews_call(101, 1),
+            post_call(101)
+        ]
     );
     let body = w.post_body(1);
     assert_eq!(
@@ -783,17 +883,13 @@ fn a_confirmed_post_sends_one_review_and_marks_the_draft_posted() {
     assert_eq!(left, ["101.json"], "the rewrite left something behind");
 }
 
-/// A stray keypress sends nothing: `a` on its own only asks, and anything
+/// A stray keypress reaches nothing: `a` on its own only asks, and anything
 /// that is not a second `a` withdraws the question.
 #[test]
 fn a_single_a_sends_nothing() {
     let w = World::new();
-    let path = w.draft(101, |_| {});
-    let before = std::fs::read_to_string(&path).unwrap();
-    let t = w.drafts_view();
-    t.wait_line("#101 ready to post", LOAD, |l| {
-        l.contains("#101") && l.contains("approve +1")
-    });
+    w.pull(101, "open", false, FIXTURE_HEAD_101);
+    let (t, path, before) = ready_to_post(&w);
     let asked = |t: &Term| t.wait_for("a again to confirm", LOAD);
     let withdrawn = |t: &Term| {
         t.wait("the prompt to go", LOAD, |s| {
@@ -817,20 +913,18 @@ fn a_single_a_sends_nothing() {
     t.send(b"?");
     t.wait_for(" keys ", LOAD);
     std::thread::sleep(Duration::from_millis(300));
-    assert!(w.posts().is_empty(), "{:?}", w.posts());
+    assert_eq!(w.calls(), [FETCH], "not so much as a read");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 }
 
-/// Stale, unverified, invalid, skipped and already posted: `a`, twice, on
-/// each sends nothing, says why, and leaves the file alone.
+/// Stale, invalid, skipped and already posted never arm: `a`, twice, on each
+/// asks GitHub nothing, says why, and leaves the file alone.
 #[test]
-fn drafts_that_must_not_be_posted_send_nothing() {
+fn drafts_that_never_arm_ask_github_nothing() {
     let w = World::new();
-    // The fixture has #102 at another commit, has never heard of #999, and
-    // lists #90 as merged.
+    // The fixture has #102 at another commit and lists #90 as merged.
     let mut files = vec![
         (w.draft(102, |_| {}), "102", "#102 is stale"),
-        (w.draft(999, |_| {}), "999", "#999 is unverified"),
         (w.draft(103, |_| {}), "103", "#103 is invalid"),
         (
             w.draft(101, |v| v["status"] = "skipped".into()),
@@ -846,7 +940,10 @@ fn drafts_that_must_not_be_posted_send_nothing() {
             "#90 is already posted",
         ),
     ];
-    std::fs::write(&files[2].0, "{ \"version\": 1,").unwrap();
+    std::fs::write(&files[1].0, "{ \"version\": 1,").unwrap();
+    for n in [90, 101, 102, 103] {
+        w.pull(n, "open", false, FIXTURE_HEAD_101);
+    }
     let before: Vec<String> = files
         .iter()
         .map(|(p, _, _)| std::fs::read_to_string(p).unwrap())
@@ -859,11 +956,11 @@ fn drafts_that_must_not_be_posted_send_nothing() {
     });
     for (_, number, why) in &files {
         // Narrow the list to the one draft, so the row under `a` is not a
-        // matter of ordering.
-        // Enter is a carriage return to a terminal in raw mode.
+        // matter of ordering. Enter is a carriage return to a terminal in
+        // raw mode.
         t.send(format!("/{number}\r").as_bytes());
         t.wait("the filter to apply", LOAD, |s| {
-            s.contains(&format!("/{number} ")) && s.contains("Drafts 5")
+            s.contains(&format!("/{number} ")) && s.contains("Drafts 4")
         });
         t.send(b"aa");
         t.wait_for(why, LOAD);
@@ -876,7 +973,7 @@ fn drafts_that_must_not_be_posted_send_nothing() {
     t.send(b"?");
     t.wait_for(" keys ", LOAD);
     std::thread::sleep(Duration::from_millis(300));
-    assert!(w.posts().is_empty(), "{:?}", w.posts());
+    assert_eq!(w.calls(), [FETCH]);
     for ((path, number, _), text) in files.drain(..).zip(before) {
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -886,28 +983,198 @@ fn drafts_that_must_not_be_posted_send_nothing() {
     }
 }
 
-/// When `gh` refuses the review nothing went out, so nothing is recorded:
-/// the file is byte for byte what it was and the row is still a draft.
+/// The list said #101 was at the draft's commit; GitHub, asked on the
+/// confirming keypress, says it has moved. Nothing is sent, the reviews are
+/// not even read, and the row is stale from then on.
 #[test]
-fn a_failing_gh_leaves_the_draft_untouched() {
+fn a_pull_request_that_moved_since_the_fetch_is_refused_and_goes_stale() {
     let w = World::new();
-    let path = w.draft(101, |_| {});
-    let before = std::fs::read_to_string(&path).unwrap();
-    let t = w.drafts_view();
-    t.wait_line("#101 ready to post", LOAD, |l| {
-        l.contains("#101") && l.contains("approve +1")
-    });
-    w.gh("fail");
+    w.pull(101, "open", false, MOVED);
+    let (t, path, before) = ready_to_post(&w);
+
     t.send(b"aa");
     t.wait_for(
-        "posting to #101 failed: gh api failed: gh: Validation Failed (HTTP 422)",
+        "nothing posted: #101 has moved on to 9f8e7d6 since this draft was written",
         LOAD,
     );
-    assert_eq!(w.posts().len(), 1, "attempted once: {:?}", w.posts());
+    t.wait_line("#101 stale", LOAD, |l| {
+        l.contains("#101") && l.contains("stale")
+    });
+    assert_eq!(w.calls(), [FETCH.to_string(), pull_call(101)]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+}
+
+#[test]
+fn a_pull_request_closed_without_merging_takes_no_review() {
+    let w = World::new();
+    w.pull(101, "closed", false, FIXTURE_HEAD_101);
+    let (t, path, before) = ready_to_post(&w);
+
+    t.send(b"aa");
+    t.wait_for("nothing posted: #101 was closed without being merged", LOAD);
+    assert_eq!(w.calls(), [FETCH.to_string(), pull_call(101)]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+}
+
+/// The same review is already on the pull request — here on the second page
+/// of a long list — so the draft was sent: it is marked posted, with the time
+/// GitHub gives, and nothing more goes out.
+#[test]
+fn a_review_already_on_github_marks_the_draft_posted_and_sends_nothing() {
+    let w = World::new();
+    w.pull(101, "open", false, FIXTURE_HEAD_101);
+    let others: Vec<_> = (0..100)
+        .map(|_| review("hubot", "COMMENTED", "Noted."))
+        .collect();
+    w.reviews(101, 1, &serde_json::Value::Array(others));
+    w.reviews(
+        101,
+        2,
+        &serde_json::json!([review("octocat", "APPROVED", "Reads well.")]),
+    );
+    let (t, path, before) = ready_to_post(&w);
+    let before: serde_json::Value = serde_json::from_str(&before).unwrap();
+
+    t.send(b"aa");
+    t.wait_line("#101 posted", LOAD, |l| {
+        l.contains("#101") && l.contains("✓ posted")
+    });
+    assert_eq!(
+        w.calls(),
+        [
+            FETCH.to_string(),
+            pull_call(101),
+            reviews_call(101, 1),
+            reviews_call(101, 2)
+        ]
+    );
+    let mut want = before;
+    want["status"] = "posted".into();
+    want["posted_at"] = "2027-01-15T09:30:00Z".into();
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(after, want);
+}
+
+/// The viewer has said something else on the pull request since the draft
+/// was written. The draft is not sent on top of it, and stays as it is.
+#[test]
+fn a_different_review_since_the_draft_was_written_blocks_it() {
+    let w = World::new();
+    w.pull(101, "open", false, FIXTURE_HEAD_101);
+    w.reviews(
+        101,
+        1,
+        &serde_json::json!([review("octocat", "CHANGES_REQUESTED", "Not yet.")]),
+    );
+    let (t, path, before) = ready_to_post(&w);
+
+    t.send(b"aa");
+    t.wait_for(
+        "nothing posted: you have reviewed #101 since this draft was written",
+        LOAD,
+    );
+    assert_eq!(
+        w.calls(),
+        [FETCH.to_string(), pull_call(101), reviews_call(101, 1)]
+    );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     t.wait_line("#101 still a draft", LOAD, |l| {
         l.contains("#101") && l.contains("approve +1")
     });
+}
+
+/// If GitHub cannot be asked, nothing is sent on the list's word alone.
+#[test]
+fn a_read_that_fails_sends_nothing() {
+    let w = World::new();
+    w.pull(101, "open", false, FIXTURE_HEAD_101);
+    std::fs::write(w.root().join("reviews.101.err"), "gh: HTTP 502\n").unwrap();
+    let (t, path, before) = ready_to_post(&w);
+
+    t.send(b"aa");
+    t.wait_for(
+        "nothing posted: could not check #101 on GitHub: gh: HTTP 502",
+        LOAD,
+    );
+    assert_eq!(
+        w.calls(),
+        [FETCH.to_string(), pull_call(101), reviews_call(101, 1)]
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+}
+
+/// GitHub declines the review with a 422. Its own message is what the footer
+/// shows; nothing is recorded, and the row is still a draft.
+#[test]
+fn a_422_from_github_is_shown_in_its_words_and_leaves_the_draft_alone() {
+    let w = World::new();
+    w.pull(101, "open", false, FIXTURE_HEAD_101);
+    std::fs::write(
+        w.root().join("post.refusal.json"),
+        r#"{"message":"Unprocessable Entity","errors":["Line must be part of the diff"],"status":"422"}"#,
+    )
+    .unwrap();
+    let (t, path, before) = ready_to_post(&w);
+
+    t.send(b"aa");
+    t.wait_for(
+        "posting to #101 failed: Unprocessable Entity: Line must be part of the diff (HTTP 422)",
+        LOAD,
+    );
+    assert_eq!(
+        w.calls(),
+        [
+            FETCH.to_string(),
+            pull_call(101),
+            reviews_call(101, 1),
+            post_call(101)
+        ]
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    t.wait_line("#101 still a draft", LOAD, |l| {
+        l.contains("#101") && l.contains("approve +1")
+    });
+}
+
+/// A draft for a pull request the fetch never returned is not stuck: the
+/// prompt says the list cannot vouch for it, and the confirming read finds
+/// its head matches and sends it.
+#[test]
+fn an_unverified_draft_whose_live_head_matches_is_posted() {
+    let w = World::new();
+    let path = w.draft(999, |_| {});
+    w.pull(999, "open", false, FIXTURE_HEAD_101);
+    let t = w.drafts_view();
+    // The fetch has landed once the viewer is known; #999 is not in it.
+    t.wait_for("@octocat", LOAD);
+    t.wait_line("#999 unverified", LOAD, |l| {
+        l.contains("#999") && l.contains("unverified")
+    });
+
+    t.send(b"a");
+    t.wait_for(
+        "#999? not fetched here, so GitHub is asked for its head first. a again to confirm",
+        LOAD,
+    );
+    assert_eq!(w.calls(), [FETCH]);
+
+    t.send(b"a");
+    t.wait_line("#999 posted", LOAD, |l| {
+        l.contains("#999") && l.contains("✓ posted")
+    });
+    assert_eq!(
+        w.calls(),
+        [
+            FETCH.to_string(),
+            pull_call(999),
+            reviews_call(999, 1),
+            post_call(999)
+        ]
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(after["status"], "posted");
 }
 
 /// `e` steps out of the way for the editor, comes back with the whole screen
@@ -946,5 +1213,5 @@ fn editing_a_draft_rereads_it_and_restores_the_screen() {
     // An invalid draft cannot be posted, and rigor is still listening.
     t.send(b"aa");
     t.wait_for("#101 is invalid", LOAD);
-    assert!(w.posts().is_empty());
+    assert_eq!(w.calls(), [FETCH]);
 }

@@ -4,6 +4,9 @@
 //! rigor does not write drafts and does not know who does. The file is the
 //! whole contract: `<drafts dir>/<owner>/<repo>/<number>.json`. The only fields
 //! rigor ever changes are `status` and `posted_at`.
+//!
+//! Posting is the one thing rigor sends anywhere, so it is decided here, in
+//! one place, against what GitHub says at that moment: see `deliver`.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::ffi::OsString;
@@ -35,6 +38,14 @@ impl Verdict {
         match self {
             Self::Approve => "APPROVE",
             Self::Comment => "COMMENT",
+        }
+    }
+
+    /// The state GitHub gives a review of this kind once it is submitted.
+    const fn submitted_as(self) -> &'static str {
+        match self {
+            Self::Approve => "APPROVED",
+            Self::Comment => "COMMENTED",
         }
     }
 }
@@ -199,7 +210,7 @@ pub fn state(draft: &Result<Draft, String>, head: Option<&str>) -> State {
 }
 
 #[derive(Serialize)]
-struct Review<'a> {
+struct Request<'a> {
     commit_id: &'a str,
     event: &'static str,
     body: &'a str,
@@ -209,12 +220,147 @@ struct Review<'a> {
 /// The body of the one request rigor ever sends. Built from a type with no
 /// place for `note` or `picked`, so neither can reach GitHub.
 pub fn payload(d: &Draft) -> serde_json::Result<String> {
-    serde_json::to_string(&Review {
+    serde_json::to_string(&Request {
         commit_id: &d.head_sha,
         event: d.verdict.event(),
         body: &d.body,
         comments: &d.comments,
     })
+}
+
+/// A pull request as GitHub describes it right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Live {
+    pub open: bool,
+    pub merged: bool,
+    pub head: String,
+}
+
+/// A review already on a pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Review {
+    pub author: String,
+    /// `APPROVED`, `COMMENTED`, `CHANGES_REQUESTED`, `DISMISSED` or `PENDING`.
+    pub state: String,
+    pub commit: String,
+    pub body: String,
+    /// `None` while the review is still pending.
+    pub submitted_at: Option<String>,
+}
+
+/// What posting needs from GitHub, for one repository. `main` wires in `gh`;
+/// a test hands over a recorder, so nothing built in a test can reach GitHub.
+pub trait Remote: Send + Sync {
+    fn pull(&self, number: u64) -> Result<Live, String>;
+    /// Every review on the pull request, all pages.
+    fn reviews(&self, number: u64) -> Result<Vec<Review>, String>;
+    fn post(&self, number: u64, body: &str) -> Result<(), String>;
+}
+
+/// Why nothing was sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The pull request was closed without being merged.
+    Closed,
+    /// The pull request is at this commit now, not the draft's.
+    Moved(String),
+    /// The viewer has reviewed the pull request since the draft was written,
+    /// and not with this review.
+    ReviewedSince,
+    /// Who is asking is not known, so their reviews cannot be told from
+    /// anyone else's.
+    NoViewer,
+    /// GitHub could not be asked.
+    Unchecked(String),
+    /// GitHub was asked to take the review and did not.
+    Rejected(String),
+}
+
+/// How an attempt to post ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Sent,
+    /// The same review is already on the pull request, submitted at this
+    /// time. Nothing was sent.
+    AlreadySent(String),
+    Refused(Refusal),
+}
+
+/// A pull request that is gone, or no longer at the draft's commit, cannot
+/// take the draft. A merged one still at that commit can.
+fn check_pull(d: &Draft, live: &Live) -> Result<(), Refusal> {
+    if !live.open && !live.merged {
+        return Err(Refusal::Closed);
+    }
+    if !live.head.eq_ignore_ascii_case(&d.head_sha) {
+        return Err(Refusal::Moved(live.head.clone()));
+    }
+    Ok(())
+}
+
+/// The viewer's own reviews since the draft was written decide whether it is
+/// still theirs to send. The same review — event, commit and body — means it
+/// already went out: a post that timed out, or was cut off by quitting, still
+/// landed. Any other review means they have since said something else, and
+/// the draft is not sent on top of it.
+fn check_reviews(d: &Draft, viewer: &str, reviews: &[Review]) -> Option<Outcome> {
+    // Checked when the draft was read. Were it somehow not a time, every
+    // review counts as since: the doubt must not end in a second post.
+    let written = parse_iso8601(&d.created_at).unwrap_or(i64::MIN);
+    let mut since = reviews.iter().filter(|r| {
+        r.author.eq_ignore_ascii_case(viewer)
+            && r.submitted_at
+                .as_deref()
+                .and_then(parse_iso8601)
+                .is_some_and(|at| at >= written)
+    });
+    let same = |r: &&Review| {
+        r.state == d.verdict.submitted_as()
+            && r.commit.eq_ignore_ascii_case(&d.head_sha)
+            && r.body.trim() == d.body.trim()
+    };
+    if let Some(sent) = since.clone().find(same) {
+        return Some(Outcome::AlreadySent(
+            sent.submitted_at.clone().unwrap_or_default(),
+        ));
+    }
+    since
+        .next()
+        .map(|_| Outcome::Refused(Refusal::ReviewedSince))
+}
+
+/// Post `d` to pull request `number`, if GitHub's own account of the pull
+/// request, read here and now, still allows it. Two reads, then at most one
+/// write; a read that fails sends nothing.
+///
+/// This is what a confirming keypress runs. What the list showed when the
+/// prompt went up is as old as the last refresh; this is as old as the time
+/// between these calls.
+pub fn deliver(remote: &dyn Remote, viewer: &str, number: u64, d: &Draft) -> Outcome {
+    if viewer.is_empty() {
+        return Outcome::Refused(Refusal::NoViewer);
+    }
+    let live = match remote.pull(number) {
+        Ok(live) => live,
+        Err(e) => return Outcome::Refused(Refusal::Unchecked(e)),
+    };
+    if let Err(why) = check_pull(d, &live) {
+        return Outcome::Refused(why);
+    }
+    let reviews = match remote.reviews(number) {
+        Ok(reviews) => reviews,
+        Err(e) => return Outcome::Refused(Refusal::Unchecked(e)),
+    };
+    if let Some(settled) = check_reviews(d, viewer, &reviews) {
+        return settled;
+    }
+    let sent = payload(d)
+        .map_err(|e| format!("could not build the review: {e}"))
+        .and_then(|body| remote.post(number, &body));
+    match sent {
+        Ok(()) => Outcome::Sent,
+        Err(e) => Outcome::Refused(Refusal::Rejected(e)),
+    }
 }
 
 /// `$RIGOR_DRAFTS_DIR`, else `$XDG_DATA_HOME/rigor/drafts`, else
@@ -692,6 +838,307 @@ pub mod tests {
                 r#"{{"commit_id":"{HEAD}","event":"COMMENT","body":"Reads well.","comments":[]}}"#
             )
         );
+    }
+
+    /// GitHub as one case of the table describes it. Records the calls made,
+    /// in order, so a case can say not only what was decided but how much was
+    /// asked before deciding.
+    struct Github {
+        pull: Result<Live, String>,
+        reviews: Result<Vec<Review>, String>,
+        post: Result<(), String>,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl Remote for Github {
+        fn pull(&self, _: u64) -> Result<Live, String> {
+            self.calls.lock().unwrap().push("pull");
+            self.pull.clone()
+        }
+        fn reviews(&self, _: u64) -> Result<Vec<Review>, String> {
+            self.calls.lock().unwrap().push("reviews");
+            self.reviews.clone()
+        }
+        fn post(&self, _: u64, _: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push("post");
+            self.post.clone()
+        }
+    }
+
+    const MOVED: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432";
+    /// The sample draft was written at 09:00.
+    const BEFORE: &str = "2027-01-15T08:59:59Z";
+    const AT: &str = "2027-01-15T09:00:00Z";
+    const AFTER: &str = "2027-01-15T09:30:00Z";
+
+    fn open_at(head: &str) -> Live {
+        Live {
+            open: true,
+            merged: false,
+            head: head.into(),
+        }
+    }
+
+    /// A review that is exactly what the sample draft would send, by `author`.
+    fn review(author: &str, at: &str) -> Review {
+        Review {
+            author: author.into(),
+            state: "APPROVED".into(),
+            commit: HEAD.into(),
+            body: "Reads well.".into(),
+            submitted_at: Some(at.into()),
+        }
+    }
+
+    /// One situation on GitHub at the moment of posting, and what must come
+    /// of it. Anything a case leaves out is the ordinary one: an open pull
+    /// request at the draft's commit, no reviews, a post that is accepted.
+    struct Moment {
+        name: &'static str,
+        viewer: &'static str,
+        pull: Result<Live, String>,
+        reviews: Result<Vec<Review>, String>,
+        post: Result<(), String>,
+        want: Outcome,
+        calls: &'static [&'static str],
+    }
+
+    impl Default for Moment {
+        fn default() -> Self {
+            Self {
+                name: "",
+                viewer: "octocat",
+                pull: Ok(open_at(HEAD)),
+                reviews: Ok(Vec::new()),
+                post: Ok(()),
+                want: Outcome::Sent,
+                calls: &["pull", "reviews", "post"],
+            }
+        }
+    }
+
+    fn live_through(moments: impl IntoIterator<Item = Moment>) {
+        let draft = parse(&sample().to_string(), "acme/widget", 101).unwrap();
+        for m in moments {
+            let github = Github {
+                pull: m.pull,
+                reviews: m.reviews,
+                post: m.post,
+                calls: std::sync::Mutex::default(),
+            };
+            let got = deliver(&github, m.viewer, 101, &draft);
+            assert_eq!(got, m.want, "{}", m.name);
+            assert_eq!(*github.calls.lock().unwrap(), m.calls, "{}", m.name);
+        }
+    }
+
+    /// Where the pull request is right now decides first, before anyone's
+    /// reviews are even read.
+    #[test]
+    fn posting_is_decided_by_where_the_pull_request_is_now() {
+        live_through([
+            Moment {
+                name: "open, at the draft's commit",
+                ..Moment::default()
+            },
+            Moment {
+                name: "merged, still at the draft's commit",
+                pull: Ok(Live {
+                    open: false,
+                    merged: true,
+                    head: HEAD.into(),
+                }),
+                ..Moment::default()
+            },
+            Moment {
+                name: "the same commit, spelled in capitals",
+                pull: Ok(open_at(&HEAD.to_uppercase())),
+                ..Moment::default()
+            },
+            Moment {
+                name: "closed without merging",
+                pull: Ok(Live {
+                    open: false,
+                    merged: false,
+                    head: HEAD.into(),
+                }),
+                want: Outcome::Refused(Refusal::Closed),
+                calls: &["pull"],
+                ..Moment::default()
+            },
+            Moment {
+                name: "moved on",
+                pull: Ok(open_at(MOVED)),
+                want: Outcome::Refused(Refusal::Moved(MOVED.into())),
+                calls: &["pull"],
+                ..Moment::default()
+            },
+            Moment {
+                name: "merged, but at another commit",
+                pull: Ok(Live {
+                    open: false,
+                    merged: true,
+                    head: MOVED.into(),
+                }),
+                want: Outcome::Refused(Refusal::Moved(MOVED.into())),
+                calls: &["pull"],
+                ..Moment::default()
+            },
+            Moment {
+                name: "closed and moved: closed is the reason",
+                pull: Ok(Live {
+                    open: false,
+                    merged: false,
+                    head: MOVED.into(),
+                }),
+                want: Outcome::Refused(Refusal::Closed),
+                calls: &["pull"],
+                ..Moment::default()
+            },
+            Moment {
+                name: "the pull request could not be read",
+                pull: Err("timed out after 45s".into()),
+                want: Outcome::Refused(Refusal::Unchecked("timed out after 45s".into())),
+                calls: &["pull"],
+                ..Moment::default()
+            },
+            Moment {
+                name: "the reviews could not be read",
+                reviews: Err("HTTP 502".into()),
+                want: Outcome::Refused(Refusal::Unchecked("HTTP 502".into())),
+                calls: &["pull", "reviews"],
+                ..Moment::default()
+            },
+            Moment {
+                name: "nobody knows who is asking",
+                viewer: "",
+                want: Outcome::Refused(Refusal::NoViewer),
+                calls: &[],
+                ..Moment::default()
+            },
+            Moment {
+                name: "GitHub declines the review",
+                post: Err("Unprocessable Entity (HTTP 422)".into()),
+                want: Outcome::Refused(Refusal::Rejected("Unprocessable Entity (HTTP 422)".into())),
+                ..Moment::default()
+            },
+        ]);
+    }
+
+    /// The viewer's own reviews since the draft was written: the same one
+    /// means it was already sent, any other means it must not be.
+    #[test]
+    fn the_viewers_own_reviews_since_the_draft_decide_it() {
+        let already = |at: &str| Outcome::AlreadySent(at.into());
+        let reviewed = Outcome::Refused(Refusal::ReviewedSince);
+        let read_only: &[&str] = &["pull", "reviews"];
+        live_through([
+            Moment {
+                name: "the same review, after the draft",
+                reviews: Ok(vec![review("octocat", AFTER)]),
+                want: already(AFTER),
+                calls: read_only,
+                ..Moment::default()
+            },
+            Moment {
+                name: "the same review, in the very second the draft was written",
+                reviews: Ok(vec![review("octocat", AT)]),
+                want: already(AT),
+                calls: read_only,
+                ..Moment::default()
+            },
+            Moment {
+                name: "the login in another case, the body with stray whitespace",
+                reviews: Ok(vec![Review {
+                    body: "Reads well.\n".into(),
+                    ..review("Octocat", AFTER)
+                }]),
+                want: already(AFTER),
+                calls: read_only,
+                ..Moment::default()
+            },
+            Moment {
+                name: "other words",
+                reviews: Ok(vec![Review {
+                    body: "Not yet.".into(),
+                    ..review("octocat", AFTER)
+                }]),
+                want: reviewed.clone(),
+                calls: read_only,
+                ..Moment::default()
+            },
+            Moment {
+                name: "another verdict",
+                reviews: Ok(vec![Review {
+                    state: "COMMENTED".into(),
+                    ..review("octocat", AFTER)
+                }]),
+                want: reviewed.clone(),
+                calls: read_only,
+                ..Moment::default()
+            },
+            Moment {
+                name: "an approval since dismissed",
+                reviews: Ok(vec![Review {
+                    state: "DISMISSED".into(),
+                    ..review("octocat", AFTER)
+                }]),
+                want: reviewed.clone(),
+                calls: read_only,
+                ..Moment::default()
+            },
+            Moment {
+                name: "another commit",
+                reviews: Ok(vec![Review {
+                    commit: MOVED.into(),
+                    ..review("octocat", AFTER)
+                }]),
+                want: reviewed,
+                calls: read_only,
+                ..Moment::default()
+            },
+            Moment {
+                name: "the same review among others",
+                reviews: Ok(vec![
+                    Review {
+                        body: "Not yet.".into(),
+                        ..review("octocat", AFTER)
+                    },
+                    review("hubot", AFTER),
+                    review("octocat", AFTER),
+                ]),
+                want: already(AFTER),
+                calls: read_only,
+                ..Moment::default()
+            },
+        ]);
+    }
+
+    /// Reviews that say nothing about this draft: it is sent as if they were
+    /// not there.
+    #[test]
+    fn reviews_that_are_older_pending_or_someone_elses_do_not_count() {
+        live_through([
+            Moment {
+                name: "the same review from before the draft is an older one",
+                reviews: Ok(vec![review("octocat", BEFORE)]),
+                ..Moment::default()
+            },
+            Moment {
+                name: "someone else's identical review is not the viewer's",
+                reviews: Ok(vec![review("hubot", AFTER)]),
+                ..Moment::default()
+            },
+            Moment {
+                name: "a pending review has not been submitted",
+                reviews: Ok(vec![Review {
+                    state: "PENDING".into(),
+                    submitted_at: None,
+                    ..review("octocat", AFTER)
+                }]),
+                ..Moment::default()
+            },
+        ]);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! clicks do to it.
 
 use ratatui::layout::Rect;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -24,15 +24,29 @@ pub enum Msg {
     Prs(Result<github::Fetched, String>),
     Worktrees(Result<Vec<Worktree>, String>),
     Statuses(Result<Vec<git::Scanned>, String>),
-    /// How the review in `App::posting` went.
-    Posted(Result<(), String>),
+    /// How the attempt in `App::posting` ended.
+    Posted(Result<drafts::Outcome, String>),
 }
 
-/// Sends one review: owner, repository, pull request number, request body.
-pub type Poster = Arc<dyn Fn(&str, &str, u64, &str) -> Result<(), String> + Send + Sync>;
+/// The remote an `App` starts with: none. Every call fails, so nothing is
+/// ever sent until `main` wires in `gh`.
+struct Unwired;
+
+impl drafts::Remote for Unwired {
+    fn pull(&self, _: u64) -> Result<drafts::Live, String> {
+        Err("GitHub is not wired up".into())
+    }
+    fn reviews(&self, _: u64) -> Result<Vec<drafts::Review>, String> {
+        Err("GitHub is not wired up".into())
+    }
+    fn post(&self, _: u64, _: &str) -> Result<(), String> {
+        Err("GitHub is not wired up".into())
+    }
+}
 
 /// A post waiting on its second `a`: which draft, the file as it read when
-/// the prompt went up, and what the prompt says would be sent. Once the
+/// the prompt went up, what the prompt says would be sent, and whether the
+/// list could vouch for the pull request's head at the time. Once the
 /// selected draft stops matching, the question on screen is no longer the one
 /// a keypress would be answering, and it is withdrawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +54,9 @@ pub struct Armed {
     pub number: u64,
     raw: String,
     pub what: String,
+    /// `Ready`, or `Unverified` for a pull request the last fetch did not
+    /// include. The prompt says which.
+    pub state: drafts::State,
 }
 
 /// Run `work` off the UI thread and always answer. A panic inside becomes an
@@ -101,9 +118,9 @@ pub enum DraftPr<'a> {
     Unknown,
 }
 
-impl DraftPr<'_> {
+impl<'a> DraftPr<'a> {
     /// The pull request's head commit, when the fetch carried one.
-    pub const fn head(&self) -> Option<&str> {
+    pub const fn head(&self) -> Option<&'a str> {
         match self {
             Self::Open(p) => Some(p.head_oid.as_str()),
             Self::Merged(m) => Some(m.head_oid.as_str()),
@@ -214,16 +231,16 @@ pub struct App {
     /// The pull request a review is being sent to right now, and the draft
     /// file it came from. One at a time.
     pub posting: Option<(u64, PathBuf)>,
-    /// Pull requests whose review went out but whose draft file could not be
-    /// marked posted. The file still says `drafted`; these are never offered
-    /// again this session.
-    unrecorded: HashSet<u64>,
+    /// Head commits GitHub reported at the moment of a post, for pull
+    /// requests whose draft turned out to be behind. Newer than the last
+    /// fetch, so it wins until the next fetch covers the pull request.
+    live_heads: HashMap<u64, String>,
     /// Why the last post failed, until the next keypress. Kept apart from
     /// `error`, which is the sync's and is cleared by the next good fetch.
     pub post_error: Option<String>,
-    /// How a review is sent. Inert until `main` wires in `gh`, so an `App`
-    /// built in a test cannot reach GitHub.
-    pub poster: Poster,
+    /// GitHub, as posting needs it. Inert until `main` wires in `gh`, so an
+    /// `App` built in a test cannot reach GitHub.
+    pub remote: Arc<dyn drafts::Remote>,
     /// A draft file the user asked to edit. The event loop owns the terminal,
     /// so it is the one to run the editor.
     pub edit_request: Option<PathBuf>,
@@ -269,9 +286,9 @@ impl App {
             drafts: Vec::new(),
             armed: None,
             posting: None,
-            unrecorded: HashSet::new(),
+            live_heads: HashMap::new(),
             post_error: None,
-            poster: Arc::new(|_, _, _, _| Err("posting is not wired up".into())),
+            remote: Arc::new(Unwired),
             edit_request: None,
             sort: Sort::Recent,
             rows: Vec::new(),
@@ -373,6 +390,11 @@ impl App {
                     .map(|(i, m)| (m.head_ref.clone(), i))
                     .collect();
                 self.merged = f.merged;
+                // What this fetch covers it knows better than an older read.
+                self.live_heads.retain(|n, _| {
+                    !self.prs.iter().any(|p| p.number == *n)
+                        && !self.merged.iter().any(|m| m.number == *n)
+                });
                 self.rebuild();
             }
             Msg::Prs(Err(e)) => {
@@ -446,29 +468,65 @@ impl App {
         }
     }
 
-    /// The review in `posting` came back. Only one that went out changes the
-    /// draft's file; a failure leaves it exactly as it was.
-    fn posted(&mut self, result: Result<(), String>) {
+    /// The attempt in `posting` came back. The draft's file changes only when
+    /// its review is on GitHub — sent just now, or found already there; every
+    /// refusal leaves it exactly as it was.
+    fn posted(&mut self, result: Result<drafts::Outcome, String>) {
+        use drafts::{Outcome, Refusal};
         let Some((number, path)) = self.posting.take() else {
             return;
         };
-        match result {
-            Ok(()) => {
-                let at = format_iso8601(now_secs());
-                let slug = self.repo.slug();
-                match drafts::set_status(&path, &slug, drafts::Status::Posted, Some(at)) {
-                    Ok(()) => self.note(format!("posted to #{number}")),
-                    // The review is on GitHub whatever the file says.
-                    Err(e) => {
-                        self.unrecorded.insert(number);
-                        self.post_error = Some(format!(
-                            "the review was posted to #{number}, but its draft file could not be updated: {e}"
-                        ));
-                    }
+        let slug = self.repo.slug();
+        let record =
+            |at: String| drafts::set_status(&path, &slug, drafts::Status::Posted, Some(at));
+        let failure = match result {
+            Ok(Outcome::Sent) => match record(format_iso8601(now_secs())) {
+                Ok(()) => {
+                    self.note(format!("posted to #{number}"));
+                    None
                 }
-            }
-            Err(e) => self.post_error = Some(format!("posting to #{number} failed: {e}")),
-        }
+                // The review is on GitHub whatever the file says. The next
+                // attempt will find it there and send nothing.
+                Err(e) => Some(format!(
+                    "the review was posted to #{number}, but its draft file could not be updated: {e}"
+                )),
+            },
+            Ok(Outcome::AlreadySent(at)) => match record(at) {
+                Ok(()) => {
+                    self.note(format!(
+                        "#{number} already has this review from you; marked posted, nothing sent"
+                    ));
+                    None
+                }
+                Err(e) => Some(format!(
+                    "#{number} already has this review from you, but its draft file could not be updated: {e}"
+                )),
+            },
+            Ok(Outcome::Refused(why)) => Some(match why {
+                Refusal::Closed => {
+                    format!("nothing posted: #{number} was closed without being merged")
+                }
+                Refusal::Moved(head) => {
+                    let short = head.get(..7).unwrap_or(&head).to_string();
+                    self.live_heads.insert(number, head);
+                    format!(
+                        "nothing posted: #{number} has moved on to {short} since this draft was written"
+                    )
+                }
+                Refusal::ReviewedSince => format!(
+                    "nothing posted: you have reviewed #{number} since this draft was written; x skips it, or review in the browser"
+                ),
+                Refusal::NoViewer => {
+                    "nothing posted: your GitHub login is not known yet; r refreshes".to_string()
+                }
+                Refusal::Unchecked(e) => {
+                    format!("nothing posted: could not check #{number} on GitHub: {e}")
+                }
+                Refusal::Rejected(e) => format!("posting to #{number} failed: {e}"),
+            }),
+            Err(e) => Some(format!("posting to #{number} failed: {e}")),
+        };
+        self.post_error = failure;
         self.reload_drafts();
     }
 
@@ -587,8 +645,18 @@ impl App {
             .map_or(DraftPr::Unknown, DraftPr::Merged)
     }
 
+    /// The pull request's head commit as far as rigor knows: what GitHub said
+    /// at the last attempt to post, else what the last fetch carried.
+    pub fn draft_head(&self, entry: &drafts::Entry) -> Option<&str> {
+        entry
+            .number
+            .and_then(|n| self.live_heads.get(&n))
+            .map(String::as_str)
+            .or_else(|| self.draft_pr(entry).head())
+    }
+
     pub fn draft_state(&self, entry: &drafts::Entry) -> drafts::State {
-        drafts::state(&entry.draft, self.draft_pr(entry).head())
+        drafts::state(&entry.draft, self.draft_head(entry))
     }
 
     /// Drafts still waiting on a decision: neither posted nor skipped.
@@ -612,26 +680,28 @@ impl App {
 
     /// `a`. Posting is public and under the user's name, so one keypress only
     /// asks: the first `a` puts up a prompt naming what would be sent, and
-    /// only a second `a` on the same, unchanged draft sends it. `armed` is
-    /// the prompt that was up when this key arrived, if there was one.
+    /// only a second `a` on the same, unchanged draft goes ahead — and then
+    /// only if GitHub, asked there and then, still agrees (`drafts::deliver`).
+    /// `armed` is the prompt that was up when this key arrived, if any.
     pub fn post_key(&mut self, armed: Option<&Armed>) {
+        use drafts::State;
         let Some(entry) = self.selected_draft().cloned() else {
             return;
         };
         let label = entry.label();
         let state = self.draft_state(&entry);
-        let (Some(number), Ok(draft), drafts::State::Ready) = (entry.number, &entry.draft, state)
+        // An unverified draft may be asked about too: the list cannot vouch
+        // for its pull request's head, but the check before sending can.
+        let (Some(number), Ok(draft), State::Ready | State::Unverified) =
+            (entry.number, &entry.draft, state)
         else {
             let why = match state {
-                drafts::State::Posted => "is already posted",
-                drafts::State::Skipped => "is skipped; x brings it back",
-                drafts::State::Stale => {
+                State::Posted => "is already posted",
+                State::Skipped => "is skipped; x brings it back",
+                State::Stale => {
                     "is stale: the pull request has moved on since this draft was written"
                 }
-                drafts::State::Unverified => {
-                    "is unverified: its pull request was not fetched, so its head is not known"
-                }
-                drafts::State::Invalid | drafts::State::Ready => {
+                State::Invalid | State::Ready | State::Unverified => {
                     "is invalid and cannot be posted; e opens it in your editor"
                 }
             };
@@ -642,16 +712,11 @@ impl App {
             self.note("a review is already being posted");
             return;
         }
-        if self.unrecorded.contains(&number) {
-            self.note(format!(
-                "#{number} was posted this session; its draft file could not be updated"
-            ));
-            return;
-        }
         let ask = Armed {
             number,
             raw: entry.raw.clone(),
             what: draft.describe(),
+            state,
         };
         if armed != Some(&ask) {
             self.armed = Some(ask);
@@ -666,19 +731,12 @@ impl App {
             self.note(format!("{label} changed on disk; nothing was posted"));
             return;
         }
-        let body = match drafts::payload(draft) {
-            Ok(body) => body,
-            Err(e) => {
-                self.note(format!("could not build the review for {label}: {e}"));
-                return;
-            }
-        };
         self.posting = Some((number, entry.path.clone()));
-        self.note(format!("posting {} to {label}…", ask.what));
-        let (owner, name) = (self.repo.owner.clone(), self.repo.name.clone());
-        let post = Arc::clone(&self.poster);
+        self.note(format!("checking {label} on GitHub, then posting…"));
+        let (remote, viewer, draft) =
+            (Arc::clone(&self.remote), self.viewer.clone(), draft.clone());
         spawn_reply(self.tx.clone(), Msg::Posted, move || {
-            post(&owner, &name, number, &body)
+            Ok(drafts::deliver(remote.as_ref(), &viewer, number, &draft))
         });
     }
 
@@ -838,7 +896,7 @@ impl App {
             let still = self.selected_draft().is_some_and(|e| {
                 e.number == Some(armed.number)
                     && e.raw == armed.raw
-                    && self.draft_state(e) == drafts::State::Ready
+                    && self.draft_state(e) == armed.state
             });
             if !still {
                 self.armed = None;

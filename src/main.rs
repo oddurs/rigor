@@ -134,8 +134,9 @@ fn main() -> Result<()> {
     };
     let (mut a, rx) = App::new(repo, settings, theme);
     a.drafts_dir = drafts::dir(|key| std::env::var_os(key));
-    a.poster = std::sync::Arc::new(|owner: &str, name: &str, number: u64, body: &str| {
-        github::post_review(owner, name, number, body).map_err(|e| format!("{e:#}"))
+    a.remote = std::sync::Arc::new(github::Gh {
+        owner: a.repo.owner.clone(),
+        name: a.repo.name.clone(),
     });
     let result = run(&mut term, &mut a, &rx);
     restore(&mut term, mouse);

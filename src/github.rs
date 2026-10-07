@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::time::Duration;
 
+use crate::drafts;
 use crate::proc::{self, Priority};
 
 use crate::model::{Check, CheckState, Mergeable, MergedPr, Pr, ReviewDecision};
@@ -129,20 +130,158 @@ pub fn fetch_prs(owner: &str, name: &str, max: usize) -> Result<Fetched> {
     })
 }
 
-/// Post one review to a pull request: the only call rigor makes that changes
-/// anything on GitHub. `body` is the request's JSON, from `drafts::payload`.
-pub fn post_review(owner: &str, name: &str, number: u64, body: &str) -> Result<()> {
-    let mut cmd = Command::new("gh");
-    cmd.args(["api", "--method", "POST"])
-        .arg(format!("repos/{owner}/{name}/pulls/{number}/reviews"))
-        .args(["--input", "-"]);
-    let out = proc::run_with_input(&mut cmd, body.as_bytes(), gh_timeout(), Priority::Normal)
-        .context("gh api")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        bail!("gh api failed: {}", err.trim());
+/// GitHub's REST API through `gh`, for one repository: what posting a review
+/// draft needs, and nothing else.
+pub struct Gh {
+    pub owner: String,
+    pub name: String,
+}
+
+/// Reviews are read a page at a time, and all of them: the one that matters
+/// may be on the last page.
+const REVIEWS_PER_PAGE: usize = 100;
+/// More reviews than this on one pull request and the check is abandoned
+/// rather than made on part of the list.
+const MAX_REVIEW_PAGES: usize = 30;
+
+impl Gh {
+    fn pulls(&self, number: u64) -> String {
+        format!("repos/{}/{}/pulls/{number}", self.owner, self.name)
     }
-    Ok(())
+}
+
+impl drafts::Remote for Gh {
+    fn pull(&self, number: u64) -> Result<drafts::Live, String> {
+        get(&self.pulls(number))
+            .and_then(|v| parse_live(&v))
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn reviews(&self, number: u64) -> Result<Vec<drafts::Review>, String> {
+        let mut all = Vec::new();
+        for page in 1..=MAX_REVIEW_PAGES {
+            let path = format!(
+                "{}/reviews?per_page={REVIEWS_PER_PAGE}&page={page}",
+                self.pulls(number)
+            );
+            let mut batch = get(&path)
+                .and_then(|v| parse_reviews(&v))
+                .map_err(|e| format!("{e:#}"))?;
+            let last = batch.len() < REVIEWS_PER_PAGE;
+            all.append(&mut batch);
+            if last {
+                return Ok(all);
+            }
+        }
+        Err(format!(
+            "more than {} reviews; not all of them were read",
+            REVIEWS_PER_PAGE * MAX_REVIEW_PAGES
+        ))
+    }
+
+    /// The only call rigor makes that changes anything on GitHub. `body` is
+    /// the request's JSON, from `drafts::payload`.
+    fn post(&self, number: u64, body: &str) -> Result<(), String> {
+        let mut cmd = Command::new("gh");
+        cmd.args(["api", "--method", "POST"])
+            .arg(format!("{}/reviews", self.pulls(number)))
+            .args(["--input", "-"]);
+        let out = proc::run_with_input(&mut cmd, body.as_bytes(), gh_timeout(), Priority::Normal)
+            .map_err(|e| format!("gh api: {e:#}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(api_error(&out))
+        }
+    }
+}
+
+/// One REST read.
+fn get(path: &str) -> Result<Value> {
+    let out = proc::run(
+        Command::new("gh").args(["api", path]),
+        gh_timeout(),
+        Priority::Normal,
+    )
+    .context("gh api")?;
+    if !out.status.success() {
+        bail!("{}", api_error(&out));
+    }
+    serde_json::from_slice(&out.stdout).context("parsing gh JSON response")
+}
+
+/// Why a REST call failed, in GitHub's own words where it gave any. On an
+/// HTTP error `gh` prints the response body on stdout and a one-line summary,
+/// with the status, on stderr; the body is where GitHub says what it actually
+/// objected to.
+fn api_error(out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = stderr.trim();
+    let body: Option<Value> = serde_json::from_slice(&out.stdout).ok();
+    let Some(message) = body
+        .as_ref()
+        .and_then(|b| b.get("message"))
+        .and_then(Value::as_str)
+    else {
+        return if stderr.is_empty() {
+            format!("gh api failed ({})", out.status)
+        } else {
+            stderr.to_string()
+        };
+    };
+    // Each error is a sentence, or an object carrying one.
+    let details: Vec<&str> = body
+        .as_ref()
+        .and_then(|b| b.get("errors"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.as_str().or_else(|| e.get("message")?.as_str()))
+        .collect();
+    let status = stderr
+        .find("(HTTP ")
+        .and_then(|at| stderr[at..].split_inclusive(')').next())
+        .map(|s| format!(" {s}"))
+        .unwrap_or_default();
+    if details.is_empty() {
+        format!("{message}{status}")
+    } else {
+        format!("{message}: {}{status}", details.join("; "))
+    }
+}
+
+fn parse_live(v: &Value) -> Result<drafts::Live> {
+    let head = v
+        .pointer("/head/sha")
+        .and_then(Value::as_str)
+        .filter(|sha| !sha.is_empty())
+        .context("the pull request has no head commit")?;
+    let state = v
+        .get("state")
+        .and_then(Value::as_str)
+        .context("the pull request has no state")?;
+    Ok(drafts::Live {
+        open: state == "open",
+        merged: v.get("merged").and_then(Value::as_bool).unwrap_or(false),
+        head: head.to_string(),
+    })
+}
+
+fn parse_reviews(v: &Value) -> Result<Vec<drafts::Review>> {
+    let list = v.as_array().context("the reviews were not a list")?;
+    Ok(list
+        .iter()
+        .map(|r| drafts::Review {
+            author: str_at(r, &["user", "login"]).unwrap_or_default(),
+            state: string(r, "state"),
+            commit: string(r, "commit_id"),
+            body: string(r, "body"),
+            submitted_at: r
+                .get("submitted_at")
+                .and_then(Value::as_str)
+                .map(String::from),
+        })
+        .collect())
 }
 
 /// One page of the GraphQL response, parsed. Pure, so it is tested against a
@@ -510,6 +649,115 @@ mod tests {
         let v =
             serde_json::json!({ "data": { "viewer": { "login": "octocat" }, "repository": null } });
         assert!(parse_page(&v).is_err());
+    }
+
+    #[cfg(unix)]
+    fn failed(stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// A refusal is shown in GitHub's words, not just `gh`'s one-line summary:
+    /// the body is where it says what it objected to.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_call_is_reported_in_githubs_own_words() {
+        let cases = [
+            (
+                r#"{"message":"Unprocessable Entity","errors":["Can not approve your own pull request"],"status":"422"}"#,
+                "gh: Unprocessable Entity (HTTP 422)",
+                "Unprocessable Entity: Can not approve your own pull request (HTTP 422)",
+            ),
+            (
+                r#"{"message":"Validation Failed","errors":[{"resource":"PullRequestReviewComment","field":"line","message":"line must be part of the diff"},{"message":"path is missing"}]}"#,
+                "gh: Validation Failed (HTTP 422)",
+                "Validation Failed: line must be part of the diff; path is missing (HTTP 422)",
+            ),
+            (
+                r#"{"message":"Not Found","status":"404"}"#,
+                "gh: Not Found (HTTP 404)",
+                "Not Found (HTTP 404)",
+            ),
+            // No body to read: whatever gh said is all there is.
+            (
+                "",
+                "error connecting to api.github.com",
+                "error connecting to api.github.com",
+            ),
+            ("<html>502</html>", "gh: HTTP 502", "gh: HTTP 502"),
+        ];
+        for (stdout, stderr, want) in cases {
+            assert_eq!(api_error(&failed(stdout, stderr)), want);
+        }
+        assert!(api_error(&failed("", "")).starts_with("gh api failed"));
+    }
+
+    #[test]
+    fn reads_a_pull_requests_live_state() {
+        let live = |v: Value| parse_live(&v);
+        let open = live(serde_json::json!({
+            "state": "open", "merged": false, "head": { "sha": "1a2b3c4d" }
+        }))
+        .unwrap();
+        assert_eq!(
+            (open.open, open.merged, open.head.as_str()),
+            (true, false, "1a2b3c4d")
+        );
+
+        let merged = live(serde_json::json!({
+            "state": "closed", "merged": true, "head": { "sha": "1a2b3c4d" }
+        }))
+        .unwrap();
+        assert!(!merged.open && merged.merged);
+
+        let closed = live(serde_json::json!({
+            "state": "closed", "merged": false, "head": { "sha": "1a2b3c4d" }
+        }))
+        .unwrap();
+        assert!(!closed.open && !closed.merged);
+
+        // An answer that does not say where the pull request is, or whether it
+        // is open, is not one to post on.
+        assert!(live(serde_json::json!({ "state": "open", "head": {} })).is_err());
+        assert!(live(serde_json::json!({ "state": "open", "head": { "sha": "" } })).is_err());
+        assert!(live(serde_json::json!({ "head": { "sha": "1a2b3c4d" } })).is_err());
+    }
+
+    #[test]
+    fn reads_reviews_including_a_pending_one() {
+        let got = parse_reviews(&serde_json::json!([
+            { "user": { "login": "octocat" }, "state": "APPROVED", "commit_id": "1a2b3c4d",
+              "body": "Reads well.", "submitted_at": "2027-01-15T09:30:00Z" },
+            { "user": { "login": "octocat" }, "state": "PENDING", "commit_id": "1a2b3c4d",
+              "body": "" },
+            { "user": null, "state": "COMMENTED", "commit_id": null, "body": null,
+              "submitted_at": "2027-01-15T09:31:00Z" }
+        ]))
+        .unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(
+            (
+                got[0].author.as_str(),
+                got[0].state.as_str(),
+                got[0].commit.as_str()
+            ),
+            ("octocat", "APPROVED", "1a2b3c4d")
+        );
+        assert_eq!(got[0].submitted_at.as_deref(), Some("2027-01-15T09:30:00Z"));
+        assert_eq!(got[1].submitted_at, None, "a pending review has no time");
+        assert_eq!(
+            got[2].author, "",
+            "a deleted account is nobody, not the viewer"
+        );
+
+        assert!(
+            parse_reviews(&serde_json::json!({ "message": "Not Found" })).is_err(),
+            "anything but a list is not an empty list"
+        );
     }
 
     /// The contract with the real API: the query still parses against GitHub

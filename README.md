@@ -106,7 +106,7 @@ inline comments ride along — or the one word for why it cannot be sent:
 | State | Meaning |
 |---|---|
 | `stale` | The pull request has moved on from the commit the draft was written against |
-| `unverified` | The pull request is not among those `rigor` fetched, so its head is not known |
+| `unverified` | The pull request is not among those `rigor` fetched, so its head is not known until you post, when GitHub is asked |
 | `invalid` | The file is not a draft `rigor` understands; the detail pane says why |
 | `✓ posted`, `skipped` | Already decided |
 
@@ -122,26 +122,47 @@ link, or anything else under a draft's name, is listed as `invalid`.
 
 ### Posting a draft
 
-Posting is public and under your name, so it takes two keypresses. The first
-`a` only asks, naming what would be sent in the footer:
+Posting is public and under your name, so it takes two keypresses, and the
+second asks GitHub before it sends anything. The first `a` only asks, naming
+what would be sent in the footer:
 
 ```
 post approve to #101? a again to confirm, esc to cancel
 ```
 
-A second `a` on the same row sends it. Any other key, a click, or a refresh
+A second `a` on the same row goes ahead. Any other key, a click, or a refresh
 that changes the row withdraws the question.
 
-- A draft is posted only while the pull request is still at the commit the
-  draft was written against, as of the last refresh. `stale`, `unverified`,
-  `invalid`, skipped and already posted drafts cannot be posted; `a` says why.
-- What goes out is the verdict, the body and the inline comments, pinned to
-  that commit, in one `gh api` call. `note` and `picked` never leave your
-  machine.
-- Once GitHub accepts it, the file's `status` becomes `posted` and `posted_at`
-  is set. Those are the only two fields `rigor` ever writes, and it replaces
-  the file in one step rather than writing over it. If `gh` reports a failure,
-  the file is left exactly as it was.
+Going ahead is two reads, then at most one write:
+
+1. **The pull request, as it is right now.** One closed without being merged
+   takes no review. One that has moved on from the commit the draft was
+   written against takes none either, and its row turns `stale`. A merged one
+   still at that commit is fine.
+2. **Its reviews.** If you have already submitted this same review since the
+   draft was written — the same verdict, on the same commit, with the same
+   body — then it was sent: a post that timed out, or that you quit in the
+   middle of, landed after all. The draft is marked `posted` and nothing goes
+   out. If you have submitted a different review since, nothing goes out and
+   the draft stays as it is: skip it, or review in the browser. No key sends
+   it anyway. (Inline comments are not part of the comparison.)
+3. **Only then, the review**: the verdict, the body and the inline comments,
+   pinned to that commit, in one `gh api` call. `note` and `picked` never
+   leave your machine.
+
+If either read fails, nothing is sent. The list only decides what is offered:
+the window in which a pull request can move under a draft is the moment
+between those reads and the write, not the refresh interval. That is also why
+an `unverified` draft can be posted — the prompt says the list has not seen
+its pull request, and the first read checks it. `stale`, `invalid`, skipped
+and already posted drafts are never offered; `a` says why.
+
+Once GitHub accepts the review, the file's `status` becomes `posted` and
+`posted_at` is set. Those are the only two fields `rigor` ever writes, and it
+replaces the file in one step rather than writing over it. If GitHub declines
+the review — an approval it will not take, a comment on a line outside the
+diff — the footer shows GitHub's own message and the file is left exactly as
+it was. Edit the draft and it can be sent.
 
 `e` opens the draft's file in `$VISUAL`, else `$EDITOR`, else `vi`, and reads
 it again when the editor exits. `x` skips a draft, or brings a skipped one

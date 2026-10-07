@@ -442,13 +442,20 @@ fn draw_body(f: &mut Frame<'_>, split: BodySplit, app: &mut App) {
 fn footer_alert(app: &App) -> Option<Line<'static>> {
     let t = app.theme;
     if let Some(armed) = &app.armed {
+        // The list has not seen an unverified draft's pull request, and the
+        // prompt must not read as if it had.
+        let caveat = if armed.state == drafts::State::Unverified {
+            " not fetched here, so GitHub is asked for its head first."
+        } else {
+            ""
+        };
         return Some(Line::from(vec![
             Span::styled(
                 format!(" post {} to #{}?", armed.what, armed.number),
                 Style::new().fg(t.pending).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                " a again to confirm, esc to cancel",
+                format!("{caveat} a again to confirm, esc to cancel"),
                 Style::new().fg(t.muted),
             ),
         ]));
@@ -523,7 +530,7 @@ fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut left: Vec<Vec<Span<'_>>> = vec![key(&view_keys, "view")];
     if let Some(entry) = app.selected_draft() {
         let state = app.draft_state(entry);
-        if state == drafts::State::Ready {
+        if matches!(state, drafts::State::Ready | drafts::State::Unverified) {
             left.push(key("a", "post"));
         }
         left.push(key("e", "edit"));
