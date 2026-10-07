@@ -135,6 +135,38 @@ pub fn right(s: &str, n: usize) -> String {
     format!("{}{t}", " ".repeat(n.saturating_sub(width(&t))))
 }
 
+/// Break `text` into lines of at most `max` columns, at spaces where it can.
+/// The detail pane clips rather than wraps, so prose is wrapped before it gets
+/// there. A line that already fits is kept as written, indentation and all.
+pub fn wrap(text: &str, max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in text.lines() {
+        let para = para.trim_end().replace('\t', "  ");
+        if width(&para) <= max {
+            out.push(para);
+            continue;
+        }
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            if !line.is_empty() && width(&line) + 1 + width(word) > max {
+                out.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            // A word longer than a whole line is cut wherever the line ends.
+            for ch in word.chars() {
+                if !line.is_empty() && width(&line) + width(ch.encode_utf8(&mut [0; 4])) > max {
+                    out.push(std::mem::take(&mut line));
+                }
+                line.push(ch);
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +202,17 @@ mod tests {
         fn pad_and_right_fill_exactly(s in text(), n in 0usize..40) {
             prop_assert_eq!(width(&pad(&s, n)), n);
             prop_assert_eq!(width(&right(&s, n)), n);
+        }
+
+        /// Wrapped prose never runs past the pane, and loses no words.
+        #[test]
+        fn wrap_fits_every_line_and_keeps_every_word(s in text(), n in 2usize..40) {
+            let lines = wrap(&s, n);
+            for l in &lines {
+                prop_assert!(width(l) <= n, "{:?} -> {:?}", s, lines);
+            }
+            let squash = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+            prop_assert_eq!(squash(&lines.join(" ")), squash(&s));
         }
 
         /// Timestamps from GitHub round-trip through the hand-written civil

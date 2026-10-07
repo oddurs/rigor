@@ -7,10 +7,13 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, Desk, WtState};
+use crate::app::{App, Desk, DraftPr, WtState};
+use crate::drafts::{Draft, Entry, State, Status, Verdict};
 use crate::model::{CheckState, Mergeable, Pr, Worktree};
 use crate::theme::Theme;
-use crate::util::{cell, cols, dur_short, now_secs, pad, rel_time, right, truncate};
+use crate::util::{
+    cell, cols, dur_short, now_secs, pad, parse_iso8601, rel_time, right, truncate, wrap,
+};
 
 pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     if area.width < 4 || area.height < 2 {
@@ -23,8 +26,21 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let mut check_lines: Vec<(usize, usize)> = Vec::new();
     let mut lines: Vec<Line<'_>> = Vec::new();
 
-    match (app.selected_pr(), app.selected_worktree()) {
-        (Some(pr), wt) => pr_detail(
+    match (
+        app.selected_draft(),
+        app.selected_pr(),
+        app.selected_worktree(),
+    ) {
+        (Some(entry), _, _) => draft_detail(
+            &mut lines,
+            entry,
+            app.draft_state(entry),
+            app.draft_pr(entry),
+            now,
+            &t,
+            area.width as usize,
+        ),
+        (None, Some(pr), wt) => pr_detail(
             &mut lines,
             &mut check_lines,
             pr,
@@ -33,7 +49,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
             &t,
             area.width as usize,
         ),
-        (None, Some(wt)) => wt_detail(
+        (None, None, Some(wt)) => wt_detail(
             &mut lines,
             &app.desk(wt),
             app.settings.worktree_status,
@@ -42,7 +58,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
             &t,
         ),
         // The list pane already explains an empty view; saying it twice is noise.
-        (None, None) => {}
+        (None, None, None) => {}
     }
 
     let max_scroll = cols(lines.len().saturating_sub(usize::from(area.height)));
@@ -471,6 +487,183 @@ fn cleanup(lines: &mut Vec<Line<'static>>, desk: &Desk<'_>, home: Option<&str>, 
         }
         _ => {}
     }
+}
+
+/// A review draft: the pull request it is for, then everything the draft
+/// says, in the order a reader decides in — why this one, the verdict, the
+/// words — and last whether it still matches the commit it was written for.
+fn draft_detail(
+    lines: &mut Vec<Line<'static>>,
+    entry: &Entry,
+    state: State,
+    pr: DraftPr<'_>,
+    now: i64,
+    t: &Theme,
+    width: usize,
+) {
+    let muted = Style::new().fg(t.muted);
+    match pr {
+        DraftPr::Open(p) => pr_header(lines, p, now, t, width),
+        DraftPr::Merged(m) => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" #{} ", m.number),
+                    Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    truncate(&m.title, width.saturating_sub(10)),
+                    Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!(" merged {} ago", rel_time(m.merged_at, now)),
+                muted,
+            )));
+        }
+        DraftPr::Unknown => {
+            lines.push(Line::from(Span::styled(
+                format!(" {}", entry.label()),
+                Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                " not among the fetched pull requests",
+                muted,
+            )));
+        }
+    }
+
+    let text_w = width.saturating_sub(VALUE_COL + 1).max(10);
+    let d = match &entry.draft {
+        Ok(d) => d,
+        Err(why) => {
+            prose(lines, "invalid", why, Style::new().fg(t.failure), t, text_w);
+            prose(
+                lines,
+                "file",
+                &entry.path.to_string_lossy(),
+                muted,
+                t,
+                text_w,
+            );
+            return;
+        }
+    };
+
+    prose(lines, "picked", &d.picked, Style::new().fg(t.fg), t, text_w);
+    lines.push(verdict_line(d, now, t));
+    prose(lines, "body", &d.body, Style::new().fg(t.fg), t, text_w);
+    for c in &d.comments {
+        lines.push(Line::from(vec![
+            field("comment", t),
+            Span::styled(
+                truncate(&format!("{}:{}", c.path, c.line), text_w),
+                Style::new().fg(t.pending),
+            ),
+        ]));
+        for l in wrap(&c.body, text_w) {
+            lines.push(Line::from(vec![
+                field("", t),
+                Span::styled(l, Style::new().fg(t.fg)),
+            ]));
+        }
+    }
+    // Labeled on a line of its own, so the note can never be read as part
+    // of what goes out.
+    let note = wrap(&d.note, text_w);
+    lines.push(Line::from(vec![
+        field("note", t),
+        Span::styled(
+            if note.is_empty() {
+                "none"
+            } else {
+                "private · never posted"
+            },
+            muted,
+        ),
+    ]));
+    for l in note {
+        lines.push(Line::from(vec![field("", t), Span::styled(l, muted)]));
+    }
+    lines.push(head_line(d, state, pr, t));
+}
+
+/// A labeled block of prose, wrapped to the pane. An empty one says `none`
+/// rather than leaving the label hanging.
+fn prose(
+    lines: &mut Vec<Line<'static>>,
+    label: &'static str,
+    text: &str,
+    style: Style,
+    t: &Theme,
+    width: usize,
+) {
+    let wrapped = wrap(text, width);
+    if wrapped.is_empty() {
+        lines.push(Line::from(vec![
+            field(label, t),
+            Span::styled("none", Style::new().fg(t.muted)),
+        ]));
+        return;
+    }
+    for (i, l) in wrapped.into_iter().enumerate() {
+        lines.push(Line::from(vec![
+            field(if i == 0 { label } else { "" }, t),
+            Span::styled(l, style),
+        ]));
+    }
+}
+
+/// The verdict, and what became of the draft once it was decided.
+fn verdict_line(d: &Draft, now: i64, t: &Theme) -> Line<'static> {
+    let color = match d.verdict {
+        Verdict::Approve => t.success,
+        Verdict::Comment => t.fg,
+    };
+    let mut spans = vec![
+        field("verdict", t),
+        Span::styled(d.verdict.label(), Style::new().fg(color)),
+    ];
+    let outcome = match d.status {
+        Status::Drafted => None,
+        Status::Skipped => Some("skipped".to_string()),
+        Status::Posted => Some(d.posted_at.as_deref().and_then(parse_iso8601).map_or_else(
+            || "posted".to_string(),
+            |at| format!("posted {} ago", rel_time(at, now)),
+        )),
+    };
+    if let Some(outcome) = outcome {
+        spans.push(Span::styled(
+            format!("  · {outcome}"),
+            Style::new().fg(t.muted),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The commit the draft was written against, and whether the pull request is
+/// still there. This is the row that explains `stale` and `unverified`.
+fn head_line(d: &Draft, state: State, pr: DraftPr<'_>, t: &Theme) -> Line<'static> {
+    let sha = super::list::short_sha(&d.head_sha).to_string();
+    let current = pr.head().filter(|h| !h.is_empty());
+    let (text, color) = match current {
+        Some(h) if h.eq_ignore_ascii_case(&d.head_sha) => {
+            ("matches the pull request".to_string(), t.success)
+        }
+        Some(h) => (
+            format!("the pull request is now at {}", super::list::short_sha(h)),
+            if state == State::Stale {
+                t.warn
+            } else {
+                t.muted
+            },
+        ),
+        None => ("the pull request's head is not known".to_string(), t.muted),
+    };
+    Line::from(vec![
+        field("head", t),
+        Span::styled(format!("{sha}  "), Style::new().fg(t.fg)),
+        Span::styled(text, Style::new().fg(color)),
+    ])
 }
 
 /// The worktree's path as one shell word. `~`-shortened when it needs no

@@ -1,4 +1,5 @@
-//! The scrolling list: one line per PR (or per worktree in the worktree view).
+//! The scrolling list: one line per PR (or per worktree in the worktree view,
+//! or per review draft in the drafts view).
 //! Columns drop out as the terminal narrows rather than wrapping.
 
 use ratatui::Frame;
@@ -7,8 +8,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, Desk, Row, WtState};
+use crate::app::{App, Desk, DraftPr, Row, WtState};
 use crate::config::View;
+use crate::drafts::{Entry, State, Verdict};
 use crate::model::{CheckState, Mergeable, Pr, Worktree};
 use crate::theme::Theme;
 use crate::util::{cell, cols, now_secs, pad, rel_time, right, truncate};
@@ -74,6 +76,16 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
                 pr_line(pr, app.worktree_for(pr), selected, &ctx)
             }
             Row::Wt(wi) => wt_line(&app.desk(&app.worktrees[wi]), selected, &ctx),
+            Row::Draft(di) => {
+                let entry = &app.drafts[di];
+                draft_line(
+                    entry,
+                    app.draft_state(entry),
+                    app.draft_pr(entry),
+                    selected,
+                    &ctx,
+                )
+            }
         };
         lines.push(line);
     }
@@ -314,6 +326,115 @@ fn wt_line(desk: &Desk<'_>, selected: bool, ctx: &RowCtx<'_>) -> Line<'static> {
     }
 
     Line::from(spans).style(base)
+}
+
+/// `▎#4846  approve +1   Give the read path a retry budget     +220 −24   3m`
+///
+/// The state column is the point of the view: what posting would send, or why
+/// nothing can be sent. Title, size and age are the pull request's, from the
+/// same fetch as every other view.
+fn draft_line(
+    entry: &Entry,
+    state: State,
+    pr: DraftPr<'_>,
+    selected: bool,
+    ctx: &RowCtx<'_>,
+) -> Line<'static> {
+    let (t, width, now) = (ctx.theme, ctx.width, ctx.now);
+    let base = row_style(selected, t);
+    // A draft already decided, either way, recedes: what is left to do is
+    // what stays bright.
+    let decided = matches!(state, State::Posted | State::Skipped);
+    let quiet = dim(selected, t);
+
+    let (state_text, state_color) = draft_state_cell(entry, state, t);
+    let mut spans = vec![
+        Span::styled(if selected { "▎" } else { " " }, base.fg(t.accent)),
+        Span::styled(
+            pad(&entry.label(), 7),
+            base.fg(if decided || state == State::Invalid {
+                quiet
+            } else {
+                t.accent
+            }),
+        ),
+        Span::styled(
+            pad(&state_text, 13),
+            base.fg(if decided { quiet } else { state_color }),
+        ),
+    ];
+
+    let left = 1 + 7 + 13;
+    let show_size = width >= 92;
+    let show_age = width >= 62;
+    let right_w = (if show_size { 14 } else { 0 }) + (if show_age { 5 } else { 0 });
+    let title_w = width.saturating_sub(left + right_w).max(8);
+
+    let (title, title_color) = match pr {
+        DraftPr::Open(p) if p.is_draft => (format!("draft · {}", p.title), quiet),
+        DraftPr::Open(p) => (p.title.clone(), if decided { quiet } else { t.fg }),
+        DraftPr::Merged(m) => (format!("merged · {}", m.title), quiet),
+        DraftPr::Unknown => ("not among the fetched pull requests".to_string(), quiet),
+    };
+    let title_style = if selected {
+        base.fg(title_color).add_modifier(Modifier::BOLD)
+    } else {
+        base.fg(title_color)
+    };
+    spans.push(Span::styled(
+        pad(&truncate(&title, title_w.saturating_sub(1)), title_w),
+        title_style,
+    ));
+
+    if show_size {
+        // Only an open pull request carries its diff size.
+        let (plus, minus) = match pr {
+            DraftPr::Open(p) => (format!("+{}", p.additions), format!("−{}", p.deletions)),
+            DraftPr::Merged(_) | DraftPr::Unknown => (String::new(), String::new()),
+        };
+        let used = crate::util::width(&plus) + 1 + crate::util::width(&minus);
+        spans.push(Span::styled(" ".repeat(13usize.saturating_sub(used)), base));
+        spans.push(Span::styled(
+            plus,
+            base.fg(if decided { quiet } else { t.success }),
+        ));
+        spans.push(Span::styled(" ", base));
+        spans.push(Span::styled(
+            minus,
+            base.fg(if decided { quiet } else { t.failure }),
+        ));
+        spans.push(Span::styled(" ", base));
+    }
+    if show_age {
+        let age = pr
+            .touched_at()
+            .map(|ts| rel_time(ts, now))
+            .unwrap_or_default();
+        spans.push(Span::styled(format!("{} ", right(&age, 4)), base.fg(quiet)));
+    }
+
+    Line::from(spans).style(base)
+}
+
+/// The state column's text and color. A draft carrying inline comments takes
+/// the busy color: it will say more than a verdict, so it is the one to read
+/// before sending.
+fn draft_state_cell(entry: &Entry, state: State, t: &Theme) -> (String, Color) {
+    match (state, &entry.draft) {
+        (State::Ready, Ok(d)) => {
+            let color = match (d.comments.is_empty(), d.verdict) {
+                (false, _) => t.pending,
+                (true, Verdict::Approve) => t.success,
+                (true, Verdict::Comment) => t.fg,
+            };
+            (d.summary(), color)
+        }
+        (State::Posted, _) => ("✓ posted".into(), t.muted),
+        (State::Skipped, _) => ("skipped".into(), t.muted),
+        (State::Stale, _) => ("stale".into(), t.warn),
+        (State::Unverified, _) => ("unverified".into(), t.muted),
+        (State::Invalid | State::Ready, _) => ("invalid".into(), t.failure),
+    }
 }
 
 /// Seven characters, git's own short form — complete, so no ellipsis.

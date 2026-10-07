@@ -127,6 +127,9 @@ pub struct Pr {
     pub updated_at: i64,
     pub author: String,
     pub head_ref: String,
+    /// The commit the PR is at. A review draft is only ever posted against
+    /// the exact commit it was written for.
+    pub head_oid: String,
     pub base_ref: String,
     pub additions: u32,
     pub deletions: u32,
