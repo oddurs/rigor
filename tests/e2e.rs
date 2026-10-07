@@ -934,16 +934,15 @@ fn editing_a_draft_rereads_it_and_restores_the_screen() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "nonsense\n");
 
     // Back on the alternate screen with everything on it again, not only
-    // the cells that changed.
+    // the cells that changed. Waited for, not read at once: the row above can
+    // arrive before the rest of the same frame has.
+    t.wait("the whole screen to be redrawn", LOAD, |s| {
+        s.contains("acme/widget") && s.contains("Drafts 1") && s.contains("? help")
+    });
     let raw = t.raw();
     let count = |seq: &[u8]| raw.windows(seq.len()).filter(|w| *w == seq).count();
     assert_eq!(count(b"\x1b[?1049l"), 1, "left for the editor");
     assert_eq!(count(b"\x1b[?1049h"), 2, "and came back");
-    let text = t.text();
-    assert!(
-        text.contains("acme/widget") && text.contains("Drafts 1") && text.contains("? help"),
-        "{text}"
-    );
     // An invalid draft cannot be posted, and rigor is still listening.
     t.send(b"aa");
     t.wait_for("#101 is invalid", LOAD);
