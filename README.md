@@ -107,10 +107,15 @@ inline comments ride along — or the one word for why it cannot be sent:
 | `invalid` | The file is not a draft `rigor` understands; the detail pane says why |
 | `✓ posted`, `skipped` | Already decided |
 
-Selecting a draft shows all of it in the detail pane, with `note` marked as
-private. A count of drafts still awaiting a decision sits beside the sort order
-in every view. Every field is required and, as in the config file, an unknown
-key, value or `version` is an error, not silently ignored.
+Selecting a draft shows it in the detail pane, with `note` marked as private.
+A long draft does not fit: the pane scrolls with `J` / `K` and says when there
+is more below. A count of drafts still awaiting a decision sits beside the sort
+order in every view.
+
+Every field is required and, as in the config file, an unknown key, value or
+`version` is an error, not silently ignored. Timestamps are RFC 3339, with `Z`
+or a numeric offset. Only a regular file of at most 256 KB is read; a symbolic
+link, or anything else under a draft's name, is listed as `invalid`.
 
 ## Configuration
 

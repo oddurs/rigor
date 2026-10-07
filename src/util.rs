@@ -37,16 +37,80 @@ pub fn now_secs() -> i64 {
         .map_or(0, |d| secs(d.as_secs()))
 }
 
-/// Parse the exact shape GitHub returns: `2026-09-09T20:13:41Z`.
+/// Parse an RFC 3339 timestamp to epoch seconds: `2026-09-09T20:13:41Z` as
+/// GitHub writes it, or with fractional seconds, or with a numeric offset,
+/// which is applied. Anything else is not a timestamp — a date that does not
+/// exist, a time with no zone, text after the end. Nothing is read by taking
+/// the first nineteen characters and ignoring the rest.
 pub fn parse_iso8601(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
-    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+    // ASCII throughout, so every index below is a character boundary.
+    if bytes.len() < 20 || !text.is_ascii() {
         return None;
     }
-    let num = |from: usize, to: usize| -> Option<i64> { text.get(from..to)?.parse::<i64>().ok() };
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b't')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    // Digits only: `parse` alone would take a sign.
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let digits = &text[from..to];
+        digits
+            .bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| digits.parse::<i64>().ok())
+            .flatten()
+    };
     let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec)
+    // 60 is a leap second, which RFC 3339 allows.
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || sec > 60
+    {
+        return None;
+    }
+
+    let mut zone = &text[19..];
+    if let Some(fraction) = zone.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        zone = &fraction[digits..];
+    }
+    let offset = if matches!(zone, "Z" | "z") {
+        0
+    } else {
+        // `+hh:mm` or `-hh:mm`, and nothing after it.
+        let offset = zone.as_bytes();
+        if offset.len() != 6 || offset[3] != b':' {
+            return None;
+        }
+        let sign = match offset[0] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        let start = text.len() - 6;
+        let (hours, minutes) = (num(start + 1, start + 3)?, num(start + 4, start + 6)?);
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        sign * (hours * 3600 + minutes * 60)
+    };
+    Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec - offset)
+}
+
+const fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        4 | 6 | 9 | 11 => 30,
+        2 if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) => 29,
+        2 => 28,
+        _ => 31,
+    }
 }
 
 /// Days since 1970-01-01 (Howard Hinnant's civil-date algorithm).
@@ -177,6 +241,60 @@ mod tests {
     fn text() -> impl Strategy<Value = String> {
         proptest::string::string_regex("[a-zA-Z0-9 ._/#-]{0,12}[é漢字🙂\\u{301}]{0,4}[a-z ]{0,12}")
             .unwrap()
+    }
+
+    /// A timestamp is read whole or not at all. The old reading took the
+    /// first nineteen characters and ignored the rest, so an offset was
+    /// dropped and an impossible date was a number.
+    #[test]
+    fn timestamps_are_rfc_3339_or_nothing() {
+        let at = parse_iso8601("2027-01-15T08:00:00Z").unwrap();
+        assert_eq!(at, 1_800_000_000);
+        for same in [
+            "2027-01-15t08:00:00z",
+            "2027-01-15T08:00:00.000Z",
+            "2027-01-15T08:00:00.987654321Z",
+            "2027-01-15T10:00:00+02:00",
+            "2027-01-15T02:30:00-05:30",
+            "2027-01-15T08:00:00+00:00",
+            "2027-01-14T23:30:00.5-08:30",
+        ] {
+            assert_eq!(parse_iso8601(same), Some(at), "{same}");
+        }
+        assert_eq!(
+            parse_iso8601("2028-02-29T23:59:60Z"),
+            Some(parse_iso8601("2028-03-01T00:00:00Z").unwrap()),
+            "a leap second in a leap year"
+        );
+        for not in [
+            "",
+            "2027-01-15",
+            "2027-01-15T08:00:00",
+            "2027-01-15T08:00:00.Z",
+            "2027-01-15 08:00:00Z",
+            "2027-01-15T08:00:00Zjunk",
+            "2027-01-15T08:00:00+0200",
+            "2027-01-15T08:00:00+02:00Z",
+            "2027-01-15T08:00:00+00:+02:00",
+            "2027-01-15T08:00:00.5",
+            "2027-01-15T08:00:00 +02:00",
+            "2027-01-15T08:00:00+24:00",
+            "2027-01-15T08:00:00+02:60",
+            "2027-13-15T08:00:00Z",
+            "2027-00-15T08:00:00Z",
+            "2027-02-29T08:00:00Z",
+            "2027-04-31T08:00:00Z",
+            "2027-01-00T08:00:00Z",
+            "2027-01-15T24:00:00Z",
+            "2027-01-15T08:60:00Z",
+            "2027-01-15T08:00:61Z",
+            "+027-01-15T08:00:00Z",
+            "2027-01-15T+8:00:00Z",
+            "2027-01-15T08:00:00\u{ff3a}",
+            "yesterday at about eight",
+        ] {
+            assert_eq!(parse_iso8601(not), None, "{not:?}");
+        }
     }
 
     proptest! {

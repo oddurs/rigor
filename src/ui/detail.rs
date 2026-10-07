@@ -74,11 +74,25 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         }
     }
 
+    // A draft is read here before it is decided, so one that runs past the
+    // pane says so rather than just stopping.
+    let more = app.selected_draft().is_some() && scroll < max_scroll;
+
     let lines: Vec<Line<'_>> = lines
         .into_iter()
         .map(|l| super::clip(l, area.width as usize))
         .collect();
     f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
+
+    if more {
+        let text = " ↓ more below · J ";
+        let w = cols(crate::util::width(text)).min(area.width);
+        let corner = Rect::new(area.right() - w, area.bottom() - 1, w, 1);
+        f.render_widget(
+            Paragraph::new(Span::styled(text, Style::new().fg(t.pending))),
+            corner,
+        );
+    }
 }
 
 /// Where values begin: two columns of margin plus a ten-column label.

@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Deserializer};
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::util::parse_iso8601;
@@ -110,12 +111,12 @@ impl Draft {
             return Err("head_sha is not a 40-character commit id".into());
         }
         if parse_iso8601(&self.created_at).is_none() {
-            return Err("created_at is not a timestamp".into());
+            return Err("created_at is not an RFC 3339 timestamp".into());
         }
         if let Some(at) = &self.posted_at
             && parse_iso8601(at).is_none()
         {
-            return Err("posted_at is not a timestamp".into());
+            return Err("posted_at is not an RFC 3339 timestamp".into());
         }
         // GitHub rejects a comment review with nothing in it; an approval
         // needs no words.
@@ -214,15 +215,41 @@ impl Entry {
     }
 }
 
+/// Far more than any review needs. A file past this is not read.
+const MAX_BYTES: u64 = 256 * 1024;
+
+/// A draft's text, if the path is an ordinary file of ordinary size. Judged
+/// before it is opened: a link is not followed to wherever it points, and a
+/// pipe or a device left under a draft's name would never finish being read.
+fn read_text(path: &Path) -> Result<String, String> {
+    let unreadable = |e: std::io::Error| format!("could not be read: {e}");
+    let meta = std::fs::symlink_metadata(path).map_err(unreadable)?;
+    if meta.file_type().is_symlink() {
+        return Err("a symbolic link, not a regular file".into());
+    }
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    // Capped as it is read, not by the size it reported a moment ago.
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_BYTES + 1).read_to_string(&mut text))
+        .map_err(unreadable)?;
+    if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_BYTES {
+        return Err(format!("larger than {} KB", MAX_BYTES / 1024));
+    }
+    Ok(text)
+}
+
 fn read(path: PathBuf, slug: &str) -> Entry {
     let number = path
         .file_stem()
         .and_then(|s| s.to_str())
         .and_then(|s| s.parse::<u64>().ok());
-    let draft = match (std::fs::read_to_string(&path), number) {
+    let draft = match (read_text(&path), number) {
         (Ok(text), Some(n)) => parse(&text, slug, n),
         (Ok(_), None) => Err("the file is not named for a pull request number".into()),
-        (Err(e), _) => Err(format!("could not be read: {e}")),
+        (Err(why), _) => Err(why),
     };
     Entry {
         path,
@@ -274,7 +301,7 @@ pub mod tests {
             ],
             "note": "PRIVATE-NOTE",
             "picked": "PRIVATE-PICKED",
-            "created_at": "2027-01-15T09:00:00Z",
+            "created_at": "2027-01-15T07:00:00Z",
             "status": "drafted",
             "posted_at": null
         })
@@ -356,6 +383,11 @@ pub mod tests {
             Case {
                 name: "the repository's case does not matter",
                 text: with(|v| v["repo"] = json!("Acme/Widget")),
+                reason: None,
+            },
+            Case {
+                name: "a created_at with an offset is a time like any other",
+                text: with(|v| v["created_at"] = json!("2027-01-15T09:00:00.25+02:00")),
                 reason: None,
             },
         ]);
@@ -463,12 +495,27 @@ pub mod tests {
             Case {
                 name: "a created_at that is not a timestamp",
                 text: with(|v| v["created_at"] = json!("yesterday")),
-                reason: Some("created_at is not a timestamp"),
+                reason: Some("created_at is not an RFC 3339 timestamp"),
+            },
+            Case {
+                name: "a created_at with no zone could be any time",
+                text: with(|v| v["created_at"] = json!("2027-01-15T07:00:00")),
+                reason: Some("created_at is not an RFC 3339 timestamp"),
+            },
+            Case {
+                name: "a created_at with something after the zone",
+                text: with(|v| v["created_at"] = json!("2027-01-15T07:00:00Z+02:00")),
+                reason: Some("created_at is not an RFC 3339 timestamp"),
+            },
+            Case {
+                name: "a created_at on a day that does not exist",
+                text: with(|v| v["created_at"] = json!("2027-02-30T07:00:00Z")),
+                reason: Some("created_at is not an RFC 3339 timestamp"),
             },
             Case {
                 name: "a posted_at that is not a timestamp",
                 text: with(|v| v["posted_at"] = json!("soon")),
-                reason: Some("posted_at is not a timestamp"),
+                reason: Some("posted_at is not an RFC 3339 timestamp"),
             },
             Case {
                 name: "a comment review with nothing in it",
@@ -602,6 +649,41 @@ pub mod tests {
         let path = repo.join(name);
         std::fs::write(&path, text).unwrap();
         path
+    }
+
+    /// Only an ordinary file of ordinary size is ever opened. Anything else
+    /// under a draft's name is listed as invalid, with the reason, unread.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_regular_file_of_sane_size_is_read() {
+        let d = tempfile::tempdir().unwrap();
+        let real = write(d.path(), "101.json", &sample().to_string());
+        let repo = real.parent().unwrap().to_path_buf();
+
+        // A link to a perfectly good draft is still not the draft.
+        std::os::unix::fs::symlink(&real, repo.join("102.json")).unwrap();
+        std::fs::create_dir(repo.join("103.json")).unwrap();
+        // A pipe nobody writes to: opening it for reading would never return.
+        let fifo = std::ffi::CString::new(repo.join("104.json").to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo(2) reads a NUL-terminated path, which `fifo` is for
+        // as long as this call, and touches no other memory.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let padded = with(|v| {
+            v["number"] = json!(105);
+            v["body"] = json!("x".repeat(300 * 1024));
+        });
+        write(d.path(), "105.json", &padded);
+
+        let got = load(d.path(), "acme", "widget").unwrap();
+        let why = |n: u64| {
+            let entry = got.iter().find(|e| e.number == Some(n)).unwrap();
+            entry.draft.clone().err()
+        };
+        assert_eq!(why(101), None);
+        assert_eq!(why(102).unwrap(), "a symbolic link, not a regular file");
+        assert_eq!(why(103).unwrap(), "not a regular file");
+        assert_eq!(why(104).unwrap(), "not a regular file");
+        assert_eq!(why(105).unwrap(), "larger than 256 KB");
     }
 
     #[test]

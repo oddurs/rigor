@@ -18,7 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rigor understands. The detail pane shows the whole draft, with its private
   note marked as such. The view is off the tab bar by default, like `Assigned`:
   add `drafts` to `views`, or run `rigor -v drafts`. A count of drafts awaiting
-  a decision shows beside the sort order from every view.
+  a decision shows beside the sort order from every view. The cursor stays on
+  its draft, by file, as drafts come, go and re-sort; a draft longer than the
+  detail pane says there is more below. Only a regular file of at most 256 KB
+  is read, and a draft's timestamps must be RFC 3339.
 
 - `--print-config` lists the tab bar, and spells every value the way a config
   file does, so a line can be copied into one.

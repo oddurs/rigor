@@ -73,7 +73,9 @@ impl World {
             ],
             "note": "PRIVATE-NOTE",
             "picked": "PRIVATE-PICKED",
-            "created_at": "2027-01-15T09:00:00Z",
+            // Well in the past, whenever this runs: rigor here is on the real
+            // clock, and a draft is written before it is read.
+            "created_at": "2026-01-15T09:00:00Z",
             "status": "drafted",
             "posted_at": null
         });

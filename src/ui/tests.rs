@@ -1230,7 +1230,8 @@ fn drafts_app() -> (App, tempfile::TempDir) {
         4801,
         draft_json(4801, |v| {
             v["status"] = json!("posted");
-            v["posted_at"] = json!("2027-01-15T03:00:00Z");
+            // Half an hour after it was written, half an hour before now.
+            v["posted_at"] = json!("2027-01-15T07:30:00Z");
         }),
     );
     put(4701, draft_json(4701, |v| v["status"] = json!("skipped")));
@@ -1378,7 +1379,7 @@ fn the_draft_detail_shows_the_whole_draft() {
 
     select_draft(&mut a, 4801);
     let out = render(&mut a, 160, 30);
-    assert!(out.contains("verdict   approve  · posted 5h ago"), "{out}");
+    assert!(out.contains("verdict   approve  · posted 30m ago"), "{out}");
 }
 
 /// The rows that cannot be posted say why, in the detail pane.
@@ -1498,6 +1499,132 @@ fn drafts_are_reread_on_refresh() {
     assert!(draft_row(&mut a, 4801).contains(" invalid "));
 }
 
+/// A fresh app on the Drafts view of an empty drafts directory, and a way to
+/// drop a valid draft into it. None of these pull requests were fetched, so
+/// the rows keep the order of their numbers.
+fn bare_drafts() -> (App, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("acme").join("widget")).unwrap();
+    let mut a = sample_app();
+    a.settings.views.push(View::Drafts);
+    a.drafts_dir = Some(dir.path().to_path_buf());
+    a.set_view(View::Drafts);
+    (a, dir)
+}
+
+fn put_draft(dir: &tempfile::TempDir, number: u64) {
+    let path = dir.path().join(format!("acme/widget/{number}.json"));
+    std::fs::write(path, draft_json(number, |_| {})).unwrap();
+}
+
+fn cursor(a: &App) -> Option<u64> {
+    a.selected_draft().and_then(|e| e.number)
+}
+
+/// The cursor is on a draft, not on a position. Drafts arrive while rigor is
+/// open; if one sorting earlier could slide the highlight onto its neighbor,
+/// the next keypress would be about a draft nobody chose.
+#[test]
+fn the_cursor_stays_on_its_draft_when_the_list_changes_underneath() {
+    // Whether or not the cursor was ever moved by hand.
+    for touched in [false, true] {
+        let (mut a, dir) = bare_drafts();
+        put_draft(&dir, 100);
+        put_draft(&dir, 105);
+        a.reload_drafts();
+        assert_eq!(draft_numbers(&a), [100, 105]);
+        if touched {
+            a.select(0);
+        }
+        assert_eq!(cursor(&a), Some(100));
+        a.detail_scroll = 3;
+
+        put_draft(&dir, 90);
+        a.reload_drafts();
+        assert_eq!(draft_numbers(&a), [90, 100, 105]);
+        assert_eq!(cursor(&a), Some(100), "touched={touched}: the cursor slid");
+        assert_eq!(a.detail_scroll, 3, "and its detail pane kept its place");
+
+        // One going away above it moves the row, not the choice.
+        std::fs::remove_file(dir.path().join("acme/widget/90.json")).unwrap();
+        a.reload_drafts();
+        assert_eq!(cursor(&a), Some(100));
+
+        // Its own file going away leaves the cursor where it was in the list,
+        // on whatever is nearest, and at the top of that draft.
+        put_draft(&dir, 90);
+        a.reload_drafts();
+        std::fs::remove_file(dir.path().join("acme/widget/100.json")).unwrap();
+        a.reload_drafts();
+        assert_eq!(draft_numbers(&a), [90, 105]);
+        assert_eq!(cursor(&a), Some(105), "the nearest row, not the first");
+        assert_eq!(a.detail_scroll, 0);
+    }
+}
+
+/// A fetch re-sorts the list by how recently each pull request moved. The
+/// cursor goes with its draft there too.
+#[test]
+fn the_cursor_stays_on_its_draft_when_a_fetch_reorders_the_list() {
+    let (mut a, dir) = bare_drafts();
+    put_draft(&dir, 100);
+    put_draft(&dir, 105);
+    a.reload_drafts();
+    assert_eq!(cursor(&a), Some(100));
+
+    // #105 turns out to be an open pull request; #100 is still unknown, and
+    // sorts after it.
+    let mut seen = a.prs[0].clone();
+    seen.number = 105;
+    a.on_msg(crate::app::Msg::Prs(Ok(crate::github::Fetched {
+        budget: None,
+        viewer: "octocat".into(),
+        default_branch: "main".into(),
+        prs: vec![seen],
+        merged: vec![],
+    })));
+    assert_eq!(draft_numbers(&a), [105, 100]);
+    assert_eq!(cursor(&a), Some(100));
+}
+
+/// A draft longer than the pane says there is more of it, and a refresh in
+/// the background does not throw the reader back to its top.
+#[test]
+fn a_long_draft_says_there_is_more_below_and_keeps_its_place() {
+    let (mut a, dir) = drafts_app();
+    let long = draft_json(4846, |v| {
+        v["body"] = (1..=40)
+            .map(|i| format!("Paragraph {i} of the review."))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
+    });
+    std::fs::write(dir.path().join("acme/widget/4846.json"), long).unwrap();
+    a.reload_drafts();
+    select_draft(&mut a, 4846);
+
+    let out = render(&mut a, 160, 24);
+    assert!(out.contains("↓ more below · J"), "{out}");
+    assert!(!out.contains("Paragraph 40"), "{out}");
+
+    press(&mut a, "JJJJJ");
+    a.reload_drafts();
+    a.on_msg(crate::app::Msg::Worktrees(Ok(a.worktrees.clone())));
+    assert_eq!(a.detail_scroll, 5, "a background refresh scrolled it back");
+
+    // At the end there is no more, and the pane stops saying so.
+    a.detail_scroll = u16::MAX;
+    let out = render(&mut a, 160, 24);
+    assert!(
+        out.contains("Paragraph 40") && !out.contains("more below"),
+        "{out}"
+    );
+
+    // A short draft never says it.
+    select_draft(&mut a, 4701);
+    assert!(!render(&mut a, 160, 24).contains("more below"));
+}
+
 /// Nothing overflows the frame, at any width, with every state on screen.
 #[test]
 fn drafts_render_at_every_width() {
@@ -1546,15 +1673,21 @@ proptest::proptest! {
     ) {
         let (mut a, dir) = drafts_app();
         let text = draft_json(4846, |v| {
-            v["body"] = format!("b{payload}").into();
-            v["note"] = format!("n{payload}").into();
-            v["picked"] = format!("p{payload}").into();
-            v["comments"][0]["path"] = format!("f{payload}").into();
-            v["comments"][0]["body"] = format!("c{payload}").into();
+            v["body"] = format!("BODYTEXT{payload}").into();
+            v["note"] = format!("NOTETEXT{payload}").into();
+            v["picked"] = format!("PICKEDTEXT{payload}").into();
+            v["comments"][0]["path"] = format!("PATHTEXT{payload}").into();
+            v["comments"][0]["body"] = format!("COMMENTTEXT{payload}").into();
         });
         std::fs::write(dir.path().join("acme/widget/4846.json"), text).unwrap();
         a.reload_drafts();
         select_draft(&mut a, 4846);
+        // The draft was drawn at all: without this, a pane that drew nothing
+        // would pass for one that drew nothing dangerous.
+        let drawn = render(&mut a, 160, 30);
+        for printable in ["BODYTEXT", "NOTETEXT", "PICKEDTEXT", "PATHTEXT", "COMMENTTEXT"] {
+            proptest::prop_assert!(drawn.contains(printable), "{} was not drawn:\n{}", printable, drawn);
+        }
         let buf = frame(&mut a, 160, 30);
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {

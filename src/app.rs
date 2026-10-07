@@ -493,12 +493,15 @@ impl App {
         let Some(dir) = &self.drafts_dir else {
             return;
         };
+        // Taken before the list is replaced: after it, the same position in
+        // the list may be another draft.
+        let cursor = self.selected_draft().map(|e| e.path.clone());
         match drafts::load(dir, &self.repo.owner, &self.repo.name) {
             Ok(found) => self.drafts = found,
             Err(e) => self.note(format!("could not read review drafts: {e}")),
         }
         if self.view == View::Drafts {
-            self.rebuild();
+            self.rebuild_around(cursor);
         }
     }
 
@@ -564,6 +567,16 @@ impl App {
     /// Recompute the visible rows for the current view, filter and sort,
     /// keeping the previously selected item selected where possible.
     pub fn rebuild(&mut self) {
+        let cursor = self.selected_draft().map(|e| e.path.clone());
+        self.rebuild_around(cursor);
+    }
+
+    /// `rebuild`, told which draft the selection was on — by file, since a
+    /// row's position and a draft's place in the list both change as drafts
+    /// come, go and re-sort. A draft is what a keypress may post, so in the
+    /// Drafts view the selection follows the draft and nothing else.
+    fn rebuild_around(&mut self, cursor: Option<PathBuf>) {
+        let was = self.selected;
         let keep = if self.user_selected {
             self.rows.get(self.selected).copied()
         } else {
@@ -620,10 +633,26 @@ impl App {
             }
         };
 
+        let last = self.rows.len().saturating_sub(1);
+        if self.view == View::Drafts {
+            let same = cursor.and_then(|path| {
+                self.rows
+                    .iter()
+                    .position(|r| matches!(r, Row::Draft(i) if self.drafts[*i].path == path))
+            });
+            // Still on its draft: nothing the reader sees has to move, the
+            // detail pane's scroll included. Gone: the nearest row, not the
+            // top of the list.
+            if same.is_none() {
+                self.detail_scroll = 0;
+            }
+            self.selected = same.unwrap_or(was).min(last);
+            return;
+        }
         self.selected = keep
             .and_then(|k| self.rows.iter().position(|r| *r == k))
             .unwrap_or(0)
-            .min(self.rows.len().saturating_sub(1));
+            .min(last);
         self.detail_scroll = 0;
     }
 
