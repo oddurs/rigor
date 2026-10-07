@@ -2,10 +2,11 @@
 //! clicks do to it.
 
 use ratatui::layout::Rect;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::config::{Settings, View};
@@ -17,12 +18,28 @@ use crate::model::{
 };
 use crate::schedule::{self, Schedule};
 use crate::theme::Theme;
-use crate::util::now_secs;
+use crate::util::{format_iso8601, now_secs};
 
 pub enum Msg {
     Prs(Result<github::Fetched, String>),
     Worktrees(Result<Vec<Worktree>, String>),
     Statuses(Result<Vec<git::Scanned>, String>),
+    /// How the review in `App::posting` went.
+    Posted(Result<(), String>),
+}
+
+/// Sends one review: owner, repository, pull request number, request body.
+pub type Poster = Arc<dyn Fn(&str, &str, u64, &str) -> Result<(), String> + Send + Sync>;
+
+/// A post waiting on its second `a`: which draft, the file as it read when
+/// the prompt went up, and what the prompt says would be sent. Once the
+/// selected draft stops matching, the question on screen is no longer the one
+/// a keypress would be answering, and it is withdrawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Armed {
+    pub number: u64,
+    raw: String,
+    pub what: String,
 }
 
 /// Run `work` off the UI thread and always answer. A panic inside becomes an
@@ -193,6 +210,23 @@ pub struct App {
     /// without it reads none, so a test never picks up the developer's own.
     pub drafts_dir: Option<PathBuf>,
     pub drafts: Vec<drafts::Entry>,
+    pub armed: Option<Armed>,
+    /// The pull request a review is being sent to right now, and the draft
+    /// file it came from. One at a time.
+    pub posting: Option<(u64, PathBuf)>,
+    /// Pull requests whose review went out but whose draft file could not be
+    /// marked posted. The file still says `drafted`; these are never offered
+    /// again this session.
+    unrecorded: HashSet<u64>,
+    /// Why the last post failed, until the next keypress. Kept apart from
+    /// `error`, which is the sync's and is cleared by the next good fetch.
+    pub post_error: Option<String>,
+    /// How a review is sent. Inert until `main` wires in `gh`, so an `App`
+    /// built in a test cannot reach GitHub.
+    pub poster: Poster,
+    /// A draft file the user asked to edit. The event loop owns the terminal,
+    /// so it is the one to run the editor.
+    pub edit_request: Option<PathBuf>,
     pub view: View,
     pub sort: Sort,
     pub rows: Vec<Row>,
@@ -233,6 +267,12 @@ impl App {
             merged_by_branch: HashMap::new(),
             drafts_dir: None,
             drafts: Vec::new(),
+            armed: None,
+            posting: None,
+            unrecorded: HashSet::new(),
+            post_error: None,
+            poster: Arc::new(|_, _, _, _| Err("posting is not wired up".into())),
+            edit_request: None,
             sort: Sort::Recent,
             rows: Vec::new(),
             selected: 0,
@@ -402,7 +442,34 @@ impl App {
                 self.in_flight.scan = false;
                 self.error = Some(e);
             }
+            Msg::Posted(result) => self.posted(result),
         }
+    }
+
+    /// The review in `posting` came back. Only one that went out changes the
+    /// draft's file; a failure leaves it exactly as it was.
+    fn posted(&mut self, result: Result<(), String>) {
+        let Some((number, path)) = self.posting.take() else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                let at = format_iso8601(now_secs());
+                let slug = self.repo.slug();
+                match drafts::set_status(&path, &slug, drafts::Status::Posted, Some(at)) {
+                    Ok(()) => self.note(format!("posted to #{number}")),
+                    // The review is on GitHub whatever the file says.
+                    Err(e) => {
+                        self.unrecorded.insert(number);
+                        self.post_error = Some(format!(
+                            "the review was posted to #{number}, but its draft file could not be updated: {e}"
+                        ));
+                    }
+                }
+            }
+            Err(e) => self.post_error = Some(format!("posting to #{number} failed: {e}")),
+        }
+        self.reload_drafts();
     }
 
     /// Which worktrees to rescan this round; see `needs_scan`.
@@ -543,6 +610,115 @@ impl App {
         }
     }
 
+    /// `a`. Posting is public and under the user's name, so one keypress only
+    /// asks: the first `a` puts up a prompt naming what would be sent, and
+    /// only a second `a` on the same, unchanged draft sends it. `armed` is
+    /// the prompt that was up when this key arrived, if there was one.
+    pub fn post_key(&mut self, armed: Option<&Armed>) {
+        let Some(entry) = self.selected_draft().cloned() else {
+            return;
+        };
+        let label = entry.label();
+        let state = self.draft_state(&entry);
+        let (Some(number), Ok(draft), drafts::State::Ready) = (entry.number, &entry.draft, state)
+        else {
+            let why = match state {
+                drafts::State::Posted => "is already posted",
+                drafts::State::Skipped => "is skipped; x brings it back",
+                drafts::State::Stale => {
+                    "is stale: the pull request has moved on since this draft was written"
+                }
+                drafts::State::Unverified => {
+                    "is unverified: its pull request was not fetched, so its head is not known"
+                }
+                drafts::State::Invalid | drafts::State::Ready => {
+                    "is invalid and cannot be posted; e opens it in your editor"
+                }
+            };
+            self.note(format!("{label} {why}"));
+            return;
+        };
+        if self.posting.is_some() {
+            self.note("a review is already being posted");
+            return;
+        }
+        if self.unrecorded.contains(&number) {
+            self.note(format!(
+                "#{number} was posted this session; its draft file could not be updated"
+            ));
+            return;
+        }
+        let ask = Armed {
+            number,
+            raw: entry.raw.clone(),
+            what: draft.describe(),
+        };
+        if armed != Some(&ask) {
+            self.armed = Some(ask);
+            return;
+        }
+
+        // The file is the draft. If it changed after the prompt went up, what
+        // would go out is not what was confirmed.
+        let on_disk = std::fs::read_to_string(&entry.path).ok();
+        if on_disk.as_deref() != Some(entry.raw.as_str()) {
+            self.reload_drafts();
+            self.note(format!("{label} changed on disk; nothing was posted"));
+            return;
+        }
+        let body = match drafts::payload(draft) {
+            Ok(body) => body,
+            Err(e) => {
+                self.note(format!("could not build the review for {label}: {e}"));
+                return;
+            }
+        };
+        self.posting = Some((number, entry.path.clone()));
+        self.note(format!("posting {} to {label}…", ask.what));
+        let (owner, name) = (self.repo.owner.clone(), self.repo.name.clone());
+        let post = Arc::clone(&self.poster);
+        spawn_reply(self.tx.clone(), Msg::Posted, move || {
+            post(&owner, &name, number, &body)
+        });
+    }
+
+    /// `x`: set a draft aside, or bring a skipped one back.
+    pub fn skip_key(&mut self) {
+        let Some(entry) = self.selected_draft().cloned() else {
+            return;
+        };
+        let label = entry.label();
+        let Ok(draft) = &entry.draft else {
+            self.note(format!("{label} is invalid; e opens it in your editor"));
+            return;
+        };
+        if self.posting.as_ref().map(|(n, _)| *n) == entry.number {
+            self.note(format!("{label} is being posted"));
+            return;
+        }
+        let to = match draft.status {
+            drafts::Status::Drafted => drafts::Status::Skipped,
+            drafts::Status::Skipped => drafts::Status::Drafted,
+            drafts::Status::Posted => {
+                self.note(format!("{label} is already posted"));
+                return;
+            }
+        };
+        match drafts::set_status(&entry.path, &self.repo.slug(), to, None) {
+            Ok(()) if to == drafts::Status::Skipped => self.note(format!("skipped {label}")),
+            Ok(()) => self.note(format!("{label} is a draft again")),
+            Err(e) => self.note(format!("could not update {label}: {e}")),
+        }
+        self.reload_drafts();
+    }
+
+    /// `e`: ask for the selected draft's file to be opened in an editor.
+    pub fn edit_key(&mut self) {
+        if let Some(entry) = self.selected_draft() {
+            self.edit_request = Some(entry.path.clone());
+        }
+    }
+
     fn draft_matches(&self, i: usize, q: &str) -> bool {
         if q.is_empty() {
             return true;
@@ -654,6 +830,20 @@ impl App {
             .unwrap_or(0)
             .min(last);
         self.detail_scroll = 0;
+
+        // A pending post is only as good as the row it names. If a refresh
+        // moved the selection, rewrote the file or made the draft unpostable,
+        // the question is withdrawn.
+        if let Some(armed) = &self.armed {
+            let still = self.selected_draft().is_some_and(|e| {
+                e.number == Some(armed.number)
+                    && e.raw == armed.raw
+                    && self.draft_state(e) == drafts::State::Ready
+            });
+            if !still {
+                self.armed = None;
+            }
+        }
     }
 
     fn pr_matches(&self, i: usize, q: &str) -> bool {

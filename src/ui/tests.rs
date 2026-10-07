@@ -17,6 +17,12 @@ use crate::util::now_secs;
 const NOW: i64 = 1_800_000_000;
 
 fn sample_app() -> App {
+    sample_app_and_replies().0
+}
+
+/// The app with the channel its background work answers on, for the tests
+/// that follow a reply through.
+fn sample_app_and_replies() -> (App, std::sync::mpsc::Receiver<crate::app::Msg>) {
     crate::util::freeze_time(NOW);
     let repo = RepoInfo {
         owner: "acme".into(),
@@ -30,7 +36,7 @@ fn sample_app() -> App {
         worktree_status: false,
         ..Settings::default()
     };
-    let (mut a, _rx) = App::new(repo, settings, Theme::default());
+    let (mut a, rx) = App::new(repo, settings, Theme::default());
     a.home = Some("/home/dev".into());
     let now = now_secs();
 
@@ -64,7 +70,7 @@ fn sample_app() -> App {
     })));
 
     a.on_msg(crate::app::Msg::Worktrees(Ok(sample_worktrees(now))));
-    a
+    (a, rx)
 }
 
 /// Three PRs covering the states that matter: failing and dirty, approved and
@@ -1191,6 +1197,15 @@ fn draft_json(number: u64, edit: impl FnOnce(&mut serde_json::Value)) -> String 
 /// in every state the view can show. The directory lives as long as the
 /// returned guard.
 fn drafts_app() -> (App, tempfile::TempDir) {
+    let (a, _replies, dir) = drafts_app_and_replies();
+    (a, dir)
+}
+
+fn drafts_app_and_replies() -> (
+    App,
+    std::sync::mpsc::Receiver<crate::app::Msg>,
+    tempfile::TempDir,
+) {
     use serde_json::json;
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("acme").join("widget");
@@ -1241,12 +1256,12 @@ fn drafts_app() -> (App, tempfile::TempDir) {
     put(4990, draft_json(4990, |_| {}));
     put(4980, "{ \"version\": 1,".into());
 
-    let mut a = sample_app();
+    let (mut a, replies) = sample_app_and_replies();
     a.settings.views.push(View::Drafts);
     a.drafts_dir = Some(dir.path().to_path_buf());
     a.reload_drafts();
     a.set_view(View::Drafts);
-    (a, dir)
+    (a, replies, dir)
 }
 
 fn draft_numbers(a: &App) -> Vec<u64> {
@@ -1688,6 +1703,10 @@ fn drafts_snapshots() {
     a.settings.layout = LayoutMode::Auto;
 
     insta::assert_snapshot!("drafts_narrow_60x16", render(&mut a, 60, 16));
+
+    // The question a first `a` puts up, in place of the footer's keys.
+    press(&mut a, "a");
+    insta::assert_snapshot!("drafts_confirming_120x12", render(&mut a, 120, 12));
 }
 
 proptest::proptest! {
@@ -1732,4 +1751,502 @@ proptest::proptest! {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------- posting
+
+type Sent = std::sync::Arc<std::sync::Mutex<Vec<(String, u64, String)>>>;
+
+/// The drafts fixture with a poster that records what it is handed instead of
+/// sending it anywhere, and answers with `outcome`. Nothing in these tests can
+/// reach `gh`: an `App` only posts through the poster it is given.
+struct Outbox {
+    a: App,
+    sent: Sent,
+    replies: std::sync::mpsc::Receiver<crate::app::Msg>,
+    dir: tempfile::TempDir,
+}
+
+impl Outbox {
+    fn new(outcome: Result<(), String>) -> Self {
+        let (mut a, replies, dir) = drafts_app_and_replies();
+        let sent = Sent::default();
+        let log = std::sync::Arc::clone(&sent);
+        a.poster = std::sync::Arc::new(move |owner, name, number, body| {
+            log.lock()
+                .unwrap()
+                .push((format!("{owner}/{name}"), number, body.to_string()));
+            outcome.clone()
+        });
+        Self {
+            a,
+            sent,
+            replies,
+            dir,
+        }
+    }
+
+    fn sent(&self) -> Vec<(String, u64, String)> {
+        self.sent.lock().unwrap().clone()
+    }
+
+    /// Let the post in flight report back, as the event loop would.
+    fn settle(&mut self) {
+        let reply = self
+            .replies
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the post never reported back");
+        self.a.on_msg(reply);
+    }
+
+    fn path(&self, number: u64) -> std::path::PathBuf {
+        self.dir
+            .path()
+            .join("acme")
+            .join("widget")
+            .join(format!("{number}.json"))
+    }
+
+    fn file(&self, number: u64) -> String {
+        std::fs::read_to_string(self.path(number)).unwrap()
+    }
+
+    fn json(&self, number: u64) -> serde_json::Value {
+        serde_json::from_str(&self.file(number)).unwrap()
+    }
+}
+
+/// Posting is public and under the user's name. One `a` only asks, naming
+/// exactly what would be sent; a second `a` on the same row sends it once, and
+/// only then is the file marked posted.
+#[test]
+fn one_a_asks_and_a_second_a_posts_exactly_the_review() {
+    let mut o = Outbox::new(Ok(()));
+    select_draft(&mut o.a, 4840);
+    let before = o.json(4840);
+
+    press(&mut o.a, "a");
+    assert!(
+        o.a.posting.is_none() && o.sent().is_empty(),
+        "one a sent it"
+    );
+    let prompt = footer(&frame(&mut o.a, 160, 24));
+    assert!(
+        prompt.contains(
+            "post comment with 2 inline comments to #4840? a again to confirm, esc to cancel"
+        ),
+        "{prompt:?}"
+    );
+    assert_eq!(o.file(4840), serde_json::to_string_pretty(&before).unwrap());
+
+    press(&mut o.a, "a");
+    assert!(
+        draft_row(&mut o.a, 4840).contains(" posting… "),
+        "the row being sent says so"
+    );
+    o.settle();
+
+    let head = crate::drafts::tests::HEAD;
+    assert_eq!(
+        o.sent(),
+        [(
+            "acme/widget".to_string(),
+            4840,
+            format!(
+                r#"{{"commit_id":"{head}","event":"COMMENT","body":"Reads well overall.\n\nOne question on the cap before this goes in.","comments":[{{"path":"src/retry.rs","line":84,"side":"RIGHT","body":"Should this cap at the caller's deadline?"}},{{"path":"src/retry.rs","line":120,"side":"RIGHT","body":"A test for the zero-budget case would pin this."}}]}}"#
+            )
+        )]
+    );
+    let body = &o.sent()[0].2;
+    assert!(
+        !body.contains("backoff math") && !body.contains("self-contained"),
+        "note or picked left the machine: {body}"
+    );
+
+    // The file says posted, when, and nothing else about it changed.
+    let mut want = before;
+    want["status"] = "posted".into();
+    want["posted_at"] = "2027-01-15T08:00:00Z".into();
+    assert_eq!(o.json(4840), want);
+    assert!(draft_row(&mut o.a, 4840).contains(" ✓ posted "));
+    assert!(o.a.posting.is_none() && o.a.post_error.is_none());
+}
+
+/// A failed sync holds the footer until the next good fetch. The question must
+/// still be seen: a prompt nobody can read is a stray keypress from posting.
+#[test]
+fn the_prompt_outranks_a_sync_error() {
+    let mut o = Outbox::new(Ok(()));
+    o.a.error = Some("gh api graphql: timed out after 45s".into());
+    select_draft(&mut o.a, 4846);
+    press(&mut o.a, "a");
+    let line = footer(&frame(&mut o.a, 160, 24));
+    assert!(
+        line.contains("post approve to #4846? a again to confirm") && !line.contains("timed out"),
+        "{line:?}"
+    );
+}
+
+/// The prompt answers to a second `a` and nothing else. Any other key, a
+/// click, or a scroll withdraws it, and the next `a` asks again.
+#[test]
+fn anything_but_a_second_a_withdraws_the_prompt() {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    let mut o = Outbox::new(Ok(()));
+    select_draft(&mut o.a, 4840);
+    render(&mut o.a, 160, 24);
+    let (row_y, _) = o.a.hits.rows[o.a.selected];
+
+    // j then k comes back to the same row; `?` twice opens and closes help.
+    for other in ["jk", "\x1b", "??", "s", "e", "/\x1b", "J"] {
+        press(&mut o.a, "a");
+        assert!(o.a.armed.is_some(), "before {other:?}");
+        press(&mut o.a, other);
+        assert!(o.a.armed.is_none(), "{other:?} left the prompt up");
+        select_draft(&mut o.a, 4840);
+        press(&mut o.a, "a");
+        assert!(o.a.posting.is_none(), "a, {other:?}, a posted");
+        press(&mut o.a, "\x1b");
+    }
+
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::ScrollDown,
+    ] {
+        select_draft(&mut o.a, 4840);
+        press(&mut o.a, "a");
+        mouse(&mut o.a, kind, 4, row_y);
+        assert!(o.a.armed.is_none(), "{kind:?} left the prompt up");
+    }
+    // Only the pointer passing over is not an answer.
+    select_draft(&mut o.a, 4840);
+    press(&mut o.a, "a");
+    mouse(&mut o.a, MouseEventKind::Moved, 4, row_y);
+    assert!(
+        o.a.armed.is_some(),
+        "moving the pointer withdrew the prompt"
+    );
+
+    assert!(o.sent().is_empty(), "{:?}", o.sent());
+}
+
+/// Esc answers the prompt and nothing more: it must not also clear a filter
+/// the user had narrowed the list with.
+#[test]
+fn esc_cancels_the_prompt_without_clearing_the_filter() {
+    let mut o = Outbox::new(Ok(()));
+    press(&mut o.a, "/palette\na\x1b");
+    assert!(o.a.armed.is_none());
+    assert_eq!(o.a.filter, "palette");
+}
+
+/// A refresh that leaves the row as it was leaves the question standing; one
+/// that changes the row withdraws it, so `a` never confirms something the
+/// prompt did not say.
+#[test]
+fn a_refresh_that_changes_the_row_withdraws_the_prompt() {
+    let mut o = Outbox::new(Ok(()));
+    select_draft(&mut o.a, 4840);
+
+    press(&mut o.a, "a");
+    o.a.reload_drafts();
+    o.a.rebuild();
+    assert!(o.a.armed.is_some(), "an unchanged row lost its prompt");
+
+    // The file is rewritten underneath.
+    let text = draft_json(4840, |v| v["body"] = "Something else entirely.".into());
+    std::fs::write(o.path(4840), text).unwrap();
+    o.a.reload_drafts();
+    assert!(o.a.armed.is_none(), "a rewritten draft kept its prompt");
+
+    // The pull request moves on.
+    press(&mut o.a, "a");
+    assert!(o.a.armed.is_some());
+    let moved = o.a.prs.iter_mut().find(|p| p.number == 4840).unwrap();
+    moved.head_oid = "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432".into();
+    o.a.rebuild();
+    assert!(o.a.armed.is_none(), "a stale draft kept its prompt");
+
+    // The row under the cursor becomes another draft.
+    select_draft(&mut o.a, 4846);
+    press(&mut o.a, "a");
+    std::fs::remove_file(o.path(4846)).unwrap();
+    o.a.reload_drafts();
+    assert!(o.a.armed.is_none(), "the prompt outlived its draft");
+
+    press(&mut o.a, "a");
+    assert!(o.sent().is_empty() && o.a.posting.is_none());
+}
+
+/// Between the prompt and the second `a` the file can change without a
+/// refresh having noticed. What would go out is then not what was confirmed.
+#[test]
+fn a_draft_changed_on_disk_after_the_prompt_is_not_sent() {
+    let mut o = Outbox::new(Ok(()));
+    select_draft(&mut o.a, 4840);
+    press(&mut o.a, "a");
+    let text = draft_json(4840, |v| v["verdict"] = "comment".into());
+    std::fs::write(o.path(4840), &text).unwrap();
+    press(&mut o.a, "a");
+    assert!(o.a.posting.is_none() && o.sent().is_empty());
+    let note = o.a.notice.clone().unwrap().0;
+    assert!(note.contains("#4840 changed on disk"), "{note}");
+    assert_eq!(o.file(4840), text, "and the file is left alone");
+}
+
+/// Every draft that must not be posted: `a`, twice, sends nothing and says
+/// why. Stale and unverified are the ones that matter most — a review is only
+/// ever offered for the exact commit it was written against.
+#[test]
+fn a_draft_that_must_not_be_posted_only_explains_itself() {
+    let mut o = Outbox::new(Ok(()));
+    for (number, why) in [
+        (4700, "#4700 is stale"),
+        (4990, "#4990 is unverified"),
+        (4980, "#4980 is invalid"),
+        (4701, "#4701 is skipped"),
+        (4801, "#4801 is already posted"),
+    ] {
+        let before = o.file(number);
+        select_draft(&mut o.a, number);
+        press(&mut o.a, "aa");
+        assert!(o.a.armed.is_none(), "#{number} put up a prompt");
+        assert!(o.a.posting.is_none(), "#{number} was sent");
+        let note = o.a.notice.clone().unwrap().0;
+        assert!(note.starts_with(why), "#{number}: {note}");
+        assert_eq!(o.file(number), before, "#{number} was rewritten");
+    }
+    assert!(o.sent().is_empty(), "{:?}", o.sent());
+}
+
+/// A pull request that moved on after its draft was loaded is stale from the
+/// next fetch, without the file changing at all.
+#[test]
+fn a_ready_draft_goes_stale_when_the_pull_request_moves() {
+    let mut o = Outbox::new(Ok(()));
+    let moved = o.a.prs.iter_mut().find(|p| p.number == 4846).unwrap();
+    moved.head_oid = "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432".into();
+    o.a.rebuild();
+    select_draft(&mut o.a, 4846);
+    assert!(draft_row(&mut o.a, 4846).contains(" stale "));
+    press(&mut o.a, "aa");
+    assert!(o.sent().is_empty() && o.a.posting.is_none());
+}
+
+/// When `gh` refuses, nothing went out: the file is byte for byte what it
+/// was, the row is still a draft, and the footer says what failed.
+#[test]
+fn a_failed_post_leaves_the_draft_untouched() {
+    let mut o = Outbox::new(Err("gh api failed: HTTP 422".into()));
+    select_draft(&mut o.a, 4840);
+    let before = o.file(4840);
+    press(&mut o.a, "aa");
+    o.settle();
+
+    assert_eq!(o.sent().len(), 1, "it was attempted once");
+    assert_eq!(o.file(4840), before);
+    assert!(draft_row(&mut o.a, 4840).contains(" comment +2 "));
+    let line = footer(&frame(&mut o.a, 160, 24));
+    assert!(
+        line.contains("✗ posting to #4840 failed: gh api failed: HTTP 422"),
+        "{line:?}"
+    );
+    // A sync that succeeds meanwhile must not sweep the failure away.
+    o.a.error = None;
+    assert!(footer(&frame(&mut o.a, 160, 24)).contains("posting to #4840 failed"));
+    press(&mut o.a, "j");
+    assert!(o.a.post_error.is_none(), "it stays until the next key");
+}
+
+/// While a review is on its way, `a` — however often — sends nothing more.
+#[test]
+fn a_post_in_flight_is_not_sent_twice() {
+    let mut o = Outbox::new(Ok(()));
+    // A poster that holds each call until the test lets it go.
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new(gate);
+    let log = std::sync::Arc::clone(&o.sent);
+    o.a.poster = std::sync::Arc::new(move |owner, name, number, body| {
+        log.lock()
+            .unwrap()
+            .push((format!("{owner}/{name}"), number, body.to_string()));
+        let _ = gate.lock().unwrap().recv();
+        Ok(())
+    });
+
+    select_draft(&mut o.a, 4840);
+    press(&mut o.a, "aa");
+    assert!(o.a.posting.is_some());
+    press(&mut o.a, "aaaa");
+    assert!(o.a.armed.is_none(), "a second prompt went up mid-flight");
+    let note = o.a.notice.clone().unwrap().0;
+    assert_eq!(note, "a review is already being posted");
+    // Nor can the draft be set aside from under its own review.
+    press(&mut o.a, "x");
+    assert_eq!(o.json(4840)["status"], "drafted");
+    // Another row is held back too: one review at a time.
+    select_draft(&mut o.a, 4846);
+    press(&mut o.a, "aa");
+
+    release.send(()).unwrap();
+    o.settle();
+    assert_eq!(o.sent().len(), 1, "{:?}", o.sent());
+
+    // And once it has landed, the row is posted, not postable.
+    select_draft(&mut o.a, 4840);
+    press(&mut o.a, "aa");
+    assert!(o.a.posting.is_none());
+    assert_eq!(o.sent().len(), 1);
+}
+
+/// A review that went out but could not be written down is still out. The
+/// file says `drafted`; rigor must not offer it again on the file's word.
+#[test]
+fn a_posted_review_whose_file_was_not_updated_is_not_offered_again() {
+    let mut o = Outbox::new(Ok(()));
+    let path = o.path(4840);
+    let text = o.file(4840);
+    let log = std::sync::Arc::clone(&o.sent);
+    let gone = path.clone();
+    // The file vanishes while the review is on its way.
+    o.a.poster = std::sync::Arc::new(move |_, _, number, body| {
+        log.lock()
+            .unwrap()
+            .push((String::new(), number, body.to_string()));
+        std::fs::remove_file(&gone).unwrap();
+        Ok(())
+    });
+    select_draft(&mut o.a, 4840);
+    press(&mut o.a, "aa");
+    o.settle();
+    let line = o.a.post_error.clone().unwrap();
+    assert!(
+        line.starts_with("the review was posted to #4840, but its draft file could not be updated"),
+        "{line}"
+    );
+
+    // Whatever wrote the draft writes it again, still `drafted`.
+    std::fs::write(&path, text).unwrap();
+    o.a.reload_drafts();
+    select_draft(&mut o.a, 4840);
+    press(&mut o.a, "aa");
+    assert!(o.a.posting.is_none() && o.a.armed.is_none());
+    assert!(
+        o.a.notice
+            .clone()
+            .unwrap()
+            .0
+            .starts_with("#4840 was posted this session")
+    );
+    assert_eq!(o.sent().len(), 1);
+}
+
+/// `a` posts only from the Drafts view, and never as a chord.
+#[test]
+fn a_does_nothing_outside_the_drafts_view_or_with_ctrl() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut o = Outbox::new(Ok(()));
+    o.a.set_view(View::All);
+    press(&mut o.a, "aa");
+    assert!(o.a.armed.is_none() && o.a.posting.is_none());
+
+    o.a.set_view(View::Drafts);
+    select_draft(&mut o.a, 4840);
+    for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+        for _ in 0..2 {
+            crate::event::key(&mut o.a, KeyEvent::new(KeyCode::Char('a'), modifier));
+        }
+        assert!(o.a.armed.is_none() && o.a.posting.is_none(), "{modifier:?}");
+    }
+    assert!(o.sent().is_empty());
+}
+
+/// `x` sets a draft aside and brings it back, touching only its status. It
+/// never rewrites a draft it cannot read, or one already posted.
+#[test]
+fn x_skips_a_draft_and_brings_it_back() {
+    let mut o = Outbox::new(Ok(()));
+    select_draft(&mut o.a, 4846);
+    let before = o.json(4846);
+
+    press(&mut o.a, "x");
+    let mut want = before.clone();
+    want["status"] = "skipped".into();
+    assert_eq!(o.json(4846), want);
+    assert!(draft_row(&mut o.a, 4846).contains(" skipped "));
+    // A skipped draft is not postable until it is brought back.
+    select_draft(&mut o.a, 4846);
+    press(&mut o.a, "aa");
+    assert!(o.a.posting.is_none());
+
+    press(&mut o.a, "x");
+    assert_eq!(o.json(4846), before, "back exactly as it was");
+    assert!(draft_row(&mut o.a, 4846).contains(" approve "));
+
+    // Stale and unverified drafts can be set aside too: that is what one does
+    // with a draft that will never be posted.
+    select_draft(&mut o.a, 4700);
+    press(&mut o.a, "x");
+    assert_eq!(o.json(4700)["status"], "skipped");
+
+    for (number, why) in [(4801, "is already posted"), (4980, "is invalid")] {
+        let before = o.file(number);
+        select_draft(&mut o.a, number);
+        press(&mut o.a, "x");
+        assert_eq!(o.file(number), before, "#{number} was rewritten");
+        let note = o.a.notice.clone().unwrap().0;
+        assert!(note.contains(why), "#{number}: {note}");
+    }
+    assert!(o.sent().is_empty());
+}
+
+/// `e` hands the selected draft's file to the event loop, which owns the
+/// terminal and so runs the editor. Any draft can be edited, a broken one most
+/// of all.
+#[test]
+fn e_asks_for_the_selected_drafts_file() {
+    let mut o = Outbox::new(Ok(()));
+    select_draft(&mut o.a, 4980);
+    press(&mut o.a, "e");
+    assert_eq!(o.a.edit_request, Some(o.path(4980)));
+
+    o.a.edit_request = None;
+    o.a.set_view(View::All);
+    press(&mut o.a, "e");
+    assert_eq!(o.a.edit_request, None, "only in the Drafts view");
+}
+
+/// The footer offers what would do something on this row, and no more.
+#[test]
+fn the_footer_offers_only_what_applies_to_the_draft() {
+    let mut o = Outbox::new(Ok(()));
+    let mut keys = |number: u64| {
+        select_draft(&mut o.a, number);
+        footer(&frame(&mut o.a, 160, 24))
+    };
+    let ready = keys(4846);
+    assert!(
+        ready.contains("a post") && ready.contains("e edit") && ready.contains("x skip"),
+        "{ready:?}"
+    );
+    let stale = keys(4700);
+    assert!(
+        !stale.contains("a post") && stale.contains("x skip"),
+        "{stale:?}"
+    );
+    let skipped = keys(4701);
+    assert!(
+        !skipped.contains("a post") && skipped.contains("x unskip"),
+        "{skipped:?}"
+    );
+    let invalid = keys(4980);
+    assert!(
+        !invalid.contains("a post") && invalid.contains("e edit") && !invalid.contains("x "),
+        "{invalid:?}"
+    );
+    let posted = keys(4801);
+    assert!(
+        !posted.contains("a post") && !posted.contains("x "),
+        "{posted:?}"
+    );
 }

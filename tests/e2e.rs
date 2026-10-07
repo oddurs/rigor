@@ -35,8 +35,9 @@ const COLS: u16 = 160;
 // ------------------------------------------------------------------ the world
 
 /// A repository with a bare origin and two worktrees, a fake `gh` that answers
-/// from a fixture (or hangs, fails, or reports a rate limit), and a `git` shim
-/// that logs every call rigor makes.
+/// from a fixture (or hangs, fails, or reports a rate limit) and records every
+/// write it is asked to make, and a `git` shim that logs every call rigor
+/// makes.
 struct World {
     dir: tempfile::TempDir,
 }
@@ -89,15 +90,32 @@ impl World {
 
     /// rigor on the Drafts view, reading this world's drafts.
     fn drafts_view(&self) -> Term {
+        self.drafts_view_with(&[])
+    }
+
+    fn drafts_view_with(&self, env: &[(&str, &str)]) -> Term {
         let dir = self.root().join("drafts");
+        let mut env = env.to_vec();
+        env.push(("RIGOR_DRAFTS_DIR", dir.to_str().unwrap()));
         Term::start(
             self,
             Opts {
                 args: &["-v", "drafts"],
-                env: &[("RIGOR_DRAFTS_DIR", dir.to_str().unwrap())],
+                env: &env,
                 ..Opts::default()
             },
         )
+    }
+
+    /// Every write the fake `gh` was asked to make: its arguments, one call
+    /// per line.
+    fn posts(&self) -> Vec<String> {
+        self.log("gh.posts")
+    }
+
+    /// The exact bytes the `n`th write was given on stdin, counting from 1.
+    fn post_body(&self, n: usize) -> String {
+        std::fs::read_to_string(self.root().join(format!("gh.post.{n}"))).unwrap()
     }
 
     fn log(&self, name: &str) -> Vec<String> {
@@ -186,6 +204,20 @@ fn install_fakes(root: &Path) {
         &bin.join("gh"),
         r#"#!/bin/sh
 dir="$(cd "$(dirname "$0")/.." && pwd)"
+# A write is recorded whole — its arguments, and the body it was given on
+# stdin — and is never answered from the fixture. Kept out of gh.log, which
+# counts fetches.
+case "$*" in
+  *--method*)
+    echo "$*" >> "$dir/gh.posts"
+    cat > "$dir/gh.post.$(wc -l < "$dir/gh.posts" | tr -d ' ')"
+    if [ "$(cat "$dir/gh.mode")" = fail ]; then
+      echo "gh: Validation Failed (HTTP 422)" >&2
+      exit 1
+    fi
+    printf '%s' '{"id":1,"state":"APPROVED"}'
+    exit 0 ;;
+esac
 # One line per call. Not "$*": the query argument spans many lines, and
 # counting lines would count the query, not the calls.
 echo "$1 $2" >> "$dir/gh.log"
@@ -278,6 +310,8 @@ impl Term {
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
             "RIGOR_DRAFTS_DIR",
+            "VISUAL",
+            "EDITOR",
         ] {
             cmd.env_remove(k);
         }
@@ -689,4 +723,229 @@ fn the_default_screen_does_not_mention_drafts() {
         !text.contains("Drafts") && !text.contains("drafted"),
         "{text}"
     );
+}
+
+/// The one write rigor makes to GitHub, end to end: the first `a` only asks,
+/// the second sends exactly one request with exactly the review in it, and
+/// only then is the file marked posted.
+#[test]
+fn a_confirmed_post_sends_one_review_and_marks_the_draft_posted() {
+    let w = World::new();
+    let path = w.draft(101, |_| {});
+    let before: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let t = w.drafts_view();
+    t.wait_line("#101 ready to post", LOAD, |l| {
+        l.contains("#101") && l.contains("approve +1")
+    });
+
+    t.send(b"a");
+    t.wait_for(
+        "post approve with 1 inline comment to #101? a again to confirm, esc to cancel",
+        LOAD,
+    );
+    assert!(w.posts().is_empty(), "one a sent it: {:?}", w.posts());
+
+    t.send(b"a");
+    t.wait_line("#101 posted", LOAD, |l| {
+        l.contains("#101") && l.contains("✓ posted")
+    });
+
+    assert_eq!(
+        w.posts(),
+        ["api --method POST repos/acme/widget/pulls/101/reviews --input -"]
+    );
+    let body = w.post_body(1);
+    assert_eq!(
+        body,
+        format!(
+            r#"{{"commit_id":"{FIXTURE_HEAD_101}","event":"APPROVE","body":"Reads well.","comments":[{{"path":"src/x.rs","line":84,"side":"RIGHT","body":"Worth a test."}}]}}"#
+        )
+    );
+    assert!(!body.contains("PRIVATE"), "note or picked was sent: {body}");
+
+    // Posted, with a time, and every other field as its author wrote it.
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let at = after["posted_at"].as_str().expect("posted_at is set");
+    assert!(
+        at.len() == 20 && at.ends_with('Z') && at.as_bytes()[10] == b'T',
+        "{at}"
+    );
+    let mut want = before;
+    want["status"] = "posted".into();
+    want["posted_at"] = at.into();
+    assert_eq!(after, want);
+    let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|f| f.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["101.json"], "the rewrite left something behind");
+}
+
+/// A stray keypress sends nothing: `a` on its own only asks, and anything
+/// that is not a second `a` withdraws the question.
+#[test]
+fn a_single_a_sends_nothing() {
+    let w = World::new();
+    let path = w.draft(101, |_| {});
+    let before = std::fs::read_to_string(&path).unwrap();
+    let t = w.drafts_view();
+    t.wait_line("#101 ready to post", LOAD, |l| {
+        l.contains("#101") && l.contains("approve +1")
+    });
+    let asked = |t: &Term| t.wait_for("a again to confirm", LOAD);
+    let withdrawn = |t: &Term| {
+        t.wait("the prompt to go", LOAD, |s| {
+            !s.contains("a again to confirm")
+        });
+    };
+
+    t.send(b"a");
+    asked(&t);
+    t.send(b"\x1b");
+    withdrawn(&t);
+    // After a cancel the next `a` is a first `a` again.
+    t.send(b"a");
+    asked(&t);
+    t.send(b"j");
+    withdrawn(&t);
+    t.send(b"a");
+    asked(&t);
+
+    // Help only opens once every key before it has been handled.
+    t.send(b"?");
+    t.wait_for(" keys ", LOAD);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(w.posts().is_empty(), "{:?}", w.posts());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+}
+
+/// Stale, unverified, invalid, skipped and already posted: `a`, twice, on
+/// each sends nothing, says why, and leaves the file alone.
+#[test]
+fn drafts_that_must_not_be_posted_send_nothing() {
+    let w = World::new();
+    // The fixture has #102 at another commit, has never heard of #999, and
+    // lists #90 as merged.
+    let mut files = vec![
+        (w.draft(102, |_| {}), "102", "#102 is stale"),
+        (w.draft(999, |_| {}), "999", "#999 is unverified"),
+        (w.draft(103, |_| {}), "103", "#103 is invalid"),
+        (
+            w.draft(101, |v| v["status"] = "skipped".into()),
+            "101",
+            "#101 is skipped",
+        ),
+        (
+            w.draft(90, |v| {
+                v["status"] = "posted".into();
+                v["posted_at"] = "2027-01-15T09:30:00Z".into();
+            }),
+            "90",
+            "#90 is already posted",
+        ),
+    ];
+    std::fs::write(&files[2].0, "{ \"version\": 1,").unwrap();
+    let before: Vec<String> = files
+        .iter()
+        .map(|(p, _, _)| std::fs::read_to_string(p).unwrap())
+        .collect();
+
+    let t = w.drafts_view();
+    // The fetch has landed once #102's head is known to differ.
+    t.wait_line("#102 stale", LOAD, |l| {
+        l.contains("#102") && l.contains("stale")
+    });
+    for (_, number, why) in &files {
+        // Narrow the list to the one draft, so the row under `a` is not a
+        // matter of ordering.
+        // Enter is a carriage return to a terminal in raw mode.
+        t.send(format!("/{number}\r").as_bytes());
+        t.wait("the filter to apply", LOAD, |s| {
+            s.contains(&format!("/{number} ")) && s.contains("Drafts 5")
+        });
+        t.send(b"aa");
+        t.wait_for(why, LOAD);
+        t.send(b"\x1b");
+        t.wait("the filter to clear", LOAD, |s| {
+            !s.contains(&format!("/{number} "))
+        });
+    }
+
+    t.send(b"?");
+    t.wait_for(" keys ", LOAD);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(w.posts().is_empty(), "{:?}", w.posts());
+    for ((path, number, _), text) in files.drain(..).zip(before) {
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text,
+            "#{number} was rewritten"
+        );
+    }
+}
+
+/// When `gh` refuses the review nothing went out, so nothing is recorded:
+/// the file is byte for byte what it was and the row is still a draft.
+#[test]
+fn a_failing_gh_leaves_the_draft_untouched() {
+    let w = World::new();
+    let path = w.draft(101, |_| {});
+    let before = std::fs::read_to_string(&path).unwrap();
+    let t = w.drafts_view();
+    t.wait_line("#101 ready to post", LOAD, |l| {
+        l.contains("#101") && l.contains("approve +1")
+    });
+    w.gh("fail");
+    t.send(b"aa");
+    t.wait_for(
+        "posting to #101 failed: gh api failed: gh: Validation Failed (HTTP 422)",
+        LOAD,
+    );
+    assert_eq!(w.posts().len(), 1, "attempted once: {:?}", w.posts());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    t.wait_line("#101 still a draft", LOAD, |l| {
+        l.contains("#101") && l.contains("approve +1")
+    });
+}
+
+/// `e` steps out of the way for the editor, comes back with the whole screen
+/// redrawn, and reads the file again — here, into nonsense.
+#[test]
+fn editing_a_draft_rereads_it_and_restores_the_screen() {
+    let w = World::new();
+    let path = w.draft(101, |_| {});
+    let editor = w.root().join("bin/scribble");
+    write_exe(
+        &editor,
+        "#!/bin/sh\necho \"$1\" >> \"$(cd \"$(dirname \"$0\")/..\" && pwd)/edited.log\"\necho nonsense > \"$1\"\n",
+    );
+    let t = w.drafts_view_with(&[("EDITOR", editor.to_str().unwrap())]);
+    t.wait_line("#101 ready to post", LOAD, |l| {
+        l.contains("#101") && l.contains("approve +1")
+    });
+
+    t.send(b"e");
+    t.wait_line("#101 invalid", LOAD, |l| {
+        l.contains("#101") && l.contains("invalid")
+    });
+    assert_eq!(w.log("edited.log"), [path.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "nonsense\n");
+
+    // Back on the alternate screen with everything on it again, not only
+    // the cells that changed.
+    let raw = t.raw();
+    let count = |seq: &[u8]| raw.windows(seq.len()).filter(|w| *w == seq).count();
+    assert_eq!(count(b"\x1b[?1049l"), 1, "left for the editor");
+    assert_eq!(count(b"\x1b[?1049h"), 2, "and came back");
+    let text = t.text();
+    assert!(
+        text.contains("acme/widget") && text.contains("Drafts 1") && text.contains("? help"),
+        "{text}"
+    );
+    // An invalid draft cannot be posted, and rigor is still listening.
+    t.send(b"aa");
+    t.wait_for("#101 is invalid", LOAD);
+    assert!(w.posts().is_empty());
 }

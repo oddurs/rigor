@@ -87,9 +87,11 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
             Row::Wt(wi) => wt_line(&app.desk(&app.worktrees[wi]), selected, &ctx),
             Row::Draft(di) => {
                 let entry = &app.drafts[di];
+                // The one being sent says so, in place of its verdict.
+                let sending = app.posting.as_ref().map(|(n, _)| *n) == entry.number;
                 draft_line(
                     entry,
-                    app.draft_state(entry),
+                    (app.draft_state(entry), sending),
                     app.draft_pr(entry),
                     selected,
                     &ctx,
@@ -346,7 +348,7 @@ fn wt_line(desk: &Desk<'_>, selected: bool, ctx: &RowCtx<'_>) -> Line<'static> {
 /// same fetch as every other view.
 fn draft_line(
     entry: &Entry,
-    state: State,
+    (state, sending): (State, bool),
     pr: DraftPr<'_>,
     selected: bool,
     ctx: &RowCtx<'_>,
@@ -358,7 +360,11 @@ fn draft_line(
     let decided = matches!(state, State::Posted | State::Skipped);
     let quiet = dim(selected, t);
 
-    let (state_text, state_color) = draft_state_cell(entry, state, t);
+    let (state_text, state_color) = if sending {
+        ("posting…".to_string(), t.pending)
+    } else {
+        draft_state_cell(entry, state, t)
+    };
     let mut spans = vec![
         Span::styled(if selected { "▎" } else { " " }, base.fg(t.accent)),
         Span::styled(

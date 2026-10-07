@@ -124,6 +124,27 @@ const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// The inverse of `parse_iso8601`: an epoch second as RFC 3339 in UTC.
+pub fn format_iso8601(ts: i64) -> String {
+    let (days, secs) = (ts.div_euclid(86400), ts.rem_euclid(86400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
 /// Compact age: `12s`, `4m`, `3h`, `2d`, `5w`.
 pub fn rel_time(ts: i64, now: i64) -> String {
     let d = (now - ts).max(0);
@@ -344,26 +365,5 @@ mod tests {
         fn rel_time_never_panics_and_stays_short(a in any::<i32>(), b in any::<i32>()) {
             prop_assert!(rel_time(i64::from(a), i64::from(b)).len() <= 8);
         }
-    }
-
-    /// The inverse of `parse_iso8601`, for the round-trip property only.
-    fn format_iso8601(ts: i64) -> String {
-        let (days, secs) = (ts.div_euclid(86400), ts.rem_euclid(86400));
-        // Howard Hinnant's civil_from_days.
-        let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z - era * 146_097;
-        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let y = yoe + era * 400 + i64::from(m <= 2);
-        format!(
-            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-            secs / 3600,
-            (secs % 3600) / 60,
-            secs % 60
-        )
     }
 }

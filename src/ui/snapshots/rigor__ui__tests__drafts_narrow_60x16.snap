@@ -17,4 +17,4 @@ expression: "render(&mut a, 60, 16)"
   picked    Small, green and waiting on one review.
   verdict   approve
   body      none                           ↓ more below · J
- 1–7 view   o open   c checks   y copy      ? help   q quit
+ 1–7 view   a post   e edit   x skip        ? help   q quit

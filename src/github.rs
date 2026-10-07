@@ -68,7 +68,7 @@ pub struct Fetched {
     pub merged: Vec<MergedPr>,
 }
 
-/// How long a single `gh api graphql` call may take. Generous, because a large
+/// How long a single `gh api` call may take. Generous, because a large
 /// repository paginates; the point is that a stalled connection cannot hold the
 /// refresh forever. `RIGOR_GH_TIMEOUT_SECS` overrides it — for very slow links,
 /// and so the end-to-end tests can exercise the timeout in seconds, not minutes.
@@ -127,6 +127,22 @@ pub fn fetch_prs(owner: &str, name: &str, max: usize) -> Result<Fetched> {
         prs,
         merged: first.merged,
     })
+}
+
+/// Post one review to a pull request: the only call rigor makes that changes
+/// anything on GitHub. `body` is the request's JSON, from `drafts::payload`.
+pub fn post_review(owner: &str, name: &str, number: u64, body: &str) -> Result<()> {
+    let mut cmd = Command::new("gh");
+    cmd.args(["api", "--method", "POST"])
+        .arg(format!("repos/{owner}/{name}/pulls/{number}/reviews"))
+        .args(["--input", "-"]);
+    let out = proc::run_with_input(&mut cmd, body.as_bytes(), gh_timeout(), Priority::Normal)
+        .context("gh api")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        bail!("gh api failed: {}", err.trim());
+    }
+    Ok(())
 }
 
 /// One page of the GraphQL response, parsed. Pure, so it is tested against a

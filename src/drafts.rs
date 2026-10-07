@@ -1,10 +1,11 @@
 //! Review drafts: files some other tool leaves beside a pull request, which
-//! rigor lists.
+//! rigor lists and — on a confirmed keypress — posts as a review.
 //!
 //! rigor does not write drafts and does not know who does. The file is the
-//! whole contract: `<drafts dir>/<owner>/<repo>/<number>.json`.
+//! whole contract: `<drafts dir>/<owner>/<repo>/<number>.json`. The only fields
+//! rigor ever changes are `status` and `posted_at`.
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ use crate::util::parse_iso8601;
 /// The one file format this rigor reads.
 const VERSION: u64 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Verdict {
     Approve,
@@ -28,9 +29,17 @@ impl Verdict {
             Self::Comment => "comment",
         }
     }
+
+    /// What GitHub's review API calls it.
+    const fn event(self) -> &'static str {
+        match self {
+            Self::Approve => "APPROVE",
+            Self::Comment => "COMMENT",
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Drafted,
@@ -38,14 +47,14 @@ pub enum Status {
     Skipped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Side {
     Left,
     Right,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Comment {
     pub path: String,
@@ -54,10 +63,11 @@ pub struct Comment {
     pub body: String,
 }
 
-/// The file, field for field. An unknown key is an error, as it is in a
-/// config file: a draft rigor does not fully understand is not one it should
-/// vouch for.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// The file, field for field and in the contract's order, so that writing one
+/// back changes only what was meant to change. An unknown key is an error, as
+/// it is in a config file: a draft rigor does not fully understand is not one
+/// it should offer to post.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Draft {
     pub version: u64,
@@ -90,6 +100,15 @@ impl Draft {
         match self.comments.len() {
             0 => self.verdict.label().to_string(),
             n => format!("{} +{n}", self.verdict.label()),
+        }
+    }
+
+    /// The same, spelled out for the confirmation prompt.
+    pub fn describe(&self) -> String {
+        match self.comments.len() {
+            0 => self.verdict.label().to_string(),
+            1 => format!("{} with 1 inline comment", self.verdict.label()),
+            n => format!("{} with {n} inline comments", self.verdict.label()),
         }
     }
 
@@ -179,6 +198,25 @@ pub fn state(draft: &Result<Draft, String>, head: Option<&str>) -> State {
     }
 }
 
+#[derive(Serialize)]
+struct Review<'a> {
+    commit_id: &'a str,
+    event: &'static str,
+    body: &'a str,
+    comments: &'a [Comment],
+}
+
+/// The body of the one request rigor ever sends. Built from a type with no
+/// place for `note` or `picked`, so neither can reach GitHub.
+pub fn payload(d: &Draft) -> serde_json::Result<String> {
+    serde_json::to_string(&Review {
+        commit_id: &d.head_sha,
+        event: d.verdict.event(),
+        body: &d.body,
+        comments: &d.comments,
+    })
+}
+
 /// `$RIGOR_DRAFTS_DIR`, else `$XDG_DATA_HOME/rigor/drafts`, else
 /// `~/.local/share/rigor/drafts`. A variable set to nothing counts as unset.
 pub fn dir(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
@@ -197,6 +235,8 @@ pub struct Entry {
     /// The pull request the file is named for. `None` when the name is not a
     /// number, which makes the draft invalid but still worth showing.
     pub number: Option<u64>,
+    /// The file as read, so a pending post can tell if it changed underneath.
+    pub raw: String,
     pub draft: Result<Draft, String>,
 }
 
@@ -246,14 +286,21 @@ fn read(path: PathBuf, slug: &str) -> Entry {
         .file_stem()
         .and_then(|s| s.to_str())
         .and_then(|s| s.parse::<u64>().ok());
-    let draft = match (read_text(&path), number) {
-        (Ok(text), Some(n)) => parse(&text, slug, n),
-        (Ok(_), None) => Err("the file is not named for a pull request number".into()),
-        (Err(why), _) => Err(why),
+    let (raw, draft) = match (read_text(&path), number) {
+        (Ok(raw), Some(n)) => {
+            let draft = parse(&raw, slug, n);
+            (raw, draft)
+        }
+        (Ok(raw), None) => (
+            raw,
+            Err("the file is not named for a pull request number".into()),
+        ),
+        (Err(why), _) => (String::new(), Err(why)),
     };
     Entry {
         path,
         number,
+        raw,
         draft,
     }
 }
@@ -278,6 +325,35 @@ pub fn load(dir: &Path, owner: &str, name: &str) -> std::io::Result<Vec<Entry>> 
     }
     entries.sort_by(|a, b| a.number.cmp(&b.number).then_with(|| a.path.cmp(&b.path)));
     Ok(entries)
+}
+
+/// Set a draft's `status` and `posted_at`, leaving every other field as it is
+/// on disk right now — read fresh, so an edit made since the list was loaded
+/// survives. Written beside the file and renamed over it, so nothing reading
+/// the directory ever sees half a draft.
+pub fn set_status(
+    path: &Path,
+    slug: &str,
+    status: Status,
+    posted_at: Option<String>,
+) -> Result<(), String> {
+    let mut draft = read(path.to_path_buf(), slug).draft?;
+    draft.status = status;
+    draft.posted_at = posted_at;
+    let mut text = serde_json::to_string_pretty(&draft).map_err(|e| e.to_string())?;
+    text.push('\n');
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("{}: {e}", path.display())
+        })
 }
 
 #[cfg(test)]
@@ -332,6 +408,7 @@ pub mod tests {
         assert_eq!(d.comments[0].side, Side::Right);
         assert_eq!(d.posted_at, None);
         assert_eq!(d.summary(), "approve +1");
+        assert_eq!(d.describe(), "approve with 1 inline comment");
     }
 
     /// One draft's text and what reading it must say. `reason: None` is a
@@ -590,6 +667,33 @@ pub mod tests {
         );
     }
 
+    /// The exact bytes sent. `note` and `picked` are for the reader of the
+    /// draft and must never leave the machine.
+    #[test]
+    fn the_payload_is_the_review_and_nothing_else() {
+        let d = parse(&sample().to_string(), "acme/widget", 101).unwrap();
+        let sent = payload(&d).unwrap();
+        assert_eq!(
+            sent,
+            format!(
+                r#"{{"commit_id":"{HEAD}","event":"APPROVE","body":"Reads well.","comments":[{{"path":"src/x.rs","line":84,"side":"RIGHT","body":"Worth a test."}}]}}"#
+            )
+        );
+        assert!(!sent.contains("PRIVATE"), "{sent}");
+
+        let text = with(|v| {
+            v["verdict"] = json!("comment");
+            v["comments"] = json!([]);
+        });
+        let sent = payload(&parse(&text, "acme/widget", 101).unwrap()).unwrap();
+        assert_eq!(
+            sent,
+            format!(
+                r#"{{"commit_id":"{HEAD}","event":"COMMENT","body":"Reads well.","comments":[]}}"#
+            )
+        );
+    }
+
     #[test]
     fn the_drafts_directory_comes_from_the_environment() {
         struct Case {
@@ -714,5 +818,71 @@ pub mod tests {
         );
         assert!(got[1].draft.is_err(), "malformed, but still listed");
         assert!(got[2].draft.is_ok());
+        assert_eq!(got[2].raw, sample().to_string());
+    }
+
+    /// The only write rigor makes to a draft. Everything its author wrote
+    /// comes back unchanged, including text JSON has to escape.
+    #[test]
+    fn a_status_rewrite_changes_only_the_status() {
+        let d = tempfile::tempdir().unwrap();
+        let text = with(|v| {
+            v["body"] = json!("Line one.\n\n\"Quoted\" — and a tab:\there. ✓");
+            v["note"] = json!("C:\\path and a \u{1f642}");
+        });
+        let path = write(d.path(), "101.json", &text);
+        let before = parse(&text, "acme/widget", 101).unwrap();
+        // A second name for the file as it is now: what a reader that already
+        // had it open goes on seeing.
+        let held = d.path().join("held-open");
+        std::fs::hard_link(&path, &held).unwrap();
+
+        set_status(
+            &path,
+            "acme/widget",
+            Status::Posted,
+            Some("2027-01-15T10:00:00Z".into()),
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let after = parse(&written, "acme/widget", 101).unwrap();
+        assert_eq!(after.status, Status::Posted);
+        assert_eq!(after.posted_at.as_deref(), Some("2027-01-15T10:00:00Z"));
+        assert_eq!(
+            Draft {
+                status: before.status,
+                posted_at: before.posted_at.clone(),
+                ..after
+            },
+            before,
+            "a field other than status and posted_at changed"
+        );
+        assert!(written.ends_with("}\n"), "a complete file: {written:?}");
+        // Replaced by a rename, not written over in place: the old file is
+        // whole for anyone still reading it, and the new one appears at once.
+        assert_eq!(
+            std::fs::read_to_string(&held).unwrap(),
+            text,
+            "the draft was rewritten in place"
+        );
+
+        let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|f| f.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["101.json"], "the temporary file was left behind");
+    }
+
+    /// A draft rigor cannot read is one it must not rewrite: there is no way
+    /// to keep the other fields of a file it did not understand.
+    #[test]
+    fn an_invalid_draft_is_never_rewritten() {
+        let d = tempfile::tempdir().unwrap();
+        let text = with(|v| v["version"] = json!(2));
+        let path = write(d.path(), "101.json", &text);
+        let err = set_status(&path, "acme/widget", Status::Skipped, None).unwrap_err();
+        assert!(err.contains("version 2"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 }

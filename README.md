@@ -16,7 +16,9 @@ mergeable right now, and knowing which of your local worktrees still matter.
 `rigor` answers both in one screen, and stays out of the way of the merge button.
 
 It reads everything through the `gh` CLI, so it inherits your existing
-authentication and never asks for a token.
+authentication and never asks for a token. The one thing it ever sends to
+GitHub is a [review draft](#review-drafts) you chose to post, and only on a
+confirmed keypress.
 
 ## Install
 
@@ -51,8 +53,9 @@ repository's pull requests: add `drafts` to `views`, or run `rigor -v drafts`.
 
 Keys: `o`/`Enter` opens the selected pull request in the browser, `c` its checks
 page, `y` copies the URL, `/` filters, `s` toggles between recency and
-merge-readiness ordering, `d` shows or hides drafts, `r` refreshes, `?` lists
-everything.
+merge-readiness ordering, `d` shows or hides draft pull requests, `r` refreshes,
+`?` lists everything. In the `Drafts` view, `a` posts the selected review draft
+(it asks first), `e` edits it and `x` skips it.
 
 CI shows as a rolled-up glyph with counts in each row (`✓ 19`, `✗ 1/19`,
 `◐ 15/19`); selecting a pull request expands every check run with its state and
@@ -116,6 +119,36 @@ Every field is required and, as in the config file, an unknown key, value or
 `version` is an error, not silently ignored. Timestamps are RFC 3339, with `Z`
 or a numeric offset. Only a regular file of at most 256 KB is read; a symbolic
 link, or anything else under a draft's name, is listed as `invalid`.
+
+### Posting a draft
+
+Posting is public and under your name, so it takes two keypresses. The first
+`a` only asks, naming what would be sent in the footer:
+
+```
+post approve to #101? a again to confirm, esc to cancel
+```
+
+A second `a` on the same row sends it. Any other key, a click, or a refresh
+that changes the row withdraws the question.
+
+- A draft is posted only while the pull request is still at the commit the
+  draft was written against, as of the last refresh. `stale`, `unverified`,
+  `invalid`, skipped and already posted drafts cannot be posted; `a` says why.
+- What goes out is the verdict, the body and the inline comments, pinned to
+  that commit, in one `gh api` call. `note` and `picked` never leave your
+  machine.
+- Once GitHub accepts it, the file's `status` becomes `posted` and `posted_at`
+  is set. Those are the only two fields `rigor` ever writes, and it replaces
+  the file in one step rather than writing over it. If `gh` reports a failure,
+  the file is left exactly as it was.
+
+`e` opens the draft's file in `$VISUAL`, else `$EDITOR`, else `vi`, and reads
+it again when the editor exits. `x` skips a draft, or brings a skipped one
+back.
+
+This is the one thing `rigor` sends to GitHub. It still never merges anything,
+and never touches your git repository.
 
 ## Configuration
 

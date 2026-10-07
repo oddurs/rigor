@@ -3,32 +3,32 @@ source: src/ui/tests.rs
 expression: "render(&mut a, 120, 30)"
 ---
  rigor │ acme/widget  ⎇ chore/release-notes                                                                    @octocat
- Ready 1   Mine 2   Review 1   Blocked 1   All 3   Worktrees 5                                 ⌫ 1 removable   ↕ recent
-───────────━━━━━━───────────────────────────────────────────────────────────────────────────────────────────────────────
-▎#4846  ✗ 1/3     ⌂ Give the┌ keys ────────────────────────────────────────────────────────┐                         3m
- #4840  ✓ 3     ✔ ⌂ Move the│  j / k, ↓ / ↑        move selection                          │                         2h
-                            │  g / G, home / end   first / last                            │
-                            │  PgUp / PgDn         page                                    │
+ Ready 1   Mine 2   Review 1┌ keys ────────────────────────────────────────────────────────┐   ⌫ 1 removable   ↕ recent
+───────────━━━━━━───────────│  j / k, ↓ / ↑        move selection                          │────────────────────────────
+▎#4846  ✗ 1/3     ⌂ Give the│  g / G, home / end   first / last                            │                         3m
+ #4840  ✓ 3     ✔ ⌂ Move the│  PgUp / PgDn         page                                    │                         2h
                             │  1–9, tab / ⇧tab     switch view                             │
                             │  enter, o            open PR in browser                      │
                             │  c                   open the PR's checks page               │
                             │  y                   copy PR URL to clipboard                │
+                            │  a                   drafts: post the review (press twice)   │
+                            │  e                   drafts: edit the draft in $EDITOR       │
+                            │  x                   drafts: skip, or bring back             │
                             │  s                   toggle sort: recent ⇄ attention         │
-                            │  d                   show / hide drafts                      │
+                            │  d                   show / hide draft PRs                   │
                             │  /                   filter: title, branch, author, label    │
                             │  esc                 clear filter                            │
                             │  r                   refresh now                             │
-                            │  J / K               scroll the detail pane                  │
-────────────────────────────│  ?                   close this help                         │────────────────────────────
- #4846 Give the read path a │  q                   quit                                    │
- octocat · 3m ago · +220 −24│                                                              │
-  review    review required │  mouse                                                       │
-  merge     no conflicts  → │  click a tab         switch view                             │
-  labels    parser, backend │  click a row         select it                               │
-  branch    retry-budget    │  double-click a row  open it in the browser                  │
-  worktree  widget-wt/retry-│  click a check       open that check run                     │
-  checks    1 passed · 1 fai│  scroll wheel        scroll the list or detail pane          │
-            ✗ e2e (web)     └──────────────────────────────────────────────────────────────┘                      4m03s
-            ◐ typecheck                                                                                           1m12s
+────────────────────────────│  J / K               scroll the detail pane                  │────────────────────────────
+ #4846 Give the read path a │  ?                   close this help                         │
+ octocat · 3m ago · +220 −24│  q                   quit                                    │
+  review    review required │                                                              │
+  merge     no conflicts  → │  mouse                                                       │
+  labels    parser, backend │  click a tab         switch view                             │
+  branch    retry-budget    │  click a row         select it                               │
+  worktree  widget-wt/retry-│  double-click a row  open it in the browser                  │
+  checks    1 passed · 1 fai│  click a check       open that check run                     │
+            ✗ e2e (web)     │  scroll wheel        scroll the list or detail pane          │                      4m03s
+            ◐ typecheck     └──────────────────────────────────────────────────────────────┘                      1m12s
             ✓ build                                                                                               1m42s
  1–6 view   o open   c checks   y copy   / filter   s sort   r refresh                                  ? help   q quit

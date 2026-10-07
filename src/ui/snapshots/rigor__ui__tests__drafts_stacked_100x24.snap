@@ -25,4 +25,4 @@ expression: "render(&mut a, 100, 24)"
   head      1a2b3c4  matches the pull request
 
 
- 1–7 view   o open   c checks   y copy   / filter   s sort   r refresh              ? help   q quit
+ 1–7 view   a post   e edit   x skip   o open   c checks   y copy   / filter        ? help   q quit

@@ -26,8 +26,9 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use std::ffi::OsString;
 use std::io::{Stdout, Write, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use app::App;
@@ -133,6 +134,9 @@ fn main() -> Result<()> {
     };
     let (mut a, rx) = App::new(repo, settings, theme);
     a.drafts_dir = drafts::dir(|key| std::env::var_os(key));
+    a.poster = std::sync::Arc::new(|owner: &str, name: &str, number: u64, body: &str| {
+        github::post_review(owner, name, number, body).map_err(|e| format!("{e:#}"))
+    });
     let result = run(&mut term, &mut a, &rx);
     restore(&mut term, mouse);
     proc::shutdown();
@@ -174,6 +178,10 @@ fn run(
                 Event::FocusLost => a.set_focus(false),
                 _ => {}
             }
+        }
+
+        if let Some(path) = a.edit_request.take() {
+            edit(term, a, &path)?;
         }
 
         while let Ok(msg) = rx.try_recv() {
@@ -258,6 +266,68 @@ fn restore(term: &mut Terminal<CrosstermBackend<Stdout>>, mouse: bool) {
     let _ = term.show_cursor();
 }
 
+/// Take the terminal back after `restore`, for the editor's return.
+fn resume(term: &mut Terminal<CrosstermBackend<Stdout>>, mouse: bool) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        term.backend_mut(),
+        EnterAlternateScreen,
+        Clear(ClearType::All),
+        EnableFocusChange
+    )?;
+    if mouse {
+        execute!(term.backend_mut(), EnableMouseCapture)?;
+    }
+    term.hide_cursor()?;
+    // The editor drew over every cell, and ratatui repaints only what changed
+    // since its own last frame. `resize` starts it from a blank one — and,
+    // unlike `Terminal::clear`, without asking the terminal for its cursor.
+    let size = term.size()?;
+    term.resize(size.into())?;
+    Ok(())
+}
+
+/// `e` on a draft: hand the terminal to the user's editor for that one file,
+/// take it back, and read the file again — whatever it now says.
+fn edit(term: &mut Terminal<CrosstermBackend<Stdout>>, a: &mut App, path: &Path) -> Result<()> {
+    let mouse = a.settings.mouse;
+    let command = editor(|key| std::env::var_os(key));
+    restore(term, mouse);
+    let ran = run_editor(&command, path);
+    resume(term, mouse)?;
+    match ran {
+        Ok(status) if status.success() => {}
+        Ok(status) => a.note(format!("`{command}` ended with {status}")),
+        Err(e) => a.note(format!("could not run `{command}`: {e}")),
+    }
+    a.reload_drafts();
+    Ok(())
+}
+
+/// `$VISUAL`, else `$EDITOR`, else `vi`. A variable set to nothing counts as
+/// unset.
+fn editor(env: impl Fn(&str) -> Option<OsString>) -> String {
+    ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(env)
+        .map(|v| v.to_string_lossy().trim().to_string())
+        .find(|v| !v.is_empty())
+        .unwrap_or_else(|| "vi".into())
+}
+
+/// Split into words like `open_command`, with the file as the last argument.
+/// The editor gets the terminal itself: rigor has stepped out of the way.
+fn run_editor(command: &str, path: &Path) -> std::io::Result<std::process::ExitStatus> {
+    let mut parts = command.split_whitespace();
+    let bin = parts
+        .next()
+        .ok_or_else(|| std::io::Error::other("the command is empty"))?;
+    std::process::Command::new(bin)
+        .args(parts)
+        .arg(path)
+        .status()
+}
+
 fn init_config() -> Result<()> {
     let path = config::user_config_path().context("could not work out a config directory")?;
     if path.exists() {
@@ -329,5 +399,20 @@ mod tests {
         }
         assert!(parse_view("nope").unwrap_err().contains("worktrees"));
         assert_eq!(parse_view("Ready"), Ok(View::Ready));
+    }
+
+    #[test]
+    fn the_editor_is_visual_then_editor_then_vi() {
+        let pick = |vars: &[(&str, &str)]| {
+            editor(|key| {
+                vars.iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| OsString::from(v))
+            })
+        };
+        assert_eq!(pick(&[("VISUAL", "hx"), ("EDITOR", "nano")]), "hx");
+        assert_eq!(pick(&[("EDITOR", "nano -w")]), "nano -w");
+        assert_eq!(pick(&[("VISUAL", " "), ("EDITOR", "nano")]), "nano");
+        assert_eq!(pick(&[]), "vi");
     }
 }

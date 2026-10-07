@@ -15,6 +15,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{App, DraftPr, Hits, Mode};
 use crate::config::{LayoutMode, View};
+use crate::drafts;
 use crate::util::{cols, now_secs, rel_time, secs};
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -435,6 +436,30 @@ fn draw_body(f: &mut Frame<'_>, split: BodySplit, app: &mut App) {
     detail::draw(f, detail_area, app);
 }
 
+/// What the footer says in place of its keys when something needs answering
+/// or went wrong. A question about sending something public outranks
+/// everything else the line could say, and stays until it is answered.
+fn footer_alert(app: &App) -> Option<Line<'static>> {
+    let t = app.theme;
+    if let Some(armed) = &app.armed {
+        return Some(Line::from(vec![
+            Span::styled(
+                format!(" post {} to #{}?", armed.what, armed.number),
+                Style::new().fg(t.pending).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " a again to confirm, esc to cancel",
+                Style::new().fg(t.muted),
+            ),
+        ]));
+    }
+    let e = app.post_error.as_ref().or(app.error.as_ref())?;
+    Some(Line::from(vec![
+        Span::styled(" ✗ ", Style::new().fg(t.failure)),
+        Span::styled(e.clone(), Style::new().fg(t.failure)),
+    ]))
+}
+
 /// The footer is the command line. It uses no filled badges — the same rule as
 /// the nav — and it only offers actions that would do something right now.
 fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -457,11 +482,7 @@ fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    if let Some(e) = &app.error {
-        let line = Line::from(vec![
-            Span::styled(" ✗ ", Style::new().fg(t.failure)),
-            Span::styled(e.clone(), Style::new().fg(t.failure)),
-        ]);
+    if let Some(line) = footer_alert(app) {
         f.render_widget(Paragraph::new(line), area);
         return;
     }
@@ -500,6 +521,20 @@ fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let mut left: Vec<Vec<Span<'_>>> = vec![key(&view_keys, "view")];
+    if let Some(entry) = app.selected_draft() {
+        let state = app.draft_state(entry);
+        if state == drafts::State::Ready {
+            left.push(key("a", "post"));
+        }
+        left.push(key("e", "edit"));
+        match state {
+            drafts::State::Skipped => left.push(key("x", "unskip")),
+            drafts::State::Posted | drafts::State::Invalid => {}
+            drafts::State::Ready | drafts::State::Stale | drafts::State::Unverified => {
+                left.push(key("x", "skip"));
+            }
+        }
+    }
     if has_pr || has_merged || draft_merged {
         left.push(key("o", "open"));
     }

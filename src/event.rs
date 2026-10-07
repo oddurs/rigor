@@ -6,7 +6,8 @@ use ratatui::crossterm::event::{
 };
 use std::time::{Duration, Instant};
 
-use crate::app::{App, Mode, Sort};
+use crate::app::{App, Armed, Mode, Sort};
+use crate::config::View;
 
 /// Two clicks on the same row inside this window count as a double-click,
 /// which crossterm does not report on its own.
@@ -18,10 +19,14 @@ pub fn key(app: &mut App, k: KeyEvent) {
     if k.kind == KeyEventKind::Release {
         return;
     }
+    // A pending post survives exactly one key: a second `a` on the same row.
+    // Taking it here is what makes every other key, in any mode, withdraw it.
+    let armed = app.armed.take();
+    app.post_error = None;
     match app.mode {
         Mode::Filter => filter_key(app, k),
         Mode::Help => help_key(app, k.code),
-        Mode::Browse => browse_key(app, k),
+        Mode::Browse => browse_key(app, k, armed.as_ref()),
     }
 }
 
@@ -59,12 +64,23 @@ const fn help_key(app: &mut App, code: KeyCode) {
     }
 }
 
-fn browse_key(app: &mut App, k: KeyEvent) {
+fn browse_key(app: &mut App, k: KeyEvent, armed: Option<&Armed>) {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    // The draft keys act only in the Drafts view, and never on a chord:
+    // Ctrl-A must not post a review.
+    let drafts = app.view == View::Drafts
+        && !k
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
     match k.code {
         KeyCode::Char('c') if ctrl => app.quit = true,
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('?') => app.mode = Mode::Help,
+        KeyCode::Char('a') if drafts => app.post_key(armed),
+        KeyCode::Char('e') if drafts => app.edit_key(),
+        KeyCode::Char('x') if drafts => app.skip_key(),
+        // Esc answers the prompt and nothing more: an active filter stays.
+        KeyCode::Esc if armed.is_some() => {}
         KeyCode::Esc => {
             if !app.filter.is_empty() {
                 app.filter.clear();
@@ -120,7 +136,7 @@ fn browse_key(app: &mut App, k: KeyEvent) {
             } else {
                 "hidden"
             };
-            app.note(format!("drafts {state}"));
+            app.note(format!("draft PRs {state}"));
             app.rebuild();
         }
         _ => {}
@@ -136,6 +152,14 @@ pub struct Input {
 impl Input {
     pub fn mouse(&mut self, app: &mut App, m: MouseEvent) {
         let (x, y) = (m.column, m.row);
+        // A click or a scroll can move the selection; like a key, it
+        // withdraws a pending post. Merely moving the pointer does not.
+        if matches!(
+            m.kind,
+            MouseEventKind::Down(_) | MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+        ) {
+            app.armed = None;
+        }
         // Help is modal, as it is for keys: a click closes it, and nothing
         // reaches the dashboard underneath.
         if app.mode == Mode::Help {
