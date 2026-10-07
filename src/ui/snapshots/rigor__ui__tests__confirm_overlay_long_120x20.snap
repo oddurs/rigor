@@ -21,4 +21,4 @@ expression: "render(&mut o.a, 120, 20)"
   body      Paragr│            Paragraph 12 of the review.                                           │
             Paragr│            Paragraph 13 of the review.                                           │
             Paragr└ 29 rows still to read · j / k ───────────────────────────────────────────────────┘ ↓ more below · J
- post approve with 1 inline comment to #4840? 29 rows still to read (j / k), then y posts; esc cancels
+ post approve with 1 inline comment to #4840? 29 rows still to read (j / k), then Y posts; esc cancels

@@ -35,12 +35,16 @@ pub fn key(app: &mut App, k: KeyEvent) {
     }
 }
 
-/// Keys while the overlay asks whether to post. `y` answers yes. The
+/// Keys while the overlay asks whether to post. `Y` answers yes. The
 /// movement keys read what would be sent and leave the question up. Anything
 /// else withdraws it and does nothing more: a key pressed to get out of a
 /// question about posting should not also act on the list behind it.
 ///
-/// That includes `a`, the key that asked. A key held down repeats once the
+/// The answer is a capital: shift and `y` together. Lowercase `y` is one of
+/// the keys that withdraw, so that a word with "ay" in it, typed into this
+/// window by mistake however slowly, asks and then takes the question back.
+///
+/// The withdrawing keys include `a`, the key that asked. A key held down repeats once the
 /// keyboard's own delay has passed, and no pause demanded between two `a`s
 /// can tell that from a second press; so a second `a` is never the answer,
 /// and a held one only opens the question and closes it again.
@@ -49,7 +53,9 @@ fn confirm_key(app: &mut App, k: KeyEvent) {
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
     match k.code {
-        KeyCode::Char('y') if !chord => app.confirm(),
+        // With or without SHIFT reported: terminals differ, and the capital
+        // is what says it. Never as a Ctrl or Alt chord.
+        KeyCode::Char('Y') if !chord => app.confirm(),
         KeyCode::Char('j') | KeyCode::Down if !chord => app.scroll_confirm(1),
         KeyCode::Char('k') | KeyCode::Up if !chord => app.scroll_confirm(-1),
         KeyCode::PageDown => app.scroll_confirm(10),

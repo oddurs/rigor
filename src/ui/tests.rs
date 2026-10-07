@@ -1970,10 +1970,10 @@ impl Outbox {
         render(&mut self.a, 160, 40);
     }
 
-    /// `y`, a deliberate while after the question was drawn.
+    /// `Y`, a deliberate while after the question was drawn.
     fn answer(&mut self) {
         self.wait(1_000);
-        press(&mut self.a, "y");
+        press(&mut self.a, "Y");
     }
 
     /// Ask, answer, and take the reply, as the event loop would deliver it.
@@ -2045,7 +2045,7 @@ fn request_4840() -> String {
 /// pull request is and what has been said on it, then sends the review once,
 /// and only then is the file marked posted.
 #[test]
-fn a_asks_and_y_checks_then_posts_exactly_the_review() {
+fn a_asks_and_capital_y_checks_then_posts_exactly_the_review() {
     let mut o = Outbox::new();
     let before = o.json(4840);
 
@@ -2057,7 +2057,7 @@ fn a_asks_and_y_checks_then_posts_exactly_the_review() {
     );
     let prompt = footer(&frame(&mut o.a, 160, 40));
     assert!(
-        prompt.contains("post comment with 2 inline comments to #4840? y to post, esc to cancel"),
+        prompt.contains("post comment with 2 inline comments to #4840? Y to post, esc to cancel"),
         "{prompt:?}"
     );
     assert_eq!(o.file(4840), serde_json::to_string_pretty(&before).unwrap());
@@ -2103,7 +2103,7 @@ fn the_prompt_outranks_a_sync_error() {
     o.ask(4846);
     let line = footer(&frame(&mut o.a, 160, 40));
     assert!(
-        line.contains("post approve to #4846? y to post") && !line.contains("timed out"),
+        line.contains("post approve to #4846? Y to post") && !line.contains("timed out"),
         "{line:?}"
     );
 }
@@ -2157,11 +2157,12 @@ fn a_then_a_cancels() {
     assert!(o.a.posting.is_none() && o.calls().is_empty());
 }
 
-/// `y` answers — once the question has been on screen long enough to have
-/// been seen. The wait is counted from when the overlay was first drawn, not
-/// from the key that asked for it: a repaint that stalls does not use it up.
+/// Capital `Y` answers — once the question has been on screen long enough to
+/// have been seen. The wait is counted from when the overlay was first drawn,
+/// not from the key that asked for it: a repaint that stalls does not use it
+/// up.
 #[test]
-fn an_immediate_y_is_ignored_and_a_later_one_posts() {
+fn an_immediate_capital_y_is_ignored_and_a_later_one_posts() {
     use crate::app::ANSWER_FLOOR_MS;
     let mut o = Outbox::new();
     select_draft(&mut o.a, 4840);
@@ -2171,35 +2172,53 @@ fn an_immediate_y_is_ignored_and_a_later_one_posts() {
     // The frame is slow to come. However long ago the `a` was, nothing has
     // been shown, so nothing can be answered.
     o.wait(5_000);
-    press(&mut o.a, "y");
+    press(&mut o.a, "Y");
     assert!(o.a.posting.is_none(), "answered before it was drawn");
     assert!(o.a.armed.is_some(), "and the question is not taken down");
 
     render(&mut o.a, 160, 40);
-    press(&mut o.a, "y");
+    press(&mut o.a, "Y");
     assert!(o.a.posting.is_none(), "answered in the instant it appeared");
     o.wait(ANSWER_FLOOR_MS - 1);
     render(&mut o.a, 160, 40);
-    press(&mut o.a, "y");
+    press(&mut o.a, "Y");
     assert!(o.a.posting.is_none(), "one millisecond short is short");
     assert!(o.a.armed.is_some() && o.calls().is_empty());
 
     o.wait(1);
-    press(&mut o.a, "y");
-    assert!(o.a.posting.is_some(), "a y after the pause is the answer");
+    press(&mut o.a, "Y");
+    assert!(o.a.posting.is_some(), "a Y after the pause is the answer");
     o.settle();
     assert_eq!(o.posts(), 1);
 }
 
-/// Keys typed ahead arrive together. `ay` in one breath asks, and the `y` is
+/// The whole of it, at an ordinary pace: `a`, a look at what it shows, and
+/// shift-`y`. The capital is the answer whether or not the terminal says
+/// shift was held.
+#[test]
+fn a_then_a_pause_then_capital_y_posts() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for shift in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+        let mut o = Outbox::new();
+        o.ask(4840);
+        o.wait(2_000);
+        crate::event::key(&mut o.a, KeyEvent::new(KeyCode::Char('Y'), shift));
+        assert!(o.a.posting.is_some(), "Y with {shift:?} did not answer");
+        o.settle();
+        assert_eq!(o.posts(), 1);
+        assert_eq!(o.json(4840)["status"], "posted");
+    }
+}
+
+/// Keys typed ahead arrive together. `aY` in one breath asks, and the `Y` is
 /// not an answer to a question that has only just appeared.
 #[test]
-fn typed_ahead_ay_does_not_post() {
+fn a_typed_ahead_answer_does_not_post() {
     // Handed over before any frame is drawn.
     let mut o = Outbox::new();
     select_draft(&mut o.a, 4840);
     o.wait(1_000);
-    press(&mut o.a, "ay");
+    press(&mut o.a, "aY");
     assert!(o.a.posting.is_none());
 
     // And as the event loop takes them: one key, one frame, the next key.
@@ -2208,35 +2227,35 @@ fn typed_ahead_ay_does_not_post() {
     o.wait(1_000);
     press(&mut o.a, "a");
     render(&mut o.a, 160, 40);
-    press(&mut o.a, "y");
+    press(&mut o.a, "Y");
     render(&mut o.a, 160, 40);
-    press(&mut o.a, "yyy");
+    press(&mut o.a, "YYY");
     assert!(o.a.posting.is_none() && o.a.armed.is_some());
     assert!(o.calls().is_empty(), "{:?}", o.calls());
 }
 /// Pasted text is not typing. With bracketed paste it arrives as a paste,
 /// which neither asks nor answers; without, it arrives as keys all at once,
-/// and its `y` comes before the question has been on screen at all.
+/// and its `Y` comes before the question has been on screen at all.
 #[test]
 fn pasted_text_never_asks_or_confirms() {
     // As a paste, with nothing asked: nothing is asked by it.
     let mut o = Outbox::new();
     select_draft(&mut o.a, 4840);
-    crate::event::paste(&mut o.a, "ay");
+    crate::event::paste(&mut o.a, "aY");
     assert!(o.a.armed.is_none() && o.a.posting.is_none());
 
     // As a paste, with the question up and long enough ago to answer: it is
     // not an answer, and the question does not survive it.
     o.ask(4840);
     o.wait(5_000);
-    crate::event::paste(&mut o.a, "y");
+    crate::event::paste(&mut o.a, "Y");
     assert!(o.a.armed.is_none() && o.a.posting.is_none());
 
     // As keys, in the same instant.
     o.wait(1_000);
-    press(&mut o.a, "ay");
+    press(&mut o.a, "aY");
     render(&mut o.a, 160, 40);
-    press(&mut o.a, "y");
+    press(&mut o.a, "Y");
     assert!(o.a.posting.is_none(), "pasted keys posted");
     assert!(o.calls().is_empty(), "{:?}", o.calls());
 
@@ -2245,7 +2264,7 @@ fn pasted_text_never_asks_or_confirms() {
     crate::event::paste(&mut o.a, "pal\x1bette");
     assert_eq!(o.a.filter, "palette");
 }
-/// A question nobody answers or reads goes away on its own, so that a `y`
+/// A question nobody answers or reads goes away on its own, so that a `Y`
 /// typed long after is not about it. Reading it — scrolling — gives it
 /// longer. And it goes by the wall clock too: a question asked before the
 /// lid closed, when the other clock stops, is gone when it opens.
@@ -2261,9 +2280,9 @@ fn the_question_expires() {
     o.a.tick();
     assert!(o.a.armed.is_none(), "it outlived its time");
 
-    // A `y` now is not an answer to anything.
+    // A `Y` now is not an answer to anything.
     o.wait(60_000);
-    press(&mut o.a, "y");
+    press(&mut o.a, "Y");
     assert!(o.a.posting.is_none() && o.calls().is_empty());
 
     // Reading starts the thirty seconds again.
@@ -2348,7 +2367,7 @@ fn the_overlay_shows_what_will_be_posted_and_nothing_else() {
         "{screen}"
     );
     assert!(screen.contains("this is what will be posted"), "{screen}");
-    assert!(screen.contains("y posts · esc cancels"), "{screen}");
+    assert!(screen.contains("Y posts · esc cancels"), "{screen}");
 
     // An approval with no words says there are none, rather than nothing.
     o.a.armed = None;
@@ -2439,7 +2458,7 @@ fn long_draft(o: &mut Outbox) {
 }
 
 /// Nothing is posted unread. A draft longer than the overlay scrolls inside
-/// it, the scrolling leaves the question up, and `y` is turned away until
+/// it, the scrolling leaves the question up, and `Y` is turned away until
 /// every row of it has been on screen — which jumping to the end is not.
 #[test]
 fn nothing_is_posted_until_every_row_has_been_on_screen() {
@@ -2461,11 +2480,11 @@ fn nothing_is_posted_until_every_row_has_been_on_screen() {
     );
     let prompt = footer(&frame(&mut o.a, 120, 20));
     assert!(
-        prompt.contains("rows still to read") && !prompt.contains("y to post"),
+        prompt.contains("rows still to read") && !prompt.contains("Y to post"),
         "{prompt:?}"
     );
 
-    // However deliberate, `y` does not send what has not been shown.
+    // However deliberate, `Y` does not send what has not been shown.
     o.answer();
     assert!(o.a.posting.is_none(), "an unread draft was posted");
     assert!(o.a.armed.is_some(), "and the question is still there");
@@ -2506,8 +2525,8 @@ fn nothing_is_posted_until_every_row_has_been_on_screen() {
     assert_eq!(o.a.armed.as_ref().unwrap().unread(), 0);
     assert!(screen.contains("this is all of it"), "{screen}");
     assert!(
-        footer(&frame(&mut o.a, 120, 20)).contains("y to post"),
-        "the footer still withholds y"
+        footer(&frame(&mut o.a, 120, 20)).contains("Y to post"),
+        "the footer still withholds Y"
     );
 
     // Laid out afresh for another width, they are other rows, and what was
@@ -2583,6 +2602,59 @@ fn confirmation_overlay_snapshots() {
     press(&mut o.a, "G");
     insta::assert_snapshot!("confirm_overlay_long_end_120x20", render(&mut o.a, 120, 20));
 }
+/// Lowercase `y` is not the answer. On the overlay it is one more key that
+/// takes the question down, however long it has been up.
+#[test]
+fn a_lowercase_y_cancels_and_posts_nothing() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut o = Outbox::new();
+    let before = o.file(4840);
+    o.ask(4840);
+    o.wait(5_000);
+    press(&mut o.a, "y");
+    assert!(o.a.armed.is_none(), "y left the question up");
+    assert!(o.a.posting.is_none(), "y posted");
+
+    // Also when a terminal reports it with shift held but does not send the
+    // capital: the letter is what counts.
+    o.ask(4840);
+    o.wait(5_000);
+    crate::event::key(
+        &mut o.a,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::SHIFT),
+    );
+    assert!(o.a.armed.is_none() && o.a.posting.is_none());
+
+    assert!(o.calls().is_empty(), "{:?}", o.calls());
+    assert_eq!(o.file(4840), before);
+}
+
+/// Words typed into the wrong window. "today" and "okay" each hold an `a`
+/// followed by a `y`, and typed one key at a time, half a second apart, each
+/// key gets its frame and no floor stands in the way. They ask, and take the
+/// question back.
+#[test]
+fn words_typed_slowly_into_the_wrong_window_post_nothing() {
+    // None of these has a letter that would start a fetch or change a file
+    // on its own: what is under test is the `a` and the `y`.
+    for word in ["today", "okay", "say", "maybe", "anyway", "always"] {
+        let mut o = Outbox::new();
+        let before = o.file(4840);
+        select_draft(&mut o.a, 4840);
+        o.wait(1_000);
+        for key in word.chars() {
+            press(&mut o.a, &key.to_string());
+            render(&mut o.a, 160, 40);
+            assert!(o.a.posting.is_none(), "{word:?} posted at {key:?}");
+            o.wait(500);
+        }
+        // Whatever row the word's other letters left the cursor on, nothing
+        // was sent and nothing was changed.
+        assert!(o.calls().is_empty(), "{word:?}: {:?}", o.calls());
+        assert_eq!(o.file(4840), before, "{word:?}");
+        assert!(o.a.armed.is_none(), "{word:?} left the question up");
+    }
+}
 // --------------------------------------------------- withdrawing a question
 
 /// The question answers to `a`, and reads with the movement keys. Anything
@@ -2595,7 +2667,7 @@ fn any_other_key_withdraws_the_question_and_does_nothing_else() {
     let before = o.file(4840);
 
     for other in [
-        "\x1b", "a", "?", "s", "e", "x", "q", "o", "c", "/", "\n", "r", "d", "1", "\t",
+        "\x1b", "a", "y", "?", "s", "e", "x", "q", "o", "c", "/", "\n", "r", "d", "1", "\t",
     ] {
         o.ask(4840);
         assert!(o.a.armed.is_some(), "before {other:?}");
@@ -3291,7 +3363,7 @@ fn an_unverified_draft_is_checked_on_github_and_then_posted() {
     let prompt = footer(&frame(&mut o.a, 160, 40));
     assert!(
         prompt.contains(
-            "post approve with 1 inline comment to #4990? not fetched here, so GitHub is asked for its head first. y to post, esc to cancel"
+            "post approve with 1 inline comment to #4990? not fetched here, so GitHub is asked for its head first. Y to post, esc to cancel"
         ),
         "{prompt:?}"
     );
@@ -3326,20 +3398,29 @@ fn a_fetch_that_verifies_the_draft_withdraws_the_unverified_prompt() {
     assert!(o.calls().is_empty());
 }
 
-/// `a` asks only from the Drafts view, and neither it nor `y` does anything
+/// `a` asks only from the Drafts view, and neither it nor `Y` does anything
 /// as a chord.
 #[test]
-fn a_and_y_do_nothing_outside_the_drafts_view_or_as_a_chord() {
+fn a_and_capital_y_do_nothing_outside_the_drafts_view_or_as_a_chord() {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let mut o = Outbox::new();
     o.a.set_view(View::All);
     o.wait(1_000);
     press(&mut o.a, "a");
     assert!(o.a.armed.is_none() && o.a.posting.is_none());
-
+    // With no question up, `Y` is bound to nothing, here or in Drafts.
+    press(&mut o.a, "Y");
     o.a.set_view(View::Drafts);
     select_draft(&mut o.a, 4840);
-    for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+    press(&mut o.a, "Y");
+    assert!(o.a.armed.is_none() && o.a.posting.is_none() && o.a.notice.is_none());
+
+    for modifier in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ] {
         o.wait(1_000);
         crate::event::key(&mut o.a, KeyEvent::new(KeyCode::Char('a'), modifier));
         assert!(
@@ -3349,10 +3430,10 @@ fn a_and_y_do_nothing_outside_the_drafts_view_or_as_a_chord() {
         // Nor does a chord answer a question that is up: it takes it down.
         o.ask(4840);
         o.wait(1_000);
-        crate::event::key(&mut o.a, KeyEvent::new(KeyCode::Char('y'), modifier));
+        crate::event::key(&mut o.a, KeyEvent::new(KeyCode::Char('Y'), modifier));
         assert!(
             o.a.armed.is_none() && o.a.posting.is_none(),
-            "{modifier:?}-y answered"
+            "{modifier:?}-Y answered"
         );
     }
     assert!(o.calls().is_empty());

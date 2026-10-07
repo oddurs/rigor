@@ -38,7 +38,7 @@ const KEYS = [
   ['s', 'sort by recency or by merge-readiness'],
   ['d', 'show or hide draft pull requests'],
   [
-    'a, then y',
+    'a, then Y',
     'in Drafts: ask to post the review, then post it — GitHub is checked first',
   ],
   ['e', 'in Drafts: edit the draft in your editor'],

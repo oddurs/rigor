@@ -21,4 +21,4 @@ expression: "render(&mut o.a, 120, 20)"
   body      Paragr│  comment   src/last.rs:9                                                         │
             Paragr│            THE-LAST-LINE                                                         │
             Paragr└ 13 rows still to read · j / k ───────────────────────────────────────────────────┘ ↓ more below · J
- post approve with 1 inline comment to #4840? 13 rows still to read (j / k), then y posts; esc cancels
+ post approve with 1 inline comment to #4840? 13 rows still to read (j / k), then Y posts; esc cancels

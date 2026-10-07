@@ -246,7 +246,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    // The bottom edge says how much is left to read, and what `y` would do
+    // The bottom edge says how much is left to read, and what `Y` would do
     // once there is none.
     let unread = armed.unread();
     let (edge, edge_style) = if unread > 0 {
@@ -257,7 +257,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
         )
     } else {
         (
-            " this is all of it · y posts · esc cancels ".to_string(),
+            " this is all of it · Y posts · esc cancels ".to_string(),
             Style::new().fg(t.muted),
         )
     };

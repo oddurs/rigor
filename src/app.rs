@@ -58,7 +58,7 @@ impl drafts::Remote for Unwired {
 pub const ANSWER_FLOOR_MS: i64 = 400;
 
 /// A question nobody answers or reads withdraws itself after this long, so
-/// that a `y` typed much later is not about it.
+/// that a `Y` typed much later is not about it.
 pub const ARMED_FOR_MS: i64 = 30_000;
 
 /// A post waiting to be confirmed: a question on screen, and the overlay that
@@ -71,8 +71,9 @@ pub const ARMED_FOR_MS: i64 = 30_000;
 /// question on screen is no longer the one a keypress would be answering, and
 /// it is withdrawn.
 ///
-/// The question is asked with `a` and answered with `y`: a different key, so
-/// that neither holding `a` down nor striking it twice can be the answer.
+/// The question is asked with `a` and answered with `Y`: a different key, so
+/// that neither holding `a` down nor striking it twice can be the answer, and
+/// a capital, so that no ordinary word typed into the wrong window is.
 #[derive(Debug, Clone)]
 pub struct Armed {
     pub path: PathBuf,
@@ -103,7 +104,7 @@ pub struct Armed {
     /// The window is too small for the overlay to show its rows whole.
     /// Nothing is posted from a window that cannot show it.
     pub cramped: bool,
-    /// A `y` was turned away for either reason, so the overlay says it louder.
+    /// A `Y` was turned away for either reason, so the overlay says it louder.
     pub nudged: bool,
 }
 
@@ -848,7 +849,7 @@ impl App {
 
     /// `a` with no question up. Posting is public and under the user's name,
     /// so this only asks: it opens the overlay showing exactly what would be
-    /// sent. Sending takes a different key, `y` (`confirm`).
+    /// sent. Sending takes a different key, `Y` (`confirm`).
     pub fn post_key(&mut self) {
         use drafts::State;
         let Some(entry) = self.selected_draft().cloned() else {
@@ -905,7 +906,7 @@ impl App {
         }
     }
 
-    /// `y`, with the question up. Goes ahead only once all of what would be
+    /// `Y`, with the question up. Goes ahead only once all of what would be
     /// sent has been on screen, in a window that can show it, for long enough
     /// to have been seen — and then only if GitHub, asked there and then,
     /// still agrees (`drafts::deliver`).

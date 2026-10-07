@@ -28,13 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The first `a` opens an overlay showing exactly what would be posted — the
     pull request, the verdict, the body, each inline comment — and not the
     draft's private `note` and `picked`, which are never sent. Nothing in it
-    is cut short. `y` then posts: a different key, so that neither a held `a`
-    nor a second one can be the answer. It is ignored in the first 400 ms
-    after the overlay appears, and turned away until every row of the overlay
-    has been on screen, or while the window is too small to show it whole. A
-    paste never asks or answers. Any other key takes the overlay down and
-    does nothing else; so does a refresh that changes the draft, and thirty
-    seconds without an answer or a scroll.
+    is cut short. Capital `Y` then posts: a different key, so that neither a
+    held `a` nor a second one can be the answer, and a capital, so that no
+    word typed into the wrong window can be either. It is ignored in the
+    first 400 ms after the overlay appears, and turned away until every row
+    of the overlay has been on screen, or while the window is too small to
+    show it whole. A paste never asks or answers. Any other key, lowercase
+    `y` among them, takes the overlay down and does nothing else; so does a
+    refresh that changes the draft, and thirty seconds without an answer or a
+    scroll.
   - Going ahead reads the pull request and its reviews from GitHub first, and
     sends nothing if a read fails. A pull request closed without merging, or
     one that has moved on from the commit the draft was written against, is

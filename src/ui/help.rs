@@ -16,7 +16,7 @@ const KEYS: &[(&str, &str)] = &[
     ("enter, o", "open PR in browser"),
     ("c", "open the PR's checks page"),
     ("y", "copy PR URL to clipboard"),
-    ("a, then y", "drafts: ask to post, then post it"),
+    ("a, then Y", "drafts: ask to post, then post it"),
     ("e", "drafts: edit the draft in $EDITOR"),
     ("x", "drafts: skip, or bring back"),
     ("s", "toggle sort: recent ⇄ attention"),

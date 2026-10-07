@@ -55,7 +55,7 @@ Keys: `o`/`Enter` opens the selected pull request in the browser, `c` its checks
 page, `y` copies the URL, `/` filters, `s` toggles between recency and
 merge-readiness ordering, `d` shows or hides draft pull requests, `r` refreshes,
 `?` lists everything. In the `Drafts` view, `a` asks to post the selected review
-draft and `y` then posts it, `e` edits it and `x` skips it.
+draft and `Y` (capital) then posts it, `e` edits it and `x` skips it.
 
 CI shows as a rolled-up glyph with counts in each row (`✓ 19`, `✗ 1/19`,
 `◐ 15/19`); selecting a pull request expands every check run with its state and
@@ -133,18 +133,20 @@ path wraps — and the private `note` and `picked` are not in it, because they
 are not sent. The footer names the action:
 
 ```
-post approve to #101? y to post, esc to cancel
+post approve to #101? Y to post, esc to cancel
 ```
 
-`y` goes ahead, under three conditions:
+Capital `Y` goes ahead, under three conditions:
 
-- **It answers a question you have had time to see.** A `y` in the first
+- **It answers a question you have had time to see.** A `Y` in the first
   400 ms after the overlay appears is ignored, so keys typed ahead are not an
   answer. Pasted text never asks and never answers. And the key that asks is
   not the key that answers: a second `a`, or an `a` held down, only takes the
-  overlay down again.
+  overlay down again. Nor is the answer a letter an ordinary word contains:
+  lowercase `y` takes the overlay down like any other key, so "today" typed
+  into the wrong window asks and then takes it back.
 - **You have been shown all of it.** A draft longer than the overlay scrolls
-  inside it with `j` / `k`, and `y` is turned away until every row of it has
+  inside it with `j` / `k`, and `Y` is turned away until every row of it has
   been on screen; jumping to the end does not count for the rows in between.
   In a window too small to show it without cutting something, the overlay asks
   for a larger one and nothing is posted.

@@ -894,13 +894,13 @@ fn ready_to_post_with(w: &World, env: &[(&str, &str)]) -> (Term, PathBuf, String
 /// The question a first `a` puts up, drawn.
 const ASKED: &str = "this is what will be posted";
 
-/// `a`, the overlay read, a pause any person would leave, and `y`.
+/// `a`, the overlay read, a pause any person would leave, and capital `Y`.
 fn confirm(t: &Term) {
     t.send(b"a");
     t.wait_for(ASKED, LOAD);
-    t.wait_for("y to post, esc to cancel", LOAD);
+    t.wait_for("Y to post, esc to cancel", LOAD);
     std::thread::sleep(Duration::from_millis(600));
-    t.send(b"y");
+    t.send(b"Y");
 }
 
 /// The one write rigor makes to GitHub, end to end. The first `a` only asks,
@@ -916,7 +916,7 @@ fn a_confirmed_post_reads_twice_then_sends_exactly_one_review() {
 
     t.send(b"a");
     t.wait_for(
-        "post approve with 1 inline comment to #101? y to post, esc to cancel",
+        "post approve with 1 inline comment to #101? Y to post, esc to cancel",
         LOAD,
     );
     // What will go out is on screen, under the pull request it is for, and
@@ -941,7 +941,7 @@ fn a_confirmed_post_reads_twice_then_sends_exactly_one_review() {
     assert_eq!(w.calls(), [FETCH], "one a reached GitHub");
 
     std::thread::sleep(Duration::from_millis(600));
-    t.send(b"y");
+    t.send(b"Y");
     t.wait_line("#101 posted", LOAD, |l| {
         l.contains("#101") && l.contains("✓ posted")
     });
@@ -988,7 +988,7 @@ fn a_confirmed_post_reads_twice_then_sends_exactly_one_review() {
 }
 
 /// A stray keypress reaches nothing: `a` only asks, a second `a` is not an
-/// answer, and anything that is not `y` takes the question down.
+/// answer, and anything that is not capital `Y` takes the question down.
 #[test]
 fn a_alone_sends_nothing_and_a_second_a_cancels() {
     let w = World::new();
@@ -1032,10 +1032,10 @@ fn a_alone_sends_nothing_and_a_second_a_cancels() {
     );
 }
 
-/// A key held down, keys typed ahead, a paste with `ay` in it: none of them
+/// A key held down, keys typed ahead, a paste with `aY` in it: none of them
 /// is a decision, and none of them posts.
 #[test]
-fn a_held_a_typed_ahead_ay_and_a_paste_do_not_post() {
+fn a_held_a_a_typed_ahead_answer_and_a_paste_do_not_post() {
     let w = World::new();
     w.pull(101, "open", false, FIXTURE_HEAD_101);
     let (t, path, before) = ready_to_post(&w);
@@ -1056,19 +1056,19 @@ fn a_held_a_typed_ahead_ay_and_a_paste_do_not_post() {
     t.send(b"\x1b");
     t.wait("the question to go", LOAD, |s| !s.contains(ASKED));
 
-    // Typed ahead: both keys in one write. The `a` asks; the `y` arrives
+    // Typed ahead: both keys in one write. The `a` asks; the `Y` arrives
     // before the question has been on screen long enough to be an answer.
-    t.send(b"ay");
+    t.send(b"aY");
     t.wait_for(ASKED, LOAD);
     std::thread::sleep(Duration::from_millis(900));
-    assert_eq!(w.calls(), [FETCH], "typed-ahead ay posted");
+    assert_eq!(w.calls(), [FETCH], "a typed-ahead aY posted");
     assert!(t.text().contains(ASKED), "and the question is still up");
 
     // A paste is not an answer, and takes the question down.
-    t.send(b"\x1b[200~y\x1b[201~");
+    t.send(b"\x1b[200~Y\x1b[201~");
     t.wait("the question to go", LOAD, |s| !s.contains(ASKED));
     // Nor is it a question.
-    t.send(b"\x1b[200~ay\x1b[201~");
+    t.send(b"\x1b[200~aY\x1b[201~");
     t.send(b"?");
     t.wait_for(" keys ", LOAD);
     let text = t.text();
@@ -1461,6 +1461,44 @@ fn quitting_mid_post_lets_it_finish_and_records_it() {
     );
 }
 
+/// Words typed into the wrong window, one key at a time, half a second
+/// apart: slowly enough that every key gets its frame and the floor is long
+/// past. "today" and "okay" each ask, with their `a`, and take the question
+/// back, with their `y`. Lowercase `y` is never the answer.
+#[test]
+fn words_typed_slowly_into_the_wrong_window_post_nothing() {
+    let w = World::new();
+    w.pull(101, "open", false, FIXTURE_HEAD_101);
+    let (t, path, before) = ready_to_post(&w);
+
+    for word in ["today", "okay"] {
+        for key in word.bytes() {
+            t.send(&[key]);
+            if key == b'a' {
+                // The question it asks is up, and stays up for the half
+                // second before the next key.
+                t.wait_for(ASKED, LOAD);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        t.wait("the question to go", LOAD, |s| !s.contains(ASKED));
+    }
+
+    // And the plain case: `a`, a long look, lowercase `y`.
+    t.send(b"a");
+    t.wait_for(ASKED, LOAD);
+    t.wait_for("Y to post, esc to cancel", LOAD);
+    std::thread::sleep(Duration::from_millis(900));
+    t.send(b"y");
+    t.wait("the question to go", LOAD, |s| !s.contains(ASKED));
+
+    t.send(b"?");
+    t.wait_for(" keys ", LOAD);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(w.calls(), [FETCH], "a word posted a review");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+}
+
 /// A signal ends rigor the same way a key does, and gets the same care: the
 /// post in flight is let finish and is recorded.
 #[test]
@@ -1545,13 +1583,13 @@ fn an_unverified_draft_whose_live_head_matches_is_posted() {
 
     t.send(b"a");
     t.wait_for(
-        "#999? not fetched here, so GitHub is asked for its head first. y to post",
+        "#999? not fetched here, so GitHub is asked for its head first. Y to post",
         LOAD,
     );
     assert_eq!(w.calls(), [FETCH]);
 
     std::thread::sleep(Duration::from_millis(600));
-    t.send(b"y");
+    t.send(b"Y");
     t.wait_line("#999 posted", LOAD, |l| {
         l.contains("#999") && l.contains("✓ posted")
     });
