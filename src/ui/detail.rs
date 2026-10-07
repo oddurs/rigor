@@ -98,7 +98,7 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &mut App) {
 /// Where values begin: two columns of margin plus a ten-column label.
 const VALUE_COL: usize = 12;
 
-fn field<'a>(k: &'a str, t: &Theme) -> Span<'a> {
+pub(super) fn field<'a>(k: &'a str, t: &Theme) -> Span<'a> {
     Span::styled(format!("  {}", pad(k, 10)), Style::new().fg(t.muted))
 }
 

@@ -10,8 +10,9 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::util::parse_iso8601;
 
@@ -58,7 +59,7 @@ pub enum Status {
     Skipped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Side {
     Left,
@@ -239,6 +240,7 @@ pub struct Live {
 /// A review already on a pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Review {
+    pub id: u64,
     pub author: String,
     /// `APPROVED`, `COMMENTED`, `CHANGES_REQUESTED`, `DISMISSED` or `PENDING`.
     pub state: String,
@@ -248,13 +250,27 @@ pub struct Review {
     pub submitted_at: Option<String>,
 }
 
+/// How a write that did not succeed ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostFailure {
+    /// GitHub answered, and the answer was no. Nothing was posted.
+    Declined(String),
+    /// No answer came back: a timeout, a dropped connection, a gateway error.
+    /// The review may or may not be on the pull request.
+    NoAnswer(String),
+}
+
 /// What posting needs from GitHub, for one repository. `main` wires in `gh`;
 /// a test hands over a recorder, so nothing built in a test can reach GitHub.
 pub trait Remote: Send + Sync {
     fn pull(&self, number: u64) -> Result<Live, String>;
     /// Every review on the pull request, all pages.
     fn reviews(&self, number: u64) -> Result<Vec<Review>, String>;
-    fn post(&self, number: u64, body: &str) -> Result<(), String>;
+    /// The inline comments of one review, all pages.
+    fn review_comments(&self, number: u64, review: u64) -> Result<Vec<Comment>, String>;
+    fn post(&self, number: u64, body: &str) -> Result<(), PostFailure>;
+    /// How long any one of these calls may take.
+    fn timeout(&self) -> Duration;
 }
 
 /// Why nothing was sent.
@@ -267,13 +283,17 @@ pub enum Refusal {
     /// The viewer has reviewed the pull request since the draft was written,
     /// and not with this review.
     ReviewedSince,
+    /// The viewer has a review started and not submitted. GitHub allows one.
+    Pending,
     /// Who is asking is not known, so their reviews cannot be told from
     /// anyone else's.
     NoViewer,
     /// GitHub could not be asked.
     Unchecked(String),
-    /// GitHub was asked to take the review and did not.
+    /// GitHub was asked to take the review and said no.
     Rejected(String),
+    /// Another rigor is posting this same draft right now.
+    Busy,
 }
 
 /// How an attempt to post ended.
@@ -284,6 +304,9 @@ pub enum Outcome {
     /// time. Nothing was sent.
     AlreadySent(String),
     Refused(Refusal),
+    /// The review was sent and no answer came back. Whether it is on the
+    /// pull request is not known; asking again will find out before sending.
+    Unknown(String),
 }
 
 /// A pull request that is gone, or no longer at the draft's commit, cannot
@@ -298,39 +321,74 @@ fn check_pull(d: &Draft, live: &Live) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// The viewer's own reviews since the draft was written decide whether it is
-/// still theirs to send. The same review — event, commit and body — means it
-/// already went out: a post that timed out, or was cut off by quitting, still
-/// landed. Any other review means they have since said something else, and
-/// the draft is not sent on top of it.
-fn check_reviews(d: &Draft, viewer: &str, reviews: &[Review]) -> Option<Outcome> {
-    // Checked when the draft was read. Were it somehow not a time, every
-    // review counts as since: the doubt must not end in a second post.
-    let written = parse_iso8601(&d.created_at).unwrap_or(i64::MIN);
-    let mut since = reviews.iter().filter(|r| {
-        r.author.eq_ignore_ascii_case(viewer)
-            && r.submitted_at
-                .as_deref()
-                .and_then(parse_iso8601)
-                .is_some_and(|at| at >= written)
-    });
-    let same = |r: &&Review| {
+/// Inline comments as a thing to compare: every one, in no particular order,
+/// with the whitespace GitHub may have trimmed from the ends left out.
+fn comment_set(comments: &[Comment]) -> Vec<(&str, u64, Side, &str)> {
+    let mut set: Vec<_> = comments
+        .iter()
+        .map(|c| (c.path.as_str(), c.line, c.side, c.body.trim()))
+        .collect();
+    set.sort_unstable();
+    set
+}
+
+/// The viewer's own reviews decide whether the draft is still theirs to send.
+///
+/// The same review — verdict, commit, body and every inline comment — means
+/// it already went out, whenever that was: a post that timed out, or was cut
+/// off by quitting, still landed. The verdict, commit and body alone are not
+/// enough to say so: a reply typed in the browser is a comment review with no
+/// body, just like a draft that is all inline comments. So a review that
+/// looks the same has its comments read and compared before it is believed.
+///
+/// Failing that, a review of theirs since the draft was written means they
+/// have said something else, and one still pending means GitHub would refuse
+/// another. Either way the draft is not sent on top of it.
+fn check_reviews(
+    remote: &dyn Remote,
+    number: u64,
+    d: &Draft,
+    viewer: &str,
+    reviews: &[Review],
+) -> Result<Option<Outcome>, String> {
+    let mine: Vec<&Review> = reviews
+        .iter()
+        .filter(|r| r.author.eq_ignore_ascii_case(viewer))
+        .collect();
+    let looks_the_same = |r: &&&Review| {
         r.state == d.verdict.submitted_as()
             && r.commit.eq_ignore_ascii_case(&d.head_sha)
             && r.body.trim() == d.body.trim()
     };
-    if let Some(sent) = since.clone().find(same) {
-        return Some(Outcome::AlreadySent(
-            sent.submitted_at.clone().unwrap_or_default(),
-        ));
+    for candidate in mine.iter().filter(looks_the_same) {
+        let theirs = remote.review_comments(number, candidate.id)?;
+        if comment_set(&theirs) == comment_set(&d.comments) {
+            return Ok(Some(Outcome::AlreadySent(
+                candidate.submitted_at.clone().unwrap_or_default(),
+            )));
+        }
     }
-    since
-        .next()
-        .map(|_| Outcome::Refused(Refusal::ReviewedSince))
+
+    // Checked when the draft was read. Were it somehow not a time, every
+    // review counts as since: the doubt must not end in a second post.
+    let written = parse_iso8601(&d.created_at).unwrap_or(i64::MIN);
+    let since = mine.iter().any(|r| {
+        r.submitted_at
+            .as_deref()
+            .and_then(parse_iso8601)
+            .is_some_and(|at| at >= written)
+    });
+    if since {
+        return Ok(Some(Outcome::Refused(Refusal::ReviewedSince)));
+    }
+    if mine.iter().any(|r| r.state == "PENDING") {
+        return Ok(Some(Outcome::Refused(Refusal::Pending)));
+    }
+    Ok(None)
 }
 
 /// Post `d` to pull request `number`, if GitHub's own account of the pull
-/// request, read here and now, still allows it. Two reads, then at most one
+/// request, read here and now, still allows it. Reads, then at most one
 /// write; a read that fails sends nothing.
 ///
 /// This is what a confirming keypress runs. What the list showed when the
@@ -347,19 +405,149 @@ pub fn deliver(remote: &dyn Remote, viewer: &str, number: u64, d: &Draft) -> Out
     if let Err(why) = check_pull(d, &live) {
         return Outcome::Refused(why);
     }
-    let reviews = match remote.reviews(number) {
-        Ok(reviews) => reviews,
+    let settled = remote
+        .reviews(number)
+        .and_then(|reviews| check_reviews(remote, number, d, viewer, &reviews));
+    match settled {
+        Ok(Some(outcome)) => return outcome,
+        Ok(None) => {}
         Err(e) => return Outcome::Refused(Refusal::Unchecked(e)),
-    };
-    if let Some(settled) = check_reviews(d, viewer, &reviews) {
-        return settled;
     }
-    let sent = payload(d)
-        .map_err(|e| format!("could not build the review: {e}"))
-        .and_then(|body| remote.post(number, &body));
-    match sent {
+    let body = match payload(d) {
+        Ok(body) => body,
+        Err(e) => {
+            return Outcome::Refused(Refusal::Rejected(format!(
+                "could not build the review: {e}"
+            )));
+        }
+    };
+    match remote.post(number, &body) {
         Ok(()) => Outcome::Sent,
-        Err(e) => Outcome::Refused(Refusal::Rejected(e)),
+        Err(PostFailure::Declined(e)) => Outcome::Refused(Refusal::Rejected(e)),
+        Err(PostFailure::NoAnswer(e)) => Outcome::Unknown(e),
+    }
+}
+
+/// How much longer than one call a lock may sit before it is taken for one
+/// its owner left behind.
+const LOCK_MARGIN: Duration = Duration::from_secs(15);
+
+/// A lock file beside a draft, held for as long as one rigor is reading and
+/// posting for it, so that two windows on the same repository cannot both
+/// send it. Created with `O_EXCL`, so only one of them can; removed when the
+/// attempt is over.
+struct Lock {
+    path: PathBuf,
+}
+
+impl Lock {
+    fn beside(draft: &Path) -> PathBuf {
+        let name = draft
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // Not `*.json`, so the loader never takes it for a draft.
+        draft.with_file_name(format!(".{name}.lock"))
+    }
+
+    /// `None` when another rigor holds it. A lock not touched for longer
+    /// than a call can last, plus a margin, was left by one that died, and
+    /// is replaced.
+    fn take(draft: &Path, call: Duration) -> std::io::Result<Option<Self>> {
+        let path = Self::beside(draft);
+        for _ in 0..2 {
+            let made = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path);
+            match made {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "{}", std::process::id());
+                    return Ok(Some(Self { path }));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let age = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|at| at.elapsed().ok());
+                    // No age to read means it was just removed, or its clock
+                    // is ahead of ours: either way, try once more.
+                    if age.is_some_and(|age| age <= call + LOCK_MARGIN) {
+                        return Ok(None);
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Say the owner is still alive. Called before every call to GitHub, so
+    /// the lock's age is the age of the call in flight, not of the attempt.
+    fn touch(&self) {
+        if let Ok(file) = std::fs::File::options().write(true).open(&self.path) {
+            let _ = file.set_modified(std::time::SystemTime::now());
+        }
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A remote that keeps a lock fresh for as long as it is being used.
+struct Held<'a> {
+    remote: &'a dyn Remote,
+    lock: &'a Lock,
+}
+
+impl Remote for Held<'_> {
+    fn pull(&self, number: u64) -> Result<Live, String> {
+        self.lock.touch();
+        self.remote.pull(number)
+    }
+    fn reviews(&self, number: u64) -> Result<Vec<Review>, String> {
+        self.lock.touch();
+        self.remote.reviews(number)
+    }
+    fn review_comments(&self, number: u64, review: u64) -> Result<Vec<Comment>, String> {
+        self.lock.touch();
+        self.remote.review_comments(number, review)
+    }
+    fn post(&self, number: u64, body: &str) -> Result<(), PostFailure> {
+        self.lock.touch();
+        self.remote.post(number, body)
+    }
+    fn timeout(&self) -> Duration {
+        self.remote.timeout()
+    }
+}
+
+/// `deliver`, with the draft at `path` locked against any other rigor for
+/// the whole of it: the reads and the write are one attempt, and two
+/// attempts at once could each find nothing posted and both post.
+pub fn deliver_exclusively(
+    remote: &dyn Remote,
+    viewer: &str,
+    number: u64,
+    path: &Path,
+    d: &Draft,
+) -> Outcome {
+    match Lock::take(path, remote.timeout()) {
+        Ok(Some(lock)) => deliver(
+            &Held {
+                remote,
+                lock: &lock,
+            },
+            viewer,
+            number,
+            d,
+        ),
+        Ok(None) => Outcome::Refused(Refusal::Busy),
+        Err(e) => Outcome::Refused(Refusal::Unchecked(format!("could not lock the draft: {e}"))),
     }
 }
 
@@ -473,10 +661,38 @@ pub fn load(dir: &Path, owner: &str, name: &str) -> std::io::Result<Vec<Entry>> 
     Ok(entries)
 }
 
+/// Replace the file at `path` with `draft`. Written beside the file, flushed
+/// to disk, and renamed over it, so nothing reading the directory ever sees
+/// half a draft and a crash leaves either the old file or the new one. The
+/// new file keeps the old one's permissions.
+fn replace(path: &Path, draft: &Draft) -> Result<(), String> {
+    let mut text = serde_json::to_string_pretty(draft).map_err(|e| e.to_string())?;
+    text.push('\n');
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let written = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        if let Ok(meta) = std::fs::metadata(path) {
+            file.set_permissions(meta.permissions())?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    written.map_err(|e: std::io::Error| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
+}
+
 /// Set a draft's `status` and `posted_at`, leaving every other field as it is
 /// on disk right now — read fresh, so an edit made since the list was loaded
-/// survives. Written beside the file and renamed over it, so nothing reading
-/// the directory ever sees half a draft.
+/// survives. A file rigor cannot read as a draft, a symbolic link among them,
+/// is never rewritten.
 pub fn set_status(
     path: &Path,
     slug: &str,
@@ -486,20 +702,28 @@ pub fn set_status(
     let mut draft = read(path.to_path_buf(), slug).draft?;
     draft.status = status;
     draft.posted_at = posted_at;
-    let mut text = serde_json::to_string_pretty(&draft).map_err(|e| e.to_string())?;
-    text.push('\n');
+    replace(path, &draft)
+}
 
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, text)
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("{}: {e}", path.display())
-        })
+/// Record that `sent` is on GitHub, posted at `at`. `raw` is the file as it
+/// was when `sent` was read from it.
+///
+/// If the file still says that, only its status changes. If it says anything
+/// else by now — edited, regenerated, gone — then what it says is not what
+/// was posted, and marking *that* posted would be a false record: the draft
+/// that was sent is written back instead. Returns whether it had to be.
+pub fn record_posted(path: &Path, raw: &str, sent: &Draft, at: String) -> Result<bool, String> {
+    // A link is not followed to be overwritten, whatever it points at.
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!("{}: a symbolic link", path.display()));
+    }
+    let changed = read_text(path).ok().as_deref() != Some(raw);
+    let posted = Draft {
+        status: Status::Posted,
+        posted_at: Some(at),
+        ..sent.clone()
+    };
+    replace(path, &posted).map(|()| changed)
 }
 
 #[cfg(test)]
@@ -846,7 +1070,8 @@ pub mod tests {
     struct Github {
         pull: Result<Live, String>,
         reviews: Result<Vec<Review>, String>,
-        post: Result<(), String>,
+        comments: Result<Vec<Comment>, String>,
+        post: Result<(), PostFailure>,
         calls: std::sync::Mutex<Vec<&'static str>>,
     }
 
@@ -859,17 +1084,25 @@ pub mod tests {
             self.calls.lock().unwrap().push("reviews");
             self.reviews.clone()
         }
-        fn post(&self, _: u64, _: &str) -> Result<(), String> {
+        fn review_comments(&self, _: u64, _: u64) -> Result<Vec<Comment>, String> {
+            self.calls.lock().unwrap().push("comments");
+            self.comments.clone()
+        }
+        fn post(&self, _: u64, _: &str) -> Result<(), PostFailure> {
             self.calls.lock().unwrap().push("post");
             self.post.clone()
+        }
+        fn timeout(&self) -> Duration {
+            Duration::from_secs(45)
         }
     }
 
     const MOVED: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432";
-    /// The sample draft was written at 09:00.
-    const BEFORE: &str = "2027-01-15T08:59:59Z";
-    const AT: &str = "2027-01-15T09:00:00Z";
-    const AFTER: &str = "2027-01-15T09:30:00Z";
+    /// The sample draft was written at 07:00. The frozen clock of the screen
+    /// tests is 08:00, which is when the app would have posted it.
+    const BEFORE: &str = "2027-01-15T06:59:59Z";
+    const AT: &str = "2027-01-15T07:00:00Z";
+    const AFTER: &str = "2027-01-15T08:00:00Z";
 
     fn open_at(head: &str) -> Live {
         Live {
@@ -879,9 +1112,10 @@ pub mod tests {
         }
     }
 
-    /// A review that is exactly what the sample draft would send, by `author`.
+    /// A review that reads exactly as the sample draft would, by `author`.
     fn review(author: &str, at: &str) -> Review {
         Review {
+            id: 7,
             author: author.into(),
             state: "APPROVED".into(),
             commit: HEAD.into(),
@@ -890,15 +1124,27 @@ pub mod tests {
         }
     }
 
+    /// The sample draft's one inline comment, as GitHub would list it.
+    fn its_comment() -> Comment {
+        Comment {
+            path: "src/x.rs".into(),
+            line: 84,
+            side: Side::Right,
+            body: "Worth a test.".into(),
+        }
+    }
+
     /// One situation on GitHub at the moment of posting, and what must come
     /// of it. Anything a case leaves out is the ordinary one: an open pull
-    /// request at the draft's commit, no reviews, a post that is accepted.
+    /// request at the draft's commit, no reviews, a post that is accepted —
+    /// and, should a review's comments be asked for, the draft's own.
     struct Moment {
         name: &'static str,
         viewer: &'static str,
         pull: Result<Live, String>,
         reviews: Result<Vec<Review>, String>,
-        post: Result<(), String>,
+        comments: Result<Vec<Comment>, String>,
+        post: Result<(), PostFailure>,
         want: Outcome,
         calls: &'static [&'static str],
     }
@@ -910,6 +1156,7 @@ pub mod tests {
                 viewer: "octocat",
                 pull: Ok(open_at(HEAD)),
                 reviews: Ok(Vec::new()),
+                comments: Ok(vec![its_comment()]),
                 post: Ok(()),
                 want: Outcome::Sent,
                 calls: &["pull", "reviews", "post"],
@@ -923,6 +1170,7 @@ pub mod tests {
             let github = Github {
                 pull: m.pull,
                 reviews: m.reviews,
+                comments: m.comments,
                 post: m.post,
                 calls: std::sync::Mutex::default(),
             };
@@ -1016,47 +1264,188 @@ pub mod tests {
                 calls: &[],
                 ..Moment::default()
             },
+        ]);
+    }
+
+    /// A write that GitHub answers with a no is a no. One that gets no
+    /// answer at all is not: the review may be there.
+    #[test]
+    fn only_an_answer_from_github_says_the_review_was_not_posted() {
+        live_through([
             Moment {
                 name: "GitHub declines the review",
-                post: Err("Unprocessable Entity (HTTP 422)".into()),
+                post: Err(PostFailure::Declined(
+                    "Unprocessable Entity (HTTP 422)".into(),
+                )),
                 want: Outcome::Refused(Refusal::Rejected("Unprocessable Entity (HTTP 422)".into())),
+                ..Moment::default()
+            },
+            Moment {
+                name: "the write times out",
+                post: Err(PostFailure::NoAnswer("timed out after 45s".into())),
+                want: Outcome::Unknown("timed out after 45s".into()),
                 ..Moment::default()
             },
         ]);
     }
 
-    /// The viewer's own reviews since the draft was written: the same one
-    /// means it was already sent, any other means it must not be.
+    /// The very same review is on the pull request already: it was sent,
+    /// whenever that was, and is not sent again.
     #[test]
-    fn the_viewers_own_reviews_since_the_draft_decide_it() {
+    fn the_same_review_already_there_was_already_sent() {
         let already = |at: &str| Outcome::AlreadySent(at.into());
-        let reviewed = Outcome::Refused(Refusal::ReviewedSince);
-        let read_only: &[&str] = &["pull", "reviews"];
+        let read_only: &[&str] = &["pull", "reviews", "comments"];
         live_through([
             Moment {
-                name: "the same review, after the draft",
+                name: "submitted when the app would have posted it",
                 reviews: Ok(vec![review("octocat", AFTER)]),
                 want: already(AFTER),
                 calls: read_only,
                 ..Moment::default()
             },
             Moment {
-                name: "the same review, in the very second the draft was written",
+                name: "in the very second the draft was written",
                 reviews: Ok(vec![review("octocat", AT)]),
                 want: already(AT),
                 calls: read_only,
                 ..Moment::default()
             },
             Moment {
-                name: "the login in another case, the body with stray whitespace",
+                name: "before the draft says it was written: a clock is wrong, not the review",
+                reviews: Ok(vec![review("octocat", BEFORE)]),
+                want: already(BEFORE),
+                calls: read_only,
+                ..Moment::default()
+            },
+            Moment {
+                name: "the login in another case, the words with stray whitespace",
                 reviews: Ok(vec![Review {
                     body: "Reads well.\n".into(),
                     ..review("Octocat", AFTER)
+                }]),
+                comments: Ok(vec![Comment {
+                    body: " Worth a test.\n".into(),
+                    ..its_comment()
                 }]),
                 want: already(AFTER),
                 calls: read_only,
                 ..Moment::default()
             },
+            Moment {
+                name: "among other reviews, and with one of the viewer's still pending",
+                reviews: Ok(vec![
+                    Review {
+                        body: "Not yet.".into(),
+                        ..review("octocat", AFTER)
+                    },
+                    review("hubot", AFTER),
+                    Review {
+                        state: "PENDING".into(),
+                        submitted_at: None,
+                        ..review("octocat", AFTER)
+                    },
+                    review("octocat", AFTER),
+                ]),
+                want: already(AFTER),
+                calls: read_only,
+                ..Moment::default()
+            },
+        ]);
+    }
+
+    /// The verdict, the commit and the words can all agree and the review
+    /// still be another one: only its inline comments say. A review that
+    /// merely looks the same is not taken for the draft having been sent.
+    #[test]
+    fn a_review_that_only_looks_the_same_is_not_the_same() {
+        let reviewed = Outcome::Refused(Refusal::ReviewedSince);
+        let compared: &[&str] = &["pull", "reviews", "comments"];
+        let but = |edit: fn(&mut Comment)| {
+            let mut c = its_comment();
+            edit(&mut c);
+            Ok(vec![c])
+        };
+        live_through([
+            Moment {
+                name: "no inline comments where the draft has one",
+                reviews: Ok(vec![review("octocat", AFTER)]),
+                comments: Ok(Vec::new()),
+                want: reviewed.clone(),
+                calls: compared,
+                ..Moment::default()
+            },
+            Moment {
+                name: "a comment with other words",
+                reviews: Ok(vec![review("octocat", AFTER)]),
+                comments: but(|c| c.body = "Worth two tests.".into()),
+                want: reviewed.clone(),
+                calls: compared,
+                ..Moment::default()
+            },
+            Moment {
+                name: "a comment on another line",
+                reviews: Ok(vec![review("octocat", AFTER)]),
+                comments: but(|c| c.line = 85),
+                want: reviewed.clone(),
+                calls: compared,
+                ..Moment::default()
+            },
+            Moment {
+                name: "a comment on the other side",
+                reviews: Ok(vec![review("octocat", AFTER)]),
+                comments: but(|c| c.side = Side::Left),
+                want: reviewed.clone(),
+                calls: compared,
+                ..Moment::default()
+            },
+            Moment {
+                name: "a comment on another file",
+                reviews: Ok(vec![review("octocat", AFTER)]),
+                comments: but(|c| c.path = "src/y.rs".into()),
+                want: reviewed.clone(),
+                calls: compared,
+                ..Moment::default()
+            },
+            Moment {
+                name: "one comment more than the draft has",
+                reviews: Ok(vec![review("octocat", AFTER)]),
+                comments: Ok(vec![its_comment(), its_comment()]),
+                want: reviewed,
+                calls: compared,
+                ..Moment::default()
+            },
+            Moment {
+                name: "from before the draft, and not the same: an older review",
+                reviews: Ok(vec![review("octocat", BEFORE)]),
+                comments: Ok(Vec::new()),
+                calls: &["pull", "reviews", "comments", "post"],
+                ..Moment::default()
+            },
+            Moment {
+                name: "its comments could not be read",
+                reviews: Ok(vec![review("octocat", AFTER)]),
+                comments: Err("HTTP 502".into()),
+                want: Outcome::Refused(Refusal::Unchecked("HTTP 502".into())),
+                calls: compared,
+                ..Moment::default()
+            },
+        ]);
+    }
+
+    /// The viewer's other reviews: one since the draft was written means
+    /// they have said something else; one still pending means GitHub would
+    /// refuse another. Neither is posted on top of.
+    #[test]
+    fn the_viewers_other_reviews_block_the_draft() {
+        let reviewed = Outcome::Refused(Refusal::ReviewedSince);
+        let read_only: &[&str] = &["pull", "reviews"];
+        let pending = |author: &str| Review {
+            state: "PENDING".into(),
+            submitted_at: None,
+            body: String::new(),
+            ..review(author, AFTER)
+        };
+        live_through([
             Moment {
                 name: "other words",
                 reviews: Ok(vec![Review {
@@ -1093,21 +1482,27 @@ pub mod tests {
                     commit: MOVED.into(),
                     ..review("octocat", AFTER)
                 }]),
-                want: reviewed,
+                want: reviewed.clone(),
                 calls: read_only,
                 ..Moment::default()
             },
             Moment {
-                name: "the same review among others",
+                name: "a review started in the browser and not submitted",
+                reviews: Ok(vec![pending("octocat")]),
+                want: Outcome::Refused(Refusal::Pending),
+                calls: read_only,
+                ..Moment::default()
+            },
+            Moment {
+                name: "one pending, and another since: the one since is the reason",
                 reviews: Ok(vec![
+                    pending("octocat"),
                     Review {
                         body: "Not yet.".into(),
                         ..review("octocat", AFTER)
                     },
-                    review("hubot", AFTER),
-                    review("octocat", AFTER),
                 ]),
-                want: already(AFTER),
+                want: reviewed,
                 calls: read_only,
                 ..Moment::default()
             },
@@ -1117,11 +1512,14 @@ pub mod tests {
     /// Reviews that say nothing about this draft: it is sent as if they were
     /// not there.
     #[test]
-    fn reviews_that_are_older_pending_or_someone_elses_do_not_count() {
+    fn reviews_that_are_older_or_someone_elses_do_not_count() {
         live_through([
             Moment {
-                name: "the same review from before the draft is an older one",
-                reviews: Ok(vec![review("octocat", BEFORE)]),
+                name: "other words from before the draft",
+                reviews: Ok(vec![Review {
+                    body: "Not yet.".into(),
+                    ..review("octocat", BEFORE)
+                }]),
                 ..Moment::default()
             },
             Moment {
@@ -1130,15 +1528,185 @@ pub mod tests {
                 ..Moment::default()
             },
             Moment {
-                name: "a pending review has not been submitted",
+                name: "someone else's pending review is theirs to finish",
                 reviews: Ok(vec![Review {
                     state: "PENDING".into(),
                     submitted_at: None,
-                    ..review("octocat", AFTER)
+                    ..review("hubot", AFTER)
                 }]),
                 ..Moment::default()
             },
         ]);
+    }
+
+    /// The case that showed the gap: a draft that is all inline comments, and
+    /// a reply typed in the browser. Both are a comment review with no body
+    /// on the same commit. Only one of them is the draft.
+    #[test]
+    fn a_reply_in_the_browser_is_not_a_comment_only_draft_already_sent() {
+        let text = with(|v| {
+            v["verdict"] = json!("comment");
+            v["body"] = json!("");
+        });
+        let draft = parse(&text, "acme/widget", 101).unwrap();
+        let reply = Review {
+            state: "COMMENTED".into(),
+            body: String::new(),
+            ..review("octocat", AFTER)
+        };
+        let github = |comments: Vec<Comment>| Github {
+            pull: Ok(open_at(HEAD)),
+            reviews: Ok(vec![reply.clone()]),
+            comments: Ok(comments),
+            post: Ok(()),
+            calls: std::sync::Mutex::default(),
+        };
+
+        let replied = github(vec![Comment {
+            path: "src/y.rs".into(),
+            line: 3,
+            side: Side::Right,
+            body: "Good point, done.".into(),
+        }]);
+        assert_eq!(
+            deliver(&replied, "octocat", 101, &draft),
+            Outcome::Refused(Refusal::ReviewedSince),
+            "the draft's comments were never sent, and it must not be marked posted"
+        );
+
+        // The draft itself, posted earlier, is found by its comments —
+        // in whatever order GitHub lists them.
+        let two = with(|v| {
+            v["verdict"] = json!("comment");
+            v["body"] = json!("");
+            v["comments"] = json!([
+                { "path": "src/x.rs", "line": 84, "side": "RIGHT", "body": "Worth a test." },
+                { "path": "src/a.rs", "line": 2, "side": "LEFT", "body": "Why was this dropped?" }
+            ]);
+        });
+        let draft = parse(&two, "acme/widget", 101).unwrap();
+        let mut listed = draft.comments.clone();
+        listed.reverse();
+        assert_eq!(
+            deliver(&github(listed), "octocat", 101, &draft),
+            Outcome::AlreadySent(AFTER.into())
+        );
+    }
+
+    /// Two windows on one repository must not both post a draft: each could
+    /// read GitHub, find nothing there yet, and send. The lock beside the
+    /// draft lets one of them through.
+    #[test]
+    fn a_draft_being_posted_elsewhere_is_left_to_it() {
+        let d = tempfile::tempdir().unwrap();
+        let path = write(d.path(), "101.json", &sample().to_string());
+        let draft = parse(&sample().to_string(), "acme/widget", 101).unwrap();
+        let lock = Lock::beside(&path);
+        let github = || Github {
+            pull: Ok(open_at(HEAD)),
+            reviews: Ok(Vec::new()),
+            comments: Ok(Vec::new()),
+            post: Ok(()),
+            calls: std::sync::Mutex::default(),
+        };
+
+        // Another rigor is in the middle of it.
+        std::fs::write(&lock, "4242\n").unwrap();
+        let gh = github();
+        assert_eq!(
+            deliver_exclusively(&gh, "octocat", 101, &path, &draft),
+            Outcome::Refused(Refusal::Busy)
+        );
+        assert!(
+            gh.calls.lock().unwrap().is_empty(),
+            "GitHub was asked anyway"
+        );
+        assert!(lock.exists(), "another window's lock was removed");
+
+        // That one died without letting go: longer ago than any call lasts.
+        let long_ago = std::time::SystemTime::now() - (gh.timeout() + LOCK_MARGIN * 2);
+        std::fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        let gh = github();
+        assert_eq!(
+            deliver_exclusively(&gh, "octocat", 101, &path, &draft),
+            Outcome::Sent
+        );
+        assert!(!lock.exists(), "the lock outlived the attempt");
+        assert!(
+            load(d.path(), "acme", "widget").unwrap().len() == 1,
+            "the lock was never taken for a draft"
+        );
+    }
+
+    /// The lock is held for the whole attempt and kept fresh through it, so a
+    /// second window arriving at any point finds it.
+    #[test]
+    fn the_lock_is_held_through_every_call_and_let_go_after() {
+        struct Watching {
+            lock: PathBuf,
+            seen: std::sync::Mutex<Vec<bool>>,
+        }
+        impl Watching {
+            fn look(&self) {
+                // Aged before each call returns: only a touch at the start
+                // of the next call can make it fresh again.
+                let fresh = std::fs::metadata(&self.lock)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|at| at.elapsed().ok())
+                    .is_some_and(|age| age < Duration::from_secs(30));
+                self.seen.lock().unwrap().push(fresh);
+                let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+                let file = std::fs::File::options()
+                    .write(true)
+                    .open(&self.lock)
+                    .unwrap();
+                file.set_modified(old).unwrap();
+            }
+        }
+        impl Remote for Watching {
+            fn pull(&self, _: u64) -> Result<Live, String> {
+                self.look();
+                Ok(open_at(HEAD))
+            }
+            fn reviews(&self, _: u64) -> Result<Vec<Review>, String> {
+                self.look();
+                Ok(vec![review("octocat", BEFORE)])
+            }
+            fn review_comments(&self, _: u64, _: u64) -> Result<Vec<Comment>, String> {
+                self.look();
+                Ok(Vec::new())
+            }
+            fn post(&self, _: u64, _: &str) -> Result<(), PostFailure> {
+                self.look();
+                Ok(())
+            }
+            fn timeout(&self) -> Duration {
+                Duration::from_secs(45)
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let path = write(d.path(), "101.json", &sample().to_string());
+        let draft = parse(&sample().to_string(), "acme/widget", 101).unwrap();
+        let gh = Watching {
+            lock: Lock::beside(&path),
+            seen: std::sync::Mutex::default(),
+        };
+        assert_eq!(
+            deliver_exclusively(&gh, "octocat", 101, &path, &draft),
+            Outcome::Sent
+        );
+        assert_eq!(
+            *gh.seen.lock().unwrap(),
+            [true, true, true, true],
+            "held and fresh at the pull, the reviews, the comments and the post"
+        );
+        assert!(!gh.lock.exists());
     }
 
     #[test]
@@ -1331,5 +1899,84 @@ pub mod tests {
         let err = set_status(&path, "acme/widget", Status::Skipped, None).unwrap_err();
         assert!(err.contains("version 2"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    /// The rewritten file is the same file to everything else: it keeps the
+    /// permissions its author gave it, rather than whatever a new file gets.
+    #[cfg(unix)]
+    #[test]
+    fn a_status_rewrite_keeps_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let path = write(d.path(), "101.json", &sample().to_string());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        set_status(&path, "acme/widget", Status::Skipped, None).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+    }
+
+    /// A draft that is a link is never written through, by either of the
+    /// writes rigor makes: whatever it points at is not rigor's to change.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_draft_is_never_written_through() {
+        let d = tempfile::tempdir().unwrap();
+        let text = sample().to_string();
+        let target = d.path().join("elsewhere.json");
+        std::fs::write(&target, &text).unwrap();
+        let link = write(d.path(), "placeholder", "").with_file_name("101.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let draft = parse(&text, "acme/widget", 101).unwrap();
+
+        let err = set_status(&link, "acme/widget", Status::Skipped, None).unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        let err = record_posted(&link, &text, &draft, AFTER.into()).unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), text);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// What is marked posted is what was posted. A file that still says what
+    /// was sent only changes status; one that has come to say anything else
+    /// is put back to what was sent, and the caller is told.
+    #[test]
+    fn what_is_recorded_as_posted_is_what_was_sent() {
+        let d = tempfile::tempdir().unwrap();
+        let text = sample().to_string();
+        let sent = parse(&text, "acme/widget", 101).unwrap();
+        let posted = Draft {
+            status: Status::Posted,
+            posted_at: Some(AFTER.into()),
+            ..sent.clone()
+        };
+        let on_disk = |path: &Path| {
+            parse(&std::fs::read_to_string(path).unwrap(), "acme/widget", 101).unwrap()
+        };
+
+        let path = write(d.path(), "101.json", &text);
+        assert_eq!(record_posted(&path, &text, &sent, AFTER.into()), Ok(false));
+        assert_eq!(on_disk(&path), posted);
+
+        // Edited while the review was on its way: another verdict, other
+        // words. None of that went out.
+        let edited = with(|v| {
+            v["verdict"] = json!("comment");
+            v["body"] = json!("Something else entirely.");
+            v["comments"] = json!([]);
+        });
+        std::fs::write(&path, &edited).unwrap();
+        assert_eq!(record_posted(&path, &text, &sent, AFTER.into()), Ok(true));
+        assert_eq!(on_disk(&path), posted, "the edit was marked as posted");
+
+        // Gone altogether: the record of what was sent is still written.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(record_posted(&path, &text, &sent, AFTER.into()), Ok(true));
+        assert_eq!(on_disk(&path), posted);
     }
 }

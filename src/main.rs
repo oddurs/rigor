@@ -19,8 +19,8 @@ use clap::Parser;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event, KeyCode,
-    KeyModifiers, poll, read,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyModifiers, poll, read,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -141,6 +141,17 @@ fn main() -> Result<()> {
     let result = run(&mut term, &mut a, &rx);
     restore(&mut term, mouse);
     proc::shutdown();
+    // Quit waited for a post to finish, and the screen that would have said
+    // how it went is gone. Say it where it can still be read.
+    if a.quitting {
+        let outcome = a
+            .post_error
+            .as_ref()
+            .or_else(|| a.notice.as_ref().map(|(text, _)| text));
+        if let Some(outcome) = outcome {
+            eprintln!("rigor: {outcome}");
+        }
+    }
     result
 }
 
@@ -175,9 +186,10 @@ fn run(
                     }
                 }
                 Event::Mouse(m) => input.mouse(a, m),
+                Event::Paste(text) => event::paste(a, &text),
                 Event::FocusGained => a.set_focus(true),
                 Event::FocusLost => a.set_focus(false),
-                _ => {}
+                Event::Resize(..) => {}
             }
         }
 
@@ -193,8 +205,41 @@ fn run(
         a.tick();
 
         if a.quit || stop.load(std::sync::atomic::Ordering::Relaxed) {
+            finish_post(term, a, rx);
             return Ok(());
         }
+    }
+}
+
+/// Quitting must not cut a review off half-sent: `gh` killed mid-request
+/// leaves it unknown whether the review landed, with nobody left to find out.
+/// So a post in flight is let finish — every call it makes has a deadline —
+/// and its result is recorded before rigor goes. The screen says so; input is
+/// read and dropped, so that keys typed while waiting do not land in the
+/// shell afterwards. Best effort on the terminal throughout: after a SIGHUP
+/// it may already be gone, and the post is still worth finishing.
+fn finish_post(
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    a: &mut App,
+    rx: &std::sync::mpsc::Receiver<app::Msg>,
+) {
+    if a.posting.is_none() {
+        return;
+    }
+    a.quitting = true;
+    while a.posting.is_some() {
+        let _ = term.draw(|f| ui::draw(f, a));
+        while matches!(poll(Duration::ZERO), Ok(true)) {
+            if read().is_err() {
+                break;
+            }
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(msg) => a.on_msg(msg),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        a.spinner = a.spinner.wrapping_add(1);
     }
 }
 
@@ -224,11 +269,14 @@ fn setup(mouse: bool) -> Result<(Terminal<CrosstermBackend<Stdout>>, probe::Prob
     // buffer, so anything already on screen would survive wherever the frame is
     // blank. Clear here rather than with `Terminal::clear`, which first asks the
     // terminal for its cursor position and fails on any host that won't answer.
+    // Bracketed paste, so that pasted text arrives as a paste and not as a
+    // run of keypresses that could ask to post and then confirm.
     execute!(
         out,
         EnterAlternateScreen,
         Clear(ClearType::All),
-        EnableFocusChange
+        EnableFocusChange,
+        EnableBracketedPaste
     )?;
     if mouse {
         execute!(out, EnableMouseCapture)?;
@@ -245,6 +293,7 @@ fn setup(mouse: bool) -> Result<(Terminal<CrosstermBackend<Stdout>>, probe::Prob
         let mut out = stdout();
         let _ = execute!(
             out,
+            DisableBracketedPaste,
             DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
@@ -262,7 +311,12 @@ fn restore(term: &mut Terminal<CrosstermBackend<Stdout>>, mouse: bool) {
     if mouse {
         let _ = execute!(term.backend_mut(), DisableMouseCapture);
     }
-    let _ = execute!(term.backend_mut(), DisableFocusChange, LeaveAlternateScreen);
+    let _ = execute!(
+        term.backend_mut(),
+        DisableBracketedPaste,
+        DisableFocusChange,
+        LeaveAlternateScreen
+    );
     let _ = disable_raw_mode();
     let _ = term.show_cursor();
 }
@@ -274,7 +328,8 @@ fn resume(term: &mut Terminal<CrosstermBackend<Stdout>>, mouse: bool) -> Result<
         term.backend_mut(),
         EnterAlternateScreen,
         Clear(ClearType::All),
-        EnableFocusChange
+        EnableFocusChange,
+        EnableBracketedPaste
     )?;
     if mouse {
         execute!(term.backend_mut(), EnableMouseCapture)?;

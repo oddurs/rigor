@@ -1,6 +1,7 @@
 //! Rendering. Every frame also records the screen regions it drew into
 //! (`app.hits`) so the mouse handler can turn a click back into a row.
 
+mod confirm;
 mod detail;
 mod help;
 mod list;
@@ -54,11 +55,17 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     // Three rows of chrome: a top nav (who and where), a subnav (the views),
     // and a rail that underlines the active view and separates chrome from
     // content.
-    let [nav, subnav, rail, body, footer] = Layout::vertical([
+    // What went wrong with a post gets rows of its own above the footer, for
+    // as long as it stands: whatever mode the footer is in, it is not hidden.
+    let failure = app.post_error.as_ref().map_or_else(Vec::new, |e| {
+        crate::util::wrap(e, usize::from(area.width).saturating_sub(4).max(10))
+    });
+    let [nav, subnav, rail, body, alert, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(3),
+        Constraint::Length(cols(failure.len().min(3))),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -66,15 +73,37 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     // Laid out before the chrome is drawn so the rail knows where the detail
     // pane's divider will meet it.
     let split = body_layout(app, body);
+    confirm::settle(area, app);
 
     draw_nav(f, nav, app);
     draw_subnav(f, subnav, rail, app, split.divider_x, split.list);
     draw_body(f, split, app);
+    draw_failure(f, alert, &failure, app);
     draw_footer(f, footer, app);
 
     if app.mode == Mode::Help {
         help::draw(f, area, app);
     }
+    if app.armed.is_some() {
+        confirm::draw(f, area, app);
+    }
+}
+
+/// Why the last attempt to post sent nothing, or what is not known about it.
+fn draw_failure(f: &mut Frame<'_>, area: Rect, message: &[String], app: &App) {
+    let style = Style::new().fg(app.theme.failure);
+    let lines: Vec<Line<'_>> = message
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let mark = if i == 0 { " ✗ " } else { "   " };
+            Line::from(vec![
+                Span::styled(mark, style),
+                Span::styled(l.clone(), style),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn width_of(spans: &[Span<'_>]) -> usize {
@@ -449,22 +478,38 @@ fn footer_alert(app: &App) -> Option<Line<'static>> {
         } else {
             ""
         };
+        // Nothing is posted unread: until the end of it has been on screen,
+        // `a` is not offered.
+        let keys = if armed.seen_end {
+            " a again to confirm, esc to cancel"
+        } else {
+            " j scrolls to the end, then a confirms; esc cancels"
+        };
         return Some(Line::from(vec![
             Span::styled(
-                format!(" post {} to #{}?", armed.what, armed.number),
+                format!(" post {} to #{}?", armed.draft.describe(), armed.number),
                 Style::new().fg(t.pending).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!("{caveat} a again to confirm, esc to cancel"),
-                Style::new().fg(t.muted),
-            ),
+            Span::styled(format!("{caveat}{keys}"), Style::new().fg(t.muted)),
         ]));
     }
-    let e = app.post_error.as_ref().or(app.error.as_ref())?;
+    let e = app.error.as_ref()?;
     Some(Line::from(vec![
         Span::styled(" ✗ ", Style::new().fg(t.failure)),
         Span::styled(e.clone(), Style::new().fg(t.failure)),
     ]))
+}
+
+/// Quit was asked for with a post in flight, and is waiting on it.
+fn quitting_line(app: &App) -> Option<Line<'static>> {
+    let posting = app.posting.as_ref().filter(|_| app.quitting)?;
+    Some(Line::from(Span::styled(
+        format!(
+            " finishing the post to #{} before quitting…",
+            posting.number
+        ),
+        Style::new().fg(app.theme.pending),
+    )))
 }
 
 /// The footer is the command line. It uses no filled badges — the same rule as
@@ -472,6 +517,11 @@ fn footer_alert(app: &App) -> Option<Line<'static>> {
 fn draw_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
     let t = app.theme;
     let muted = Style::new().fg(t.muted);
+
+    if let Some(line) = quitting_line(app) {
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
 
     if app.mode == Mode::Filter {
         // A live count is the point of typing a filter: see the list narrow.

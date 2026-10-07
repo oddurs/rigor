@@ -137,17 +137,36 @@ pub struct Gh {
     pub name: String,
 }
 
-/// Reviews are read a page at a time, and all of them: the one that matters
+/// Lists are read a page at a time, and all of them: the entry that matters
 /// may be on the last page.
-const REVIEWS_PER_PAGE: usize = 100;
-/// More reviews than this on one pull request and the check is abandoned
-/// rather than made on part of the list.
-const MAX_REVIEW_PAGES: usize = 30;
+const PER_PAGE: usize = 100;
+/// More pages than this and the read is abandoned rather than made on part
+/// of the list.
+const MAX_PAGES: usize = 30;
 
 impl Gh {
     fn pulls(&self, number: u64) -> String {
         format!("repos/{}/{}/pulls/{number}", self.owner, self.name)
     }
+}
+
+/// Every page of the list at `path`, each parsed by `parse`.
+fn every_page<T>(path: &str, parse: impl Fn(&Value) -> Result<Vec<T>>) -> Result<Vec<T>, String> {
+    let mut all = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let mut batch = get(&format!("{path}?per_page={PER_PAGE}&page={page}"))
+            .and_then(|v| parse(&v))
+            .map_err(|e| format!("{e:#}"))?;
+        let last = batch.len() < PER_PAGE;
+        all.append(&mut batch);
+        if last {
+            return Ok(all);
+        }
+    }
+    Err(format!(
+        "more than {} entries; not all of them were read",
+        PER_PAGE * MAX_PAGES
+    ))
 }
 
 impl drafts::Remote for Gh {
@@ -158,41 +177,50 @@ impl drafts::Remote for Gh {
     }
 
     fn reviews(&self, number: u64) -> Result<Vec<drafts::Review>, String> {
-        let mut all = Vec::new();
-        for page in 1..=MAX_REVIEW_PAGES {
-            let path = format!(
-                "{}/reviews?per_page={REVIEWS_PER_PAGE}&page={page}",
-                self.pulls(number)
-            );
-            let mut batch = get(&path)
-                .and_then(|v| parse_reviews(&v))
-                .map_err(|e| format!("{e:#}"))?;
-            let last = batch.len() < REVIEWS_PER_PAGE;
-            all.append(&mut batch);
-            if last {
-                return Ok(all);
-            }
-        }
-        Err(format!(
-            "more than {} reviews; not all of them were read",
-            REVIEWS_PER_PAGE * MAX_REVIEW_PAGES
-        ))
+        every_page(&format!("{}/reviews", self.pulls(number)), parse_reviews)
+    }
+
+    fn review_comments(&self, number: u64, review: u64) -> Result<Vec<drafts::Comment>, String> {
+        every_page(
+            &format!("{}/reviews/{review}/comments", self.pulls(number)),
+            parse_review_comments,
+        )
     }
 
     /// The only call rigor makes that changes anything on GitHub. `body` is
     /// the request's JSON, from `drafts::payload`.
-    fn post(&self, number: u64, body: &str) -> Result<(), String> {
+    ///
+    /// Only an answer that says no is a no. A 4xx is GitHub declining the
+    /// review; anything else — a timeout, a dropped connection, a gateway
+    /// error — leaves it unknown whether the review was taken.
+    fn post(&self, number: u64, body: &str) -> Result<(), drafts::PostFailure> {
+        use drafts::PostFailure::NoAnswer;
         let mut cmd = Command::new("gh");
         cmd.args(["api", "--method", "POST"])
             .arg(format!("{}/reviews", self.pulls(number)))
             .args(["--input", "-"]);
         let out = proc::run_with_input(&mut cmd, body.as_bytes(), gh_timeout(), Priority::Normal)
-            .map_err(|e| format!("gh api: {e:#}"))?;
+            .map_err(|e| NoAnswer(format!("gh api: {e:#}")))?;
         if out.status.success() {
             Ok(())
         } else {
-            Err(api_error(&out))
+            Err(post_failure(&out))
         }
+    }
+
+    fn timeout(&self) -> Duration {
+        gh_timeout()
+    }
+}
+
+/// What a write that `gh` reported as failed amounts to. A 4xx is GitHub
+/// saying no. Anything else is no answer about the review at all.
+fn post_failure(out: &std::process::Output) -> drafts::PostFailure {
+    let why = api_error(out);
+    if String::from_utf8_lossy(&out.stderr).contains("(HTTP 4") {
+        drafts::PostFailure::Declined(why)
+    } else {
+        drafts::PostFailure::NoAnswer(why)
     }
 }
 
@@ -267,21 +295,73 @@ fn parse_live(v: &Value) -> Result<drafts::Live> {
     })
 }
 
+/// Every entry is read in full or the whole read fails. A review with no
+/// author, no state, or no time when it claims to be submitted is one that
+/// cannot be told apart from the viewer's own, and a list with a hole in it
+/// is not one to decide a post on.
 fn parse_reviews(v: &Value) -> Result<Vec<drafts::Review>> {
     let list = v.as_array().context("the reviews were not a list")?;
-    Ok(list
-        .iter()
-        .map(|r| drafts::Review {
-            author: str_at(r, &["user", "login"]).unwrap_or_default(),
-            state: string(r, "state"),
-            commit: string(r, "commit_id"),
-            body: string(r, "body"),
-            submitted_at: r
-                .get("submitted_at")
-                .and_then(Value::as_str)
-                .map(String::from),
+    list.iter()
+        .map(|r| {
+            let id = r.get("id").and_then(Value::as_u64);
+            let about = || id.map_or_else(|| "a review".to_string(), |id| format!("review {id}"));
+            let field = |key: &str| r.get(key).and_then(Value::as_str);
+            let state = field("state")
+                .filter(|s| !s.is_empty())
+                .with_context(|| format!("{} has no state", about()))?;
+            let submitted_at = field("submitted_at");
+            if state != "PENDING" && submitted_at.and_then(parse_iso8601).is_none() {
+                bail!("{} has no time it was submitted", about());
+            }
+            Ok(drafts::Review {
+                id: id.context("a review has no id")?,
+                author: str_at(r, &["user", "login"])
+                    .filter(|login| !login.is_empty())
+                    .with_context(|| format!("{} has no author", about()))?,
+                state: state.to_string(),
+                commit: string(r, "commit_id"),
+                body: string(r, "body"),
+                submitted_at: submitted_at.map(String::from),
+            })
         })
-        .collect())
+        .collect()
+}
+
+/// A review's inline comments, in the draft's own terms so the two can be
+/// compared. A comment GitHub no longer places on a line is given by where it
+/// was written; one with no place at all fails the read.
+fn parse_review_comments(v: &Value) -> Result<Vec<drafts::Comment>> {
+    let list = v
+        .as_array()
+        .context("the review comments were not a list")?;
+    list.iter()
+        .map(|c| {
+            let line = c
+                .get("line")
+                .and_then(Value::as_u64)
+                .or_else(|| c.get("original_line").and_then(Value::as_u64))
+                .context("a review comment has no line")?;
+            let side = match c
+                .get("side")
+                .and_then(Value::as_str)
+                .or_else(|| c.get("original_side").and_then(Value::as_str))
+            {
+                Some("LEFT") => drafts::Side::Left,
+                Some("RIGHT") => drafts::Side::Right,
+                _ => bail!("a review comment has no side"),
+            };
+            Ok(drafts::Comment {
+                path: c
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .context("a review comment has no path")?
+                    .to_string(),
+                line,
+                side,
+                body: string(c, "body"),
+            })
+        })
+        .collect()
 }
 
 /// One page of the GraphQL response, parsed. Pure, so it is tested against a
@@ -696,6 +776,41 @@ mod tests {
         assert!(api_error(&failed("", "")).starts_with("gh api failed"));
     }
 
+    /// Only GitHub saying no is a no. A gateway error or a dropped connection
+    /// says nothing about whether the review was taken.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_4xx_means_the_review_was_declined() {
+        use drafts::PostFailure::{Declined, NoAnswer};
+        let unprocessable =
+            r#"{"message":"Unprocessable Entity","errors":["Line must be part of the diff"]}"#;
+        assert_eq!(
+            post_failure(&failed(
+                unprocessable,
+                "gh: Unprocessable Entity (HTTP 422)"
+            )),
+            Declined("Unprocessable Entity: Line must be part of the diff (HTTP 422)".into())
+        );
+        assert_eq!(
+            post_failure(&failed(
+                r#"{"message":"Forbidden"}"#,
+                "gh: Forbidden (HTTP 403)"
+            )),
+            Declined("Forbidden (HTTP 403)".into())
+        );
+        assert_eq!(
+            post_failure(&failed(
+                r#"{"message":"Bad Gateway"}"#,
+                "gh: Bad Gateway (HTTP 502)"
+            )),
+            NoAnswer("Bad Gateway (HTTP 502)".into())
+        );
+        assert_eq!(
+            post_failure(&failed("", "error connecting to api.github.com")),
+            NoAnswer("error connecting to api.github.com".into())
+        );
+    }
+
     #[test]
     fn reads_a_pull_requests_live_state() {
         let live = |v: Value| parse_live(&v);
@@ -730,34 +845,111 @@ mod tests {
     #[test]
     fn reads_reviews_including_a_pending_one() {
         let got = parse_reviews(&serde_json::json!([
-            { "user": { "login": "octocat" }, "state": "APPROVED", "commit_id": "1a2b3c4d",
-              "body": "Reads well.", "submitted_at": "2027-01-15T09:30:00Z" },
-            { "user": { "login": "octocat" }, "state": "PENDING", "commit_id": "1a2b3c4d",
-              "body": "" },
-            { "user": null, "state": "COMMENTED", "commit_id": null, "body": null,
-              "submitted_at": "2027-01-15T09:31:00Z" }
+            { "id": 11, "user": { "login": "octocat" }, "state": "APPROVED",
+              "commit_id": "1a2b3c4d", "body": "Reads well.",
+              "submitted_at": "2027-01-15T08:00:00Z" },
+            { "id": 12, "user": { "login": "octocat" }, "state": "PENDING",
+              "commit_id": "1a2b3c4d", "body": "" },
+            { "id": 13, "user": { "login": "hubot" }, "state": "COMMENTED",
+              "commit_id": null, "body": null, "submitted_at": "2027-01-15T08:01:00Z" }
         ]))
         .unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(
-            (
-                got[0].author.as_str(),
-                got[0].state.as_str(),
-                got[0].commit.as_str()
-            ),
-            ("octocat", "APPROVED", "1a2b3c4d")
+            (got[0].id, got[0].author.as_str(), got[0].state.as_str()),
+            (11, "octocat", "APPROVED")
         );
-        assert_eq!(got[0].submitted_at.as_deref(), Some("2027-01-15T09:30:00Z"));
+        assert_eq!(got[0].commit, "1a2b3c4d");
+        assert_eq!(got[0].submitted_at.as_deref(), Some("2027-01-15T08:00:00Z"));
         assert_eq!(got[1].submitted_at, None, "a pending review has no time");
-        assert_eq!(
-            got[2].author, "",
-            "a deleted account is nobody, not the viewer"
-        );
+        assert_eq!((got[2].commit.as_str(), got[2].body.as_str()), ("", ""));
+    }
 
+    /// One entry that cannot be read spoils the list: a review with no
+    /// author might be the viewer's, and a post is not decided on a list
+    /// with a hole in it. The whole read fails, which sends nothing.
+    #[test]
+    fn a_review_that_cannot_be_read_fails_the_whole_read() {
+        type Edit = fn(&mut Value);
+        let good = serde_json::json!({
+            "id": 11, "user": { "login": "octocat" }, "state": "APPROVED",
+            "commit_id": "1a2b3c4d", "body": "", "submitted_at": "2027-01-15T08:00:00Z"
+        });
+        let broken = |edit: fn(&mut Value)| {
+            let mut bad = good.clone();
+            edit(&mut bad);
+            let list = Value::Array(vec![good.clone(), bad]);
+            format!("{:#}", parse_reviews(&list).unwrap_err())
+        };
+        assert!(parse_reviews(&Value::Array(vec![good.clone()])).is_ok());
+
+        let cases: [(Edit, &str); 9] = [
+            (|r| r["user"] = Value::Null, "review 11 has no author"),
+            (
+                |r| r["user"] = serde_json::json!({}),
+                "review 11 has no author",
+            ),
+            (
+                |r| r["user"]["login"] = "".into(),
+                "review 11 has no author",
+            ),
+            (|r| r["state"] = Value::Null, "review 11 has no state"),
+            (|r| r["state"] = "".into(), "review 11 has no state"),
+            (
+                |r| r["submitted_at"] = Value::Null,
+                "review 11 has no time it was submitted",
+            ),
+            (
+                |r| r["submitted_at"] = "soon".into(),
+                "review 11 has no time it was submitted",
+            ),
+            (
+                |r| {
+                    r.as_object_mut().unwrap().remove("submitted_at");
+                },
+                "no time it was submitted",
+            ),
+            (|r| r["id"] = Value::Null, "a review has no id"),
+        ];
+        for (edit, want) in cases {
+            let err = broken(edit);
+            assert!(err.contains(want), "{err:?} lacks {want:?}");
+        }
         assert!(
             parse_reviews(&serde_json::json!({ "message": "Not Found" })).is_err(),
             "anything but a list is not an empty list"
         );
+    }
+
+    #[test]
+    fn reads_a_reviews_inline_comments() {
+        let got = parse_review_comments(&serde_json::json!([
+            { "path": "src/x.rs", "line": 84, "side": "RIGHT", "body": "Worth a test." },
+            // No longer placed on a line: where it was written is what counts.
+            { "path": "src/old.rs", "line": null, "original_line": 7,
+              "side": null, "original_side": "LEFT", "body": "Why was this dropped?" }
+        ]))
+        .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (got[0].path.as_str(), got[0].line, got[0].side),
+            ("src/x.rs", 84, drafts::Side::Right)
+        );
+        assert_eq!(got[0].body, "Worth a test.");
+        assert_eq!(
+            (got[1].path.as_str(), got[1].line, got[1].side),
+            ("src/old.rs", 7, drafts::Side::Left)
+        );
+
+        // A comment that cannot be placed cannot be compared.
+        for bad in [
+            serde_json::json!([{ "path": "src/x.rs", "side": "RIGHT", "body": "" }]),
+            serde_json::json!([{ "path": "src/x.rs", "line": 84, "body": "" }]),
+            serde_json::json!([{ "line": 84, "side": "RIGHT", "body": "" }]),
+            serde_json::json!({ "message": "Not Found" }),
+        ] {
+            assert!(parse_review_comments(&bad).is_err(), "{bad}");
+        }
     }
 
     /// The contract with the real API: the query still parses against GitHub

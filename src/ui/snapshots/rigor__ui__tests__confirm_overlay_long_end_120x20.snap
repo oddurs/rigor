@@ -1,0 +1,24 @@
+---
+source: src/ui/tests.rs
+expression: "render(&mut o.a, 120, 20)"
+---
+ rigor │ acme/widget  ⎇ chore/release-notes                                                                    @octocat
+ Ready 1   Mine 2 ┌ this is what will be posted ─────────────────────────────────────────────────────┐rafted   ↕ recent
+──────────────────│            Paragraph 27 of the review.                                           │──────────────────
+ #4846  approve   │            Paragraph 28 of the review.                                           │    +220 −24   3m
+▎#4840  approve +1│            Paragraph 29 of the review.                                           │    +220 −24   2h
+ #4801  ✓ posted  │            Paragraph 30 of the review.                                           │    +220 −24   3d
+ #4700  stale     │            Paragraph 31 of the review.                                           │               4d
+ #4701  skipped   │            Paragraph 32 of the review.                                           │               5d
+ #4980  invalid   │            Paragraph 33 of the review.                                           │
+ #4990  unverified│            Paragraph 34 of the review.                                           │
+                  │            Paragraph 35 of the review.                                           │
+──────────────────│            Paragraph 36 of the review.                                           │──────────────────
+ #4840 Move the pa│            Paragraph 37 of the review.                                           │
+ octocat · 2h ago │            Paragraph 38 of the review.                                           │
+  picked    PRIVAT│            Paragraph 39 of the review.                                           │
+  verdict   approv│            Paragraph 40 of the review.                                           │
+  body      Paragr│  comment   src/last.rs:9                                                         │
+            Paragr│            THE-LAST-LINE                                                         │
+            Paragr└ this is all of it · a posts · esc cancels ───────────────────────────────────────┘ ↓ more below · J
+ post approve with 1 inline comment to #4840? a again to confirm, esc to cancel

@@ -2,7 +2,7 @@
 //! clicks do to it.
 
 use ratatui::layout::Rect;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -18,7 +18,7 @@ use crate::model::{
 };
 use crate::schedule::{self, Schedule};
 use crate::theme::Theme;
-use crate::util::{format_iso8601, now_secs};
+use crate::util::{format_iso8601, now_millis, now_secs};
 
 pub enum Msg {
     Prs(Result<github::Fetched, String>),
@@ -39,24 +39,65 @@ impl drafts::Remote for Unwired {
     fn reviews(&self, _: u64) -> Result<Vec<drafts::Review>, String> {
         Err("GitHub is not wired up".into())
     }
-    fn post(&self, _: u64, _: &str) -> Result<(), String> {
+    fn review_comments(&self, _: u64, _: u64) -> Result<Vec<drafts::Comment>, String> {
         Err("GitHub is not wired up".into())
+    }
+    fn post(&self, _: u64, _: &str) -> Result<(), drafts::PostFailure> {
+        Err(drafts::PostFailure::Declined(
+            "GitHub is not wired up".into(),
+        ))
+    }
+    fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(1)
     }
 }
 
-/// A post waiting on its second `a`: which draft, the file as it read when
-/// the prompt went up, what the prompt says would be sent, and whether the
-/// list could vouch for the pull request's head at the time. Once the
-/// selected draft stops matching, the question on screen is no longer the one
-/// a keypress would be answering, and it is withdrawn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A confirming `a` counts only after this long with no `a` of any kind: a
+/// held key repeats, a worn switch chatters, and neither is a decision.
+pub const A_QUIET_MS: i64 = 400;
+
+/// A question nobody answers withdraws itself after this long, so that an
+/// `a` typed much later is a first `a` again.
+pub const ARMED_FOR_MS: i64 = 30_000;
+
+/// A post waiting to be confirmed: a question on screen, and the overlay that
+/// shows what it is about.
+///
+/// It names its draft by file, and holds the draft as it was parsed when the
+/// question went up. That one value is what the overlay is drawn from and
+/// what the request is built from, so what was read is what is sent. Once the
+/// selected draft stops being that file with that text in that state, the
+/// question on screen is no longer the one a keypress would be answering, and
+/// it is withdrawn.
+#[derive(Debug, Clone)]
 pub struct Armed {
+    pub path: PathBuf,
     pub number: u64,
     raw: String,
-    pub what: String,
+    pub draft: drafts::Draft,
     /// `Ready`, or `Unverified` for a pull request the last fetch did not
     /// include. The prompt says which.
     pub state: drafts::State,
+    /// When the question went up, on `now_millis`'s clock.
+    at: i64,
+    /// How far down the overlay is scrolled. Clamped as it is drawn.
+    pub scroll: u16,
+    /// Whether the end of what would be sent has been on screen. Until it
+    /// has, `a` does not confirm: nothing is posted unread.
+    pub seen_end: bool,
+    /// An `a` was turned away for that reason, so the overlay says it louder.
+    pub nudged: bool,
+}
+
+/// An attempt in flight: which draft, and exactly what was read from it when
+/// it was confirmed. The file may change before the answer comes back; this
+/// is what the answer is about.
+#[derive(Debug, Clone)]
+pub struct Posting {
+    pub number: u64,
+    pub path: PathBuf,
+    raw: String,
+    draft: drafts::Draft,
 }
 
 /// Run `work` off the UI thread and always answer. A panic inside becomes an
@@ -228,15 +269,24 @@ pub struct App {
     pub drafts_dir: Option<PathBuf>,
     pub drafts: Vec<drafts::Entry>,
     pub armed: Option<Armed>,
-    /// The pull request a review is being sent to right now, and the draft
-    /// file it came from. One at a time.
-    pub posting: Option<(u64, PathBuf)>,
+    /// The attempt to post that is in flight. One at a time.
+    pub posting: Option<Posting>,
+    /// Drafts whose review was sent and never answered for, by file. Whether
+    /// they are on GitHub is not known, and their row says so until an
+    /// attempt gets far enough to find out.
+    unsettled: HashSet<PathBuf>,
+    /// When the last `a` of any kind arrived, on `now_millis`'s clock.
+    last_a: Option<i64>,
+    /// Quit was asked for while a post was in flight. It is being let finish.
+    pub quitting: bool,
     /// Head commits GitHub reported at the moment of a post, for pull
     /// requests whose draft turned out to be behind. Newer than the last
     /// fetch, so it wins until the next fetch covers the pull request.
     live_heads: HashMap<u64, String>,
-    /// Why the last post failed, until the next keypress. Kept apart from
-    /// `error`, which is the sync's and is cleared by the next good fetch.
+    /// Why the last attempt to post sent nothing, or what is not known about
+    /// it. It stays until `esc` or the next attempt: a keypress made for some
+    /// other reason must not sweep it away unread. Kept apart from `error`,
+    /// which is the sync's and is cleared by the next good fetch.
     pub post_error: Option<String>,
     /// GitHub, as posting needs it. Inert until `main` wires in `gh`, so an
     /// `App` built in a test cannot reach GitHub.
@@ -286,6 +336,9 @@ impl App {
             drafts: Vec::new(),
             armed: None,
             posting: None,
+            unsettled: HashSet::new(),
+            last_a: None,
+            quitting: false,
             live_heads: HashMap::new(),
             post_error: None,
             remote: Arc::new(Unwired),
@@ -322,6 +375,14 @@ impl App {
 
     /// Called every turn of the event loop. Starts whatever is due; never waits.
     pub fn tick(&mut self) {
+        if self
+            .armed
+            .as_ref()
+            .is_some_and(|armed| now_millis() - armed.at >= ARMED_FOR_MS)
+        {
+            self.armed = None;
+            self.note("the question timed out; nothing was posted");
+        }
         let now = now_secs();
         if !self.in_flight.prs && self.schedule.refresh_due(now) {
             self.refresh_prs();
@@ -472,62 +533,134 @@ impl App {
     /// its review is on GitHub — sent just now, or found already there; every
     /// refusal leaves it exactly as it was.
     fn posted(&mut self, result: Result<drafts::Outcome, String>) {
-        use drafts::{Outcome, Refusal};
-        let Some((number, path)) = self.posting.take() else {
+        use drafts::Outcome;
+        let Some(sent) = self.posting.take() else {
             return;
         };
-        let slug = self.repo.slug();
-        let record =
-            |at: String| drafts::set_status(&path, &slug, drafts::Status::Posted, Some(at));
-        let failure = match result {
-            Ok(Outcome::Sent) => match record(format_iso8601(now_secs())) {
-                Ok(()) => {
-                    self.note(format!("posted to #{number}"));
-                    None
-                }
+        let number = sent.number;
+        // What is recorded as posted is what was sent, not whatever the file
+        // has come to say while the answer was on its way.
+        let record = |at: String| {
+            let at = if at.is_empty() {
+                format_iso8601(now_secs())
+            } else {
+                at
+            };
+            drafts::record_posted(&sent.path, &sent.raw, &sent.draft, at)
+        };
+        let kept = |changed: bool| {
+            if changed {
+                "; the file changed while posting, and what was sent was kept"
+            } else {
+                ""
+            }
+        };
+        // An attempt that read the reviews knows whether an earlier,
+        // unanswered post landed. One that stopped short of them does not.
+        let mut settles = true;
+        let (done, failure) = match result {
+            Ok(Outcome::Sent) => match record(String::new()) {
+                Ok(changed) => (Some(format!("posted to #{number}{}", kept(changed))), None),
                 // The review is on GitHub whatever the file says. The next
                 // attempt will find it there and send nothing.
-                Err(e) => Some(format!(
-                    "the review was posted to #{number}, but its draft file could not be updated: {e}"
-                )),
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "the review was posted to #{number}, but its draft file could not be updated: {e}"
+                    )),
+                ),
             },
             Ok(Outcome::AlreadySent(at)) => match record(at) {
-                Ok(()) => {
-                    self.note(format!(
-                        "#{number} already has this review from you; marked posted, nothing sent"
-                    ));
-                    None
-                }
-                Err(e) => Some(format!(
-                    "#{number} already has this review from you, but its draft file could not be updated: {e}"
-                )),
-            },
-            Ok(Outcome::Refused(why)) => Some(match why {
-                Refusal::Closed => {
-                    format!("nothing posted: #{number} was closed without being merged")
-                }
-                Refusal::Moved(head) => {
-                    let short = head.get(..7).unwrap_or(&head).to_string();
-                    self.live_heads.insert(number, head);
-                    format!(
-                        "nothing posted: #{number} has moved on to {short} since this draft was written"
-                    )
-                }
-                Refusal::ReviewedSince => format!(
-                    "nothing posted: you have reviewed #{number} since this draft was written; x skips it, or review in the browser"
+                Ok(changed) => (
+                    Some(format!(
+                        "#{number} already has this review from you; marked posted, nothing sent{}",
+                        kept(changed)
+                    )),
+                    None,
                 ),
-                Refusal::NoViewer => {
-                    "nothing posted: your GitHub login is not known yet; r refreshes".to_string()
-                }
-                Refusal::Unchecked(e) => {
-                    format!("nothing posted: could not check #{number} on GitHub: {e}")
-                }
-                Refusal::Rejected(e) => format!("posting to #{number} failed: {e}"),
-            }),
-            Err(e) => Some(format!("posting to #{number} failed: {e}")),
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "#{number} already has this review from you, but its draft file could not be updated: {e}"
+                    )),
+                ),
+            },
+            Ok(Outcome::Unknown(e)) => {
+                settles = false;
+                self.unsettled.insert(sent.path.clone());
+                (
+                    None,
+                    Some(format!(
+                        "#{number}: the review was sent and no answer came back ({e}). It may or may not be posted; a again asks GitHub before sending anything"
+                    )),
+                )
+            }
+            Ok(Outcome::Refused(why)) => {
+                let (message, reached_the_reviews) = self.refusal(number, why);
+                settles = reached_the_reviews;
+                (None, Some(message))
+            }
+            Err(e) => {
+                settles = false;
+                (None, Some(format!("posting to #{number} failed: {e}")))
+            }
         };
+        if settles {
+            self.unsettled.remove(&sent.path);
+        }
+        if let Some(done) = done {
+            self.note(done);
+        }
         self.post_error = failure;
         self.reload_drafts();
+    }
+
+    /// Why nothing was sent, for the screen, and whether the attempt got as
+    /// far as reading the reviews — which is what it takes to know if an
+    /// earlier, unanswered post landed.
+    fn refusal(&mut self, number: u64, why: drafts::Refusal) -> (String, bool) {
+        use drafts::Refusal;
+        match why {
+            Refusal::Closed => (
+                format!("nothing posted: #{number} was closed without being merged"),
+                false,
+            ),
+            Refusal::Moved(head) => {
+                let short = head.get(..7).unwrap_or(&head).to_string();
+                self.live_heads.insert(number, head);
+                (
+                    format!(
+                        "nothing posted: #{number} has moved on to {short} since this draft was written"
+                    ),
+                    false,
+                )
+            }
+            Refusal::ReviewedSince => (
+                format!(
+                    "nothing posted: you have reviewed #{number} since this draft was written; x skips it, or review in the browser"
+                ),
+                true,
+            ),
+            Refusal::Pending => (
+                format!(
+                    "nothing posted: you have a review of #{number} started and not submitted; submit or discard it in the browser first"
+                ),
+                true,
+            ),
+            Refusal::NoViewer => (
+                "nothing posted: your GitHub login is not known yet; r refreshes".to_string(),
+                false,
+            ),
+            Refusal::Unchecked(e) => (
+                format!("nothing posted: could not check #{number} on GitHub: {e}"),
+                false,
+            ),
+            Refusal::Busy => (
+                format!("nothing posted: another rigor window is posting #{number}"),
+                false,
+            ),
+            Refusal::Rejected(e) => (format!("posting to #{number} failed: {e}"), true),
+        }
     }
 
     /// Which worktrees to rescan this round; see `needs_scan`.
@@ -678,12 +811,20 @@ impl App {
         }
     }
 
-    /// `a`. Posting is public and under the user's name, so one keypress only
-    /// asks: the first `a` puts up a prompt naming what would be sent, and
-    /// only a second `a` on the same, unchanged draft goes ahead — and then
-    /// only if GitHub, asked there and then, still agrees (`drafts::deliver`).
-    /// `armed` is the prompt that was up when this key arrived, if any.
-    pub fn post_key(&mut self, armed: Option<&Armed>) {
+    /// Note that an `a` arrived, and say whether it came after a pause. Every
+    /// `a` counts, pressed, repeated or released, so a key held down keeps
+    /// pushing the pause back and can never be the one that confirms.
+    pub fn a_arrived(&mut self) -> bool {
+        let now = now_millis();
+        let quiet = self.last_a.is_none_or(|last| now - last >= A_QUIET_MS);
+        self.last_a = Some(now);
+        quiet
+    }
+
+    /// `a` with no question up. Posting is public and under the user's name,
+    /// so this only asks: it opens the overlay showing exactly what would be
+    /// sent. Sending takes a second, deliberate `a` (`confirm`).
+    pub fn post_key(&mut self) {
         use drafts::State;
         let Some(entry) = self.selected_draft().cloned() else {
             return;
@@ -693,7 +834,7 @@ impl App {
         // An unverified draft may be asked about too: the list cannot vouch
         // for its pull request's head, but the check before sending can.
         let (Some(number), Ok(draft), State::Ready | State::Unverified) =
-            (entry.number, &entry.draft, state)
+            (entry.number, entry.draft, state)
         else {
             let why = match state {
                 State::Posted => "is already posted",
@@ -712,32 +853,84 @@ impl App {
             self.note("a review is already being posted");
             return;
         }
-        let ask = Armed {
+        self.armed = Some(Armed {
+            path: entry.path,
             number,
-            raw: entry.raw.clone(),
-            what: draft.describe(),
+            raw: entry.raw,
+            draft,
             state,
-        };
-        if armed != Some(&ask) {
-            self.armed = Some(ask);
-            return;
-        }
-
-        // The file is the draft. If it changed after the prompt went up, what
-        // would go out is not what was confirmed.
-        let on_disk = std::fs::read_to_string(&entry.path).ok();
-        if on_disk.as_deref() != Some(entry.raw.as_str()) {
-            self.reload_drafts();
-            self.note(format!("{label} changed on disk; nothing was posted"));
-            return;
-        }
-        self.posting = Some((number, entry.path.clone()));
-        self.note(format!("checking {label} on GitHub, then posting…"));
-        let (remote, viewer, draft) =
-            (Arc::clone(&self.remote), self.viewer.clone(), draft.clone());
-        spawn_reply(self.tx.clone(), Msg::Posted, move || {
-            Ok(drafts::deliver(remote.as_ref(), &viewer, number, &draft))
+            at: now_millis(),
+            scroll: 0,
+            seen_end: false,
+            nudged: false,
         });
+    }
+
+    /// Scroll the overlay. It does not withdraw the question: reading what
+    /// would be sent is the point of asking.
+    pub fn scroll_confirm(&mut self, delta: i32) {
+        if let Some(armed) = &mut self.armed {
+            let to = i32::from(armed.scroll).saturating_add(delta).max(0);
+            armed.scroll = u16::try_from(to).unwrap_or(u16::MAX);
+        }
+    }
+
+    /// A deliberate second `a`, with the question up. Goes ahead only once
+    /// the end of what would be sent has been on screen — and then only if
+    /// GitHub, asked there and then, still agrees (`drafts::deliver`).
+    pub fn confirm(&mut self) {
+        let Some(armed) = &mut self.armed else {
+            return;
+        };
+        if !armed.seen_end {
+            armed.nudged = true;
+            return;
+        }
+        let Some(armed) = self.armed.take() else {
+            return;
+        };
+
+        // The file is the draft. If it changed after the question went up,
+        // what was shown is no longer what it says.
+        let on_disk = std::fs::read_to_string(&armed.path).ok();
+        if on_disk.as_deref() != Some(armed.raw.as_str()) {
+            self.reload_drafts();
+            self.note(format!(
+                "#{} changed on disk; nothing was posted",
+                armed.number
+            ));
+            return;
+        }
+        let number = armed.number;
+        self.post_error = None;
+        self.note(format!("checking #{number} on GitHub, then posting…"));
+        let (remote, viewer) = (Arc::clone(&self.remote), self.viewer.clone());
+        let (path, draft) = (armed.path.clone(), armed.draft.clone());
+        self.posting = Some(Posting {
+            number,
+            path: armed.path,
+            raw: armed.raw,
+            draft: armed.draft,
+        });
+        spawn_reply(self.tx.clone(), Msg::Posted, move || {
+            Ok(drafts::deliver_exclusively(
+                remote.as_ref(),
+                &viewer,
+                number,
+                &path,
+                &draft,
+            ))
+        });
+    }
+
+    /// Whether `entry` is the draft an attempt is in flight for.
+    pub fn is_posting(&self, entry: &drafts::Entry) -> bool {
+        self.posting.as_ref().is_some_and(|p| p.path == entry.path)
+    }
+
+    /// Whether `entry`'s review was sent and never answered for.
+    pub fn is_unsettled(&self, entry: &drafts::Entry) -> bool {
+        self.unsettled.contains(&entry.path)
     }
 
     /// `x`: set a draft aside, or bring a skipped one back.
@@ -746,14 +939,18 @@ impl App {
             return;
         };
         let label = entry.label();
+        // The answer on its way is about the file as it was. It is left
+        // alone until the answer is in.
+        if self.is_posting(&entry) {
+            self.note(format!(
+                "{label} is being posted; x waits until that is done"
+            ));
+            return;
+        }
         let Ok(draft) = &entry.draft else {
             self.note(format!("{label} is invalid; e opens it in your editor"));
             return;
         };
-        if self.posting.as_ref().map(|(n, _)| *n) == entry.number {
-            self.note(format!("{label} is being posted"));
-            return;
-        }
         let to = match draft.status {
             drafts::Status::Drafted => drafts::Status::Skipped,
             drafts::Status::Skipped => drafts::Status::Drafted,
@@ -772,9 +969,17 @@ impl App {
 
     /// `e`: ask for the selected draft's file to be opened in an editor.
     pub fn edit_key(&mut self) {
-        if let Some(entry) = self.selected_draft() {
-            self.edit_request = Some(entry.path.clone());
+        let Some(entry) = self.selected_draft() else {
+            return;
+        };
+        if self.is_posting(entry) {
+            let label = entry.label();
+            self.note(format!(
+                "{label} is being posted; e waits until that is done"
+            ));
+            return;
         }
+        self.edit_request = Some(entry.path.clone());
     }
 
     fn draft_matches(&self, i: usize, q: &str) -> bool {
@@ -881,22 +1086,20 @@ impl App {
                 self.detail_scroll = 0;
             }
             self.selected = same.unwrap_or(was).min(last);
-            return;
+        } else {
+            self.selected = keep
+                .and_then(|k| self.rows.iter().position(|r| *r == k))
+                .unwrap_or(0)
+                .min(last);
+            self.detail_scroll = 0;
         }
-        self.selected = keep
-            .and_then(|k| self.rows.iter().position(|r| *r == k))
-            .unwrap_or(0)
-            .min(last);
-        self.detail_scroll = 0;
 
-        // A pending post is only as good as the row it names. If a refresh
-        // moved the selection, rewrote the file or made the draft unpostable,
-        // the question is withdrawn.
+        // A question is only as good as the draft it names. If the selection
+        // is no longer on that file, or the file no longer reads the same,
+        // or the draft can no longer be posted as it could, it is withdrawn.
         if let Some(armed) = &self.armed {
             let still = self.selected_draft().is_some_and(|e| {
-                e.number == Some(armed.number)
-                    && e.raw == armed.raw
-                    && self.draft_state(e) == armed.state
+                e.path == armed.path && e.raw == armed.raw && self.draft_state(e) == armed.state
             });
             if !still {
                 self.armed = None;

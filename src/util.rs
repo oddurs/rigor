@@ -6,6 +6,7 @@ use unicode_width::UnicodeWidthStr;
 #[cfg(test)]
 thread_local! {
     static FROZEN: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    static FROZEN_MILLIS: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Pin the clock for the current test thread, so rendered ages and durations
@@ -25,6 +26,27 @@ pub fn secs(n: u64) -> i64 {
 /// A count or width as a terminal coordinate, saturating at the largest one.
 pub fn cols(n: usize) -> u16 {
     u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+/// Milliseconds on a clock that only runs forwards, for telling how far
+/// apart two things in this process happened. Not a time of day.
+pub fn now_millis() -> i64 {
+    #[cfg(test)]
+    if let Some(at) = FROZEN_MILLIS.with(std::cell::Cell::get) {
+        return at;
+    }
+    i64::try_from(START.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Where `now_millis` counts from: the first time anyone asked.
+static START: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// Pin `now_millis` for the current test thread, so a test can put two
+/// keypresses a known distance apart without sleeping.
+#[cfg(test)]
+pub fn freeze_millis(at: i64) {
+    FROZEN_MILLIS.with(|f| f.set(Some(at)));
 }
 
 pub fn now_secs() -> i64 {

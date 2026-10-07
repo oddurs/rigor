@@ -1,0 +1,34 @@
+---
+source: src/ui/tests.rs
+expression: "render(&mut o.a, 120, 30)"
+---
+ rigor │ acme/widget  ⎇ chore/release-notes                                                                    @octocat
+ Ready 1   Mine 2   Review 1   Blocked 1   All 3   Worktrees 5   Drafts 7        ⌫ 1 removable   ✎ 4 drafted   ↕ recent
+─────────────────────────────────────────────────────────────────━━━━━━━━───────────────────────────────────────────────
+ #4846  approve      Give the read path a retry budget                                                    +220 −24   3m
+▎#4840  comment +2   Move the palette onto color tokens                                                   +220 −24   2h
+ #4801  ✓ posted     draft · Treat a filtered empty result as unknown                                     +220 −24   3d
+ #4700  stale        merged · Drop the monospace count chips                                                         4d
+ #4701  skipped      merged · Fix the row hover state                                                                5d
+ #4980  invalid      not among the fetched pull requests
+ #4990  unverified┌ this is what will be posted ─────────────────────────────────────────────────────┐
+                  │ #4840 Move the palette onto color tokens                                         │
+                  │                                                                                  │
+                  │  verdict   comment                                                               │
+                  │  body      Reads well overall.                                                   │
+                  │                                                                                  │
+                  │            One question on the cap before this goes in.                          │
+                  │  comment   src/retry.rs:84                                                       │
+──────────────────│            Should this cap at the caller's deadline?                             │──────────────────
+ #4840 Move the pa│  comment   src/retry.rs:120                                                      │
+ octocat · 2h ago │            A test for the zero-budget case would pin this.                       │
+  picked    Touche└ this is all of it · a posts · esc cancels ───────────────────────────────────────┘
+  verdict   comment
+  body      Reads well overall.
+
+            One question on the cap before this goes in.
+  comment   src/retry.rs:84
+            Should this cap at the caller's deadline?
+  comment   src/retry.rs:120
+            A test for the zero-budget case would pin this.                                            ↓ more below · J
+ post comment with 2 inline comments to #4840? a again to confirm, esc to cancel

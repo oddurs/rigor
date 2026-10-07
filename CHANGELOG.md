@@ -24,22 +24,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is read, and a draft's timestamps must be RFC 3339. A pull request number
   of any length is shown whole.
 - A review draft can be posted from the `Drafts` view: the one thing rigor
-  sends to GitHub, and only on a confirmed keypress. The first `a` asks, naming
-  what would be sent; a second `a` on the same row goes ahead, and any other
-  key, a click, or a refresh that changes the row withdraws the question.
-  Going ahead reads the pull request and its reviews from GitHub first, and
-  sends nothing if either read fails. A pull request closed without merging,
-  or one that has moved on from the commit the draft was written against, is
-  refused, and the row turns `stale`. If the same review from you is already
-  there — a post that timed out or was cut off by quitting still landed — the
-  draft is marked `posted` and nothing is sent twice; if you have reviewed
-  differently since the draft was written, it is not sent on top. An
-  `unverified` draft can be posted, since the read does the checking the list
-  could not. The private `note` and `picked` are never sent. On success the
-  file is marked `posted`, replaced in one step; when GitHub declines the
-  review its own message is shown and the file is left untouched. `e` opens
-  the draft in `$VISUAL` or `$EDITOR` and reads it again afterwards; `x` skips
-  a draft or brings it back.
+  sends to GitHub, and only on a confirmed keypress.
+  - The first `a` opens an overlay showing exactly what would be posted — the
+    pull request, the verdict, the body, each inline comment — and not the
+    draft's private `note` and `picked`, which are never sent. A second `a`
+    goes ahead only after a pause, so a held key, a chattering switch or a
+    paste never confirms, and only once the end of the overlay has been on
+    screen. Any other key takes it down and does nothing else; so does a
+    refresh that changes the draft, and thirty seconds without an answer.
+  - Going ahead reads the pull request and its reviews from GitHub first, and
+    sends nothing if a read fails. A pull request closed without merging, or
+    one that has moved on from the commit the draft was written against, is
+    refused, and the row turns `stale`. If the same review from you is already
+    there, inline comments included, the draft is marked `posted` and nothing
+    is sent twice. If you have reviewed differently since the draft was
+    written, or have a review started and not submitted, it is not sent on
+    top. An `unverified` draft can be posted, since the read does the checking
+    the list could not.
+  - On success the file is marked `posted`, replaced in one step, and records
+    what was sent even if the file changed meanwhile. When GitHub declines the
+    review its own message is shown until `esc` and the file is untouched.
+    When no answer comes back the outcome is reported as unknown, the row
+    reads `maybe sent`, and trying again asks GitHub before sending anything.
+  - One attempt at a time: a lock beside the draft keeps a second rigor from
+    posting it too, and quitting waits for a post in flight and records it.
+  - `e` opens the draft in `$VISUAL` or `$EDITOR` and reads it again
+    afterwards; `x` skips a draft or brings it back.
 
 - `--print-config` lists the tab bar, and spells every value the way a config
   file does, so a line can be copied into one.
